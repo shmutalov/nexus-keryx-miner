@@ -354,3 +354,19 @@ pub fn replay_backoff_ms(failures:u32)->u64{30000u64.saturating_mul(1u64<<failur
  #[test]fn failed_replays_back_off_without_giving_up_after_two(){assert_eq!(replay_backoff_ms(1),60000);assert_eq!(replay_backoff_ms(2),120000);assert_eq!(replay_backoff_ms(5),600000);assert_eq!(replay_backoff_ms(u32::MAX),600000);}
  #[test]fn unaccepted_responses_share_the_full_ledger_horizon(){assert!(retain_undrawn(70000,0,false,6000));assert!(!retain_undrawn(72000,0,false,6000));}
 }
+
+/// Retry transient replay failures without sleeping through a near deadline.
+/// Ten DAA/s is the existing scheduling estimate, never a consensus extension.
+/// Actual eligibility and expiry still come from the canonical node ledger.
+pub fn replay_deadline_backoff_ms(failures:u32,now:u64,deadline:u64)->u64 {
+    replay_backoff_ms(failures).min(deadline.saturating_sub(now).saturating_mul(50).clamp(1000,600000))
+}
+#[cfg(test)] mod strike_qos_tests {
+    use super::*;
+    #[test] fn imminent_opening_retries_within_remaining_estimated_budget(){
+        assert_eq!(replay_deadline_backoff_ms(5,100,120),1000);
+        assert_eq!(replay_deadline_backoff_ms(5,100,300),10000);
+        assert_eq!(replay_deadline_backoff_ms(5,100,100000),600000);
+        assert_eq!(replay_deadline_backoff_ms(5,120,100),1000);
+    }
+}

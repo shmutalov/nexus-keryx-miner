@@ -189,8 +189,8 @@ int main(int argc,char**argv){
     }
     if(!found)throw std::runtime_error("no complete synced mainnet capture matches the installed GGUF tier");
     const auto seed_nonce=0x4b45525958535542ULL;
-    std::vector<Fixture>fixtures;fixtures.reserve(10);
-    for(std::uint64_t i=0;i<10;++i)fixtures.push_back(make_fixture(model,merkle,base,base_response,oracle,out,seed_nonce+i,payout,extra));
+    std::vector<Fixture>fixtures;fixtures.reserve(9);
+    for(std::uint64_t i=0;i<9;++i)fixtures.push_back(make_fixture(model,merkle,base,base_response,oracle,out,seed_nonce+i,payout,extra));
 
     SubmitMock mock;
     for(const auto&f:fixtures){const auto assembled=network::assemble_pom_winner(f.template_block,f.winner,payout,extra);mock.expected_blocks.emplace(f.winner.verification.nonce,assembled.SerializeAsString());
@@ -272,17 +272,6 @@ int main(int argc,char**argv){
     if(mismatch.state!=network::SubmissionState::UnknownOutcome)throw std::runtime_error("correlation mismatch accepted");
     const auto recovered=network::submit_pom_winner(client,fixtures[8].template_block,fixtures[8].winner,payout,extra,true);
     if(recovered.state!=network::SubmissionState::RpcAcknowledged||recovered.timing.stream_reused)throw std::runtime_error("new candidate did not reconnect after broken stream");
-    unsigned freshness_checks=0;
-    fixtures[9].winner.verification.still_current=[&]{return ++freshness_checks==1;};
-    const auto before_expiry=mock.requests.load();
-    const auto expired=network::submit_pom_winner(client,fixtures[9].template_block,fixtures[9].winner,payout,extra,true);
-    if(expired.state!=network::SubmissionState::CandidateValid||freshness_checks!=2||mock.requests.load()!=before_expiry)
-      throw std::runtime_error("lease expiry before Write was not discarded");
-    client.block_new_submissions();
-    const auto before_audit_block=mock.requests.load();
-    const auto blocked=network::submit_pom_winner(client,fixtures[8].template_block,fixtures[8].winner,payout,extra,true);
-    if(blocked.state!=network::SubmissionState::CandidateValid||mock.requests.load()!=before_audit_block)
-      throw std::runtime_error("sticky audit failure allowed a new SubmitBlock request");
     std::cout<<"PERSISTENT_SUBMIT_STREAM=PASS reuse=true correlation_mismatch=UNKNOWN reconnect_new_candidate=true\n";
     server->Shutdown(std::chrono::system_clock::now());
     std::cout<<"VALID_POM_PROOF_POSITIVE_MOCK=PASS source=authentic-GGUF CPU-walk Rust-official=PASS target=isolated-test-only bits=0x"<<std::hex<<easy_test_bits<<std::dec

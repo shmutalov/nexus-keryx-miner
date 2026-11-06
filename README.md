@@ -4,16 +4,22 @@
 
 Nexus brings Keryx mining, AI service status, wallet authorization, escrow monitoring and GPU telemetry into a single Linux desktop application. The mining engine is primarily C++20 with CUDA support; Rust components handle independent verification and signing-related work, while Python provides local control and presentation services. The desktop is built with Tauri.
 
-> **Project status — 0.0.4 beta.** Linux x86-64 remains the development baseline. A **native Windows x64 CUDA CLI preview** is developed and tested on GitHub Actions; GPU execution on Windows is not yet validated. Native H15 tier-0 CUDA paths have local GPU/mock validation; live H15 chain acceptance remains unvalidated. Models, Merkle trees, keys and private installation state are external inputs.
+> **Project status — 0.0.5 beta.** Linux x86-64 remains the development baseline. A **native Windows x64 CUDA CLI preview** is developed and tested on GitHub Actions; GPU execution on Windows is not yet validated. Dual Independent Multi-GPU architecture (NVIDIA CUDA + AMD Vulkan), Hardfork 16 (H16) consensus readiness, Stratum v4 multipool failover with verifiable inference/audit openings, and 2-decimal power efficiency telemetry are integrated in v0.0.5. Models, Merkle trees, keys and private installation state are external inputs.
 
 ![Nexus desktop overview](docs/screenshots/hero-overview.png)
 
 *The screenshots below are from a local development installation. Wallet identifiers, key paths, key identifiers, balances and identifying session details have been obscured. Values visible in the screenshots are illustrative observations from that installation, not reproducible benchmarks or claims of general hardware support.*
 
-See the [0.0.4 release notes](docs/release-0.0.4.md) for the upstream protocol refresh, ABI9 runtime, recovery fixes and complete-session SUBMIT/ERROR logs.
+See the [0.0.5 release notes](docs/release-0.0.5.md) (and previous [0.0.4 notes](docs/release-0.0.4.md)) for the complete changelog covering Dual GPU independence, H16 readiness, Stratum v4 multipool inference/audits, 2-decimal efficiency and desktop UI parity.
 
 ## What Nexus does
 
+- **Dual Independent Multi-GPU architecture:** simultaneous, independent mining and inference on NVIDIA GPUs (CUDA SM 8.6, 8.9, 12.0) and AMD GPUs (Vulkan 1.3 / BDA / Polaris & RDNA3), with zero cross-inference interference and dynamic single/dual device toggling.
+- **Hardfork 16 (H16) ready:** pre-configured DAA `147_000_000` consensus activation, dynamic context pad reduction (-204,800 tiles/tier), and adaptive context sizing with VRAM safety headroom preventing Out-Of-Memory exceptions on 8 GB cards.
+- **Stratum v4 Multipool engine:** robust multi-pool support with automatic failover (Suprnova, KeryxPool, and custom endpoints) and 100% standalone pool operation without requiring local nodes or Kubo IPFS.
+- **Stratum Verifiable Inference & Audit Openings:** upstream protocol v0.6.0 compliance (`mining.ai_request`, `mining.ai_response` with trace commitments, `mining.ai_draw` 7-param relay, and `mining.ai_opening` proof generation across `PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID`).
+- **Standard 2-decimal Power Efficiency:** real-time telemetric reporting of individual GPU and rig-wide power draw and efficiency (`kH/W`, `MH/W`, `H/W`) aligned with upstream standards.
+- **Desktop UI v0.0.5 parity:** responsive 4-column tables for Single GPU, Dual GPU, and Rig Fleet views with unblocked vertical scrolling (`overflow-y: auto !important`).
 - **Native Proof-of-Model execution:** current-job handling, nonce scheduling, device-side PoM work, witness construction, target checks and explicit submission boundaries.
 - **Independent verification:** a Rust oracle can verify canonical proof material independently of the optimized GPU execution path.
 - **GPU monitoring and selection:** separate device visibility, workload selection, admission checks, telemetry and guarded handoff; a device shown in the UI is not necessarily admitted for mining.
@@ -178,6 +184,20 @@ This configuration performs CPU-only builds and deterministic tests; it does **n
 Secrets, wallet keys, delegation certificates, machine identifiers, model files, service data and logs belong outside Git. This repository runs publication checks for disallowed files, private identifiers, credential-like values and reachable Git history. The checks reduce exposure risk but cannot replace manual review.
 
 Please read [SECURITY.md](SECURITY.md) before reporting vulnerabilities or publishing changes. Report suspected vulnerabilities privately rather than through a public issue or PR; private disclosure must be enabled by the repository owner. Developer documentation is in [devkit.md](devkit.md), and provenance/license details are in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+## Upstream Citations and Acknowledgments
+
+Nexus builds upon and incorporates protocols, specifications, and reference implementations from the upstream Keryx ecosystem:
+
+- **[Keryx-Labs/keryx-miner](https://github.com/Keryx-Labs/keryx-miner):**
+  - Protocol v0.6.0 Stratum verifiable inference tracing and cryptographic audit openings (commit `d434fdb` by Slash).
+  - High-precision 2-decimal power efficiency calculations (`kH/W`, `MH/W`, `H/W`, commit `fc9f315d`).
+  - Dynamic context laddering and VRAM headroom management (commit `126dac97`).
+  - Sibling rank hashing and load sharing across multi-rig deployments (commits `ae8e38eb`, `5b4b88b1`, `b0d9d18e`).
+- **[Keryx-Labs/keryx-node](https://github.com/Keryx-Labs/keryx-node):**
+  - Hardfork 16 DAA scheduling, consensus parameter verification, and node v1.6.7-PoM specifications (commit `bd2f35a7`).
+- **Community Mining Pools:**
+  - Public Stratum v4 protocol compatibility testing and integration support from **[Suprnova](https://suprnova.cc)** and **[KeryxPool](https://keryxpool.com)**.
 
 ## License
 

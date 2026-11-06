@@ -53,7 +53,7 @@ def validate(values):
     workloads=values.get('workloads',{})
     if not isinstance(workloads,dict) or len(workloads)>16 or any(
         not isinstance(k,str) or not re.fullmatch(r'(GPU-[0-9a-fA-F-]{36}|pci:[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7])',k)
-        or v not in ('auto','nvidia','nexus','nexus_bda') for k,v in workloads.items()):
+        or v not in ('auto','nvidia','nexus','nexus_bda','nexus_rdna3') for k,v in workloads.items()):
         raise ValueError('Invalid per-device workload preferences')
     result['workloads']=dict(workloads)
     for key in ('background', 'text'):

@@ -131,17 +131,48 @@ struct AiResponseConfig {
 
 enum class ServeResult { Submitted, Duplicate, NotAssigned, Expired, WaitingReconciliation, Failed };
 
+struct DiscoveredRequestInfo {
+  std::string request_id;
+  std::uint64_t containing_daa{};
+  std::array<std::uint8_t, 32> model_id{};
+  bool is_private{};
+  std::vector<std::uint8_t> envelope;
+  std::uint32_t max_tokens{};
+  std::uint64_t deadline{};
+};
+
+struct ReconciliationResult {
+  std::size_t reconciled_count{};
+  std::size_t assigned_obligations{};
+  std::size_t unassigned_count{};
+  std::size_t expired_count{};
+  std::size_t unresolved_blockers{};
+};
+
 class AiResponseService final {
 public:
   explicit AiResponseService(AiResponseConfig config);
   void recover();
   // Persist an observed request identity before placing it in the volatile bounded work queue.
   // The node's startup block backfill supplies the immutable transaction again after restart.
-  bool discover(const protowire::RpcTransaction &transaction, std::uint64_t containing_daa);
+  // When providers list is supplied, immediately classifies canonical assignment so unassigned
+  // requests do not linger in DISCOVERED.
+  bool discover(const protowire::RpcTransaction &transaction, std::uint64_t containing_daa,
+                const std::vector<ServiceProvider> *providers = nullptr,
+                std::optional<std::uint64_t> current_daa = std::nullopt);
   // Mark only a stock-wire response with a valid responder signature as observed in a block.
   // Block/DAG observation is not selected-chain confirmation or finality.
   std::size_t observe_block(const protowire::RpcBlock &block);
   std::size_t observe_removed_chain_blocks(const std::vector<std::string> &block_hashes);
+  // Authoritatively reconciles pending DISCOVERED records against the canonical provider cohort,
+  // native H15 audit store duties, and DAA expiration horizons without arbitrary journal mutation.
+  ReconciliationResult reconcile_discovered(
+      const std::vector<ServiceProvider> &providers,
+      std::uint64_t current_daa,
+      bool providers_available,
+      const std::function<bool(std::string_view request_id)> &has_audit_obligation = {});
+  std::size_t reconcile_ambiguous(const std::function<bool(std::string_view txid)> &known);
+  std::optional<DiscoveredRequestInfo> get_discovered_info(std::string_view request_id) const;
   ServeResult serve(const protowire::RpcTransaction &transaction,
                     std::uint64_t containing_daa,
                     const std::vector<ServiceProvider> &providers,
@@ -155,6 +186,8 @@ private:
   mutable std::mutex observed_mutex_;
   std::unordered_map<std::string, std::unordered_set<std::string>> response_blocks_;
   std::unordered_map<std::string, std::unordered_set<std::string>> blocks_by_response_;
+  mutable std::mutex discovered_mutex_;
+  std::unordered_map<std::string, DiscoveredRequestInfo> discovered_requests_;
 };
 
 // Official protocol primitives. Encrypted request bytes remain immutable; responder keys

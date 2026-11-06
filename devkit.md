@@ -43,11 +43,9 @@ is kept in `AGENTS.md`.
 | Publication | `tools/security_gate.py`, `.githooks/`, `.github/workflows/`: privacy, secret and history gates |
 
 The productive path is: current template → leased canonical job → unique nonce
-→ full PoM walk → witness → proof/target verification
+→ full PoM walk → witness → independent Rust verification → real target check
 → current payout/delegation binding → block assembly → RPC submission → chain
 reconciliation. A stale job is discarded; an inconsistent binding is an error.
-The H15 CUDA fast path now uses bounded asynchronous submission and post-submit
-Rust auditing; see `docs/h15-post-submit.md` for ordering and failure semantics.
 `TARGET_FOUND`, `SUBMIT_SENT`, `RPC_ACKNOWLEDGED`, chain observation and selected
 chain confirmation are distinct states.
 
@@ -67,9 +65,8 @@ checks; a below-threshold pool may correctly produce no claim.
 | macOS | No validated build. No NVIDIA CUDA backend; POSIX/Linux differences and Vulkan availability require platform work. The presence of Tauri platform conditionals is not full miner support. |
 
 Compile for your own platform and toolchain. No OS support claim should be
-inferred from successful CPU compilation alone. The native CUDA kernels target SM 8.6, 8.9 and 12.0 in embedded fatbin
-images (GeForce RTX 30, 40 and 50). The inference runtime uses the same
-architecture set. See `docs/cuda-rtx-support.md` for validation limits. Vulkan admission retains
+inferred from successful CPU compilation alone. The existing native CUDA kernels
+target SM 8.6 and use generated portable C++ device images. Vulkan admission retains
 specific vendor/device and feature checks: changing a UUID does not add support
 for a new GPU model. Vendor options in the UI are broader than tested execution.
 The worker has at most two admitted lanes; arbitrary multi-GPU Rig scheduling is

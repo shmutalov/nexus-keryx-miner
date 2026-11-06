@@ -5,7 +5,7 @@ responsible for capability checks, Rust parity and confirmed per-device binding.
 """
 from nexus_gpu_identity import clean_name
 
-WORKLOADS={'nvidia':'Nvidia','nexus':'Nexus (JIT+Vulkan)','nexus_bda':'Nexus Native (BDA Vulkan)'}
+WORKLOADS={'nvidia':'Nvidia','nexus':'Nexus (JIT+Vulkan)','nexus_bda':'Nexus Native (BDA Vulkan)','nexus_rdna3':'Nexus RDNA3 (Vulkan WMMA)'}
 
 
 def vendor(device):
@@ -25,7 +25,7 @@ def workload_options(device):
     options=[('Automatic','auto')]
     if vendor(device)=='nvidia':options += [('Nvidia','nvidia'),('Nexus (JIT+Vulkan) · Not recommended','nexus'),('Nexus Native (BDA Vulkan)','nexus_bda')]
     elif vendor(device) in ('amd','intel'):
-        options += [('Nexus (JIT+Vulkan)','nexus'),('Nexus Native (BDA Vulkan)','nexus_bda')]
+        options += [('Nexus (JIT+Vulkan)','nexus'),('Nexus Native (BDA Vulkan)','nexus_bda'),('Nexus RDNA3 (Vulkan WMMA)','nexus_rdna3')]
     return options
 
 

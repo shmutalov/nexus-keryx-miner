@@ -2,6 +2,8 @@
 #include "keryx/nexus/h15_bridge.h"
 #include "keryx/nexus/trace_manifest_bridge.h"
 #include "messages.grpc.pb.h"
+#include <google/protobuf/util/json_util.h>
+#include <google/protobuf/struct.pb.h>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -53,8 +55,13 @@ void put(std::vector<std::uint8_t> &b, std::uint64_t n, unsigned bytes) {
 void hash(std::vector<std::uint8_t> &b, const Hash &h) {
   b.insert(b.end(), h.begin(), h.end());
 }
+inline auto unbundle(std::span<const std::uint8_t> b) {
+  return H15AuditClient::unbundle(b);
+}
+} // namespace
+
 std::vector<std::vector<std::uint8_t>>
-unbundle(std::span<const std::uint8_t> b) {
+H15AuditClient::unbundle(std::span<const std::uint8_t> b) {
   if (b.empty())
     return {};
   if (b[0] != 0xb0)
@@ -74,7 +81,26 @@ unbundle(std::span<const std::uint8_t> b) {
   need(at == b.size(), "Trailing audit data");
   return out;
 }
-} // namespace
+
+H15AuditClient::H15ObligationStatus
+H15AuditClient::evaluate_obligation_bundle(std::span<const std::uint8_t> b, const char *name) {
+  if (b.data() == nullptr || b.empty()) {
+    return {false, std::string("H15_") + name + "_BUNDLE_INVALID: BUFFER_EMPTY"};
+  }
+  std::vector<std::vector<std::uint8_t>> unbundled;
+  try {
+    unbundled = unbundle(b);
+  } catch (const std::exception &e) {
+    return {false, std::string("H15_") + name + "_BUNDLE_CORRUPT: " + e.what()};
+  }
+  if (b[0] == 0xb0 && unbundled.size() != static_cast<std::size_t>(b[1])) {
+    return {false, std::string("H15_") + name + "_BUNDLE_CARDINALITY_ANOMALY"};
+  }
+  if (!unbundled.empty()) {
+    return {false, std::string("H15_") + name + "_DUE_FOR_SUBMISSION"};
+  }
+  return {true, ""};
+}
 struct H15AuditClient::Impl {
   opoi::StockLlamaRuntime &runtime;
   const model::ReadOnlyGguf &gguf;
@@ -91,6 +117,7 @@ struct H15AuditClient::Impl {
   Hash anchor{};
   std::chrono::steady_clock::time_point next_poll{};
   unsigned poll_failures{};
+  std::chrono::steady_clock::time_point next_health{};
   std::optional<bool> awaited_supported;
   bool awaited_probed{};
   std::chrono::steady_clock::time_point next_awaited{};
@@ -361,6 +388,12 @@ struct H15AuditClient::Impl {
       need(bool(p.with_gpu), "Audit replay requires exclusive GPU owner");
       std::vector<std::uint8_t> b;
       p.with_gpu([&] {
+        struct ScratchRelease {
+          opoi::StockLlamaRuntime &rt;
+          ~ScratchRelease() noexcept {
+            try { rt.use_task_context(); } catch (...) {}
+          }
+        } scratch_release{p.runtime};
         p.configure();
         opoi::TracedGeneration g;
         g.tokens.assign(raw->tokens, raw->tokens + raw->positions);
@@ -482,6 +515,12 @@ AiTracedAnswer H15AuditClient::infer(std::string_view prompt,
     nexus_h15_capture_free(p.capture);
     p.capture = nullptr;
   }
+  struct ScratchRelease {
+    opoi::StockLlamaRuntime &rt;
+    ~ScratchRelease() noexcept {
+      try { rt.use_task_context(); } catch (...) {}
+    }
+  } scratch_release{p.runtime};
   p.configure();
   std::array<std::int32_t, 256> tokens{};
   std::size_t n = tokens.size();
@@ -702,12 +741,31 @@ void H15AuditClient::response_intent(std::string_view id) {
   need(nexus_h15_service_response_intent(p.service, h.data(), ms) == 0,
        "H15 response intent fsync failed");
 }
-void H15AuditClient::response_result(std::string_view id, bool rejected) {
+void H15AuditClient::response_result(std::string_view id, AiResponseEffects::SubmitResult::State state, std::uint64_t rpc_ms) {
   auto &p = *impl_;
   std::lock_guard lock(p.mutex);
   const auto h = unhex(id);
-  need(nexus_h15_service_response_result(p.service, h.data(), rejected) == 0,
+  need(nexus_h15_service_response_result(p.service, h.data(), state==AiResponseEffects::SubmitResult::State::Rejected) == 0,
        "H15 response outcome fsync failed");
+  if(nexus_h15_service_rpc_observed(p.service,h.data(),static_cast<std::uint8_t>(state),rpc_ms)!=0)
+    std::cout<<"H15_HEALTH state=UNAVAILABLE rpc_outcome=UNKNOWN tracking=CANONICAL_INTENT\n"<<std::flush;
+}
+void H15AuditClient::report_health(std::uint64_t daa) {
+  auto &p=*impl_;std::lock_guard lock(p.mutex);
+  const auto now=std::chrono::steady_clock::now();if(now<p.next_health)return;
+  p.next_health=now+std::chrono::seconds(5);Buffer out;
+  if(nexus_h15_service_health(p.service,daa,&out.b)!=0){
+    std::cout<<"H15_HEALTH state=UNAVAILABLE tracking=CANONICAL_JOURNAL records=PRESERVED\n"<<std::flush;return;
+  }
+  std::cout.write(reinterpret_cast<const char*>(out.b.data),out.b.length);std::cout<<"\n"<<std::flush;
+}
+void H15AuditClient::report_exit_health(std::uint64_t daa) {
+  auto &p=*impl_;std::lock_guard lock(p.mutex);Buffer out;
+  std::cout<<"H15_EXIT_RECOVERY_SNAPSHOT canonical_clearance=UNPROVEN\n";
+  if(nexus_h15_service_health(p.service,daa,&out.b)!=0){
+    std::cout<<"H15_EXIT_RECOVERY_SNAPSHOT state=UNKNOWN records=PRESERVED recovery=REQUIRED\n"<<std::flush;return;
+  }
+  std::cout.write(reinterpret_cast<const char*>(out.b.data),out.b.length);std::cout<<"\n"<<std::flush;
 }
 void H15AuditClient::submit_due(std::uint64_t daa, bool authorized) {
   auto &p = *impl_;
@@ -735,7 +793,11 @@ void H15AuditClient::submit_due(std::uint64_t daa, bool authorized) {
              "H15 mempool reconciliation failed");
         continue;
       }
+      const auto rpc_started=std::chrono::steady_clock::now();
       const auto result = p.transport.submit(tx, text);
+      const auto rpc_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-rpc_started).count();
+      if(nexus_h15_service_rpc_observed(p.service,id->data(),static_cast<std::uint8_t>(result.state),rpc_ms)!=0)
+        std::cout<<"H15_HEALTH state=UNAVAILABLE rpc_outcome=UNKNOWN tracking=CANONICAL_INTENT\n"<<std::flush;
       if (subnet == 4)
         need(nexus_h15_service_response_result(
                  p.service, id->data(),
@@ -765,14 +827,115 @@ void H15AuditClient::submit_due(std::uint64_t daa, bool authorized) {
     }
     return true;
   };
-  Buffer responses;
-  need(nexus_h15_service_response_due(p.service, daa, ms, &responses.b) == 0,
-       "H15 response retry state blocked");
-  if (!send(unbundle(std::span(responses.b.data, responses.b.length)), 4))
-    return;
   Buffer openings;
   need(nexus_h15_service_due(p.service, daa, ms, &openings.b) == 0,
        "H15 opening retry state blocked");
-  send(unbundle(std::span(openings.b.data, openings.b.length)), 6);
+  if(!send(unbundle(std::span(openings.b.data, openings.b.length)),6))return;
+  Buffer responses;
+  need(nexus_h15_service_response_due(p.service, daa, ms, &responses.b) == 0,
+       "H15 response retry state blocked");
+  send(unbundle(std::span(responses.b.data, responses.b.length)),4);
+}
+
+H15AuditClient::H15ObligationStatus H15AuditClient::check_obligations(std::uint64_t current_daa) {
+  auto &p = *impl_;
+  std::lock_guard lock(p.mutex);
+  if (!p.service) {
+    return {false, "H15_SERVICE_NOT_INITIALIZED"};
+  }
+  if (p.poll_failures > 0) {
+    return {false, "H15_RPC_POLL_FAILURES_DETECTED: " + std::to_string(p.poll_failures)};
+  }
+  if (p.pending_page.has_value()) {
+    return {false, "H15_CANONICAL_PAGE_PENDING"};
+  }
+  if (nexus_h15_service_restoring(p.service) != 0) {
+    return {false, "H15_RESTORING_ACTIVE"};
+  }
+  if (current_daa == 0) {
+    return {false, "CANONICAL_BLOCKCHAIN_DAA_ZERO"};
+  }
+
+  const auto ms = static_cast<std::uint64_t>(std::max<std::int64_t>(
+      0, std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+             .count()));
+
+  Buffer openings;
+  if (nexus_h15_service_due(p.service, current_daa, ms, &openings.b) != 0) {
+    return {false, "H15_QUERY_DUE_OPENINGS_FAILED"};
+  }
+  const auto openings_status = evaluate_obligation_bundle(
+      std::span<const std::uint8_t>(openings.b.data, openings.b.length), "OPENINGS");
+  if (!openings_status.safe) {
+    return openings_status;
+  }
+
+  Buffer responses;
+  if (nexus_h15_service_response_due(p.service, current_daa, ms, &responses.b) != 0) {
+    return {false, "H15_QUERY_DUE_RESPONSES_FAILED"};
+  }
+  const auto responses_status = evaluate_obligation_bundle(
+      std::span<const std::uint8_t>(responses.b.data, responses.b.length), "RESPONSES");
+  if (!responses_status.safe) {
+    return responses_status;
+  }
+
+  Buffer health_buf;
+  if (nexus_h15_service_health(p.service, current_daa, &health_buf.b) != 0) {
+    return {false, "H15_HEALTH_QUERY_FAILED"};
+  }
+  std::string json_text(reinterpret_cast<const char *>(health_buf.b.data), health_buf.b.length);
+  google::protobuf::Struct health_json;
+  if (!google::protobuf::util::JsonStringToMessage(json_text, &health_json).ok()) {
+    return {false, "H15_HEALTH_JSON_PARSE_ERROR"};
+  }
+
+  H15ObligationStatus status;
+  const auto &fields = health_json.fields();
+  auto rows_it = fields.find("rows");
+  if (rows_it == fields.end() || !rows_it->second.has_list_value()) {
+    return {false, "H15_HEALTH_MISSING_ROWS"};
+  }
+
+  for (const auto &item : rows_it->second.list_value().values()) {
+    if (!item.has_struct_value()) continue;
+    const auto &row = item.struct_value().fields();
+    std::string obligation = "unknown";
+    if (auto ob_it = row.find("obligation"); ob_it != row.end() && ob_it->second.has_string_value()) {
+      obligation = ob_it->second.string_value();
+    }
+
+    if (auto cov_it = row.find("chain_coverage_complete"); cov_it != row.end()) {
+      if (!cov_it->second.bool_value()) {
+        return {false, "H15_CHAIN_COVERAGE_INCOMPLETE: " + obligation};
+      }
+    } else {
+      return {false, "H15_MISSING_CHAIN_COVERAGE_FIELD: " + obligation};
+    }
+
+    if (auto rpc_it = row.find("response_rpc"); rpc_it != row.end() && rpc_it->second.has_string_value()) {
+      if (rpc_it->second.string_value() == "UNKNOWN") {
+        return {false, "H15_AMBIGUOUS_RESPONSE_RPC: " + obligation};
+      }
+    }
+
+    std::string row_status;
+    if (auto st_it = row.find("status"); st_it != row.end() && st_it->second.has_string_value()) {
+      row_status = st_it->second.string_value();
+    }
+    if (row_status == "OPENING_ACCEPTED") {
+      status.accepted_count++;
+    } else if (row_status == "OPENING_EXPIRED") {
+      status.expired_count++;
+    } else {
+      status.pending_count++;
+      return {false, "H15_OBLIGATION_UNRESOLVED: " + obligation + " status=" + row_status};
+    }
+  }
+
+  status.safe = true;
+  status.reason = "H15_OBLIGATIONS_CLEARED";
+  return status;
 }
 } // namespace keryx::nexus::ai

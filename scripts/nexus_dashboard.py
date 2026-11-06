@@ -28,7 +28,7 @@ def release_version():
         value = (Path(__file__).resolve().parents[1] / "VERSION").read_text().strip()
         if re.fullmatch(r"\d+\.\d+\.\d+(?:-[A-Za-z0-9.-]+)?", value): return value
     except OSError: pass
-    return "0.0.4"
+    return "0.0.5"
 
 
 RELEASE_VERSION = release_version()
@@ -158,6 +158,15 @@ class DashboardModel:
         self.setup_notice = None
         self._setup_check_thread = None
         self._setup_poll = 0
+        self.stratum = {
+            "mode": "solo", "connected": False, "state": "SOLO_GRPC",
+            "endpoint": "", "worker": "", "ping_ms": 0.0, "difficulty": 0.0,
+            "accepted_shares": 0, "rejected_shares": 0, "stale_shares": 0,
+            "duplicate_shares": 0, "blocks_submitted": 0, "pending_shares": 0,
+            "reconnect_count": 0, "challenges_passed": 0, "active_job_id": "",
+            "window_seed": "", "task_root": "", "last_error": "", "last_share_status": "NONE"
+        }
+        self.mining_mode_cfg = {"mode": "solo", "pool_url": "", "pool_worker": "", "pool_password": ""}
         self.escrow_available = {"outputs": None, "amount_sompi": None, "status": "N/A"}
         self.claimed = {"outputs": 0, "payout_sompi": 0, "transactions": 0, "status": "SESSION · ACK"}
         self._claim_acks = {}
@@ -237,7 +246,7 @@ class DashboardModel:
                 self.ai_backend = dict(obj)
         if event == "POM_BACKEND_SELECTED":
             if (type(obj.get('schema_version')) is int and obj['schema_version'] == 1 and
-                    obj.get('backend') in ('cuda-driver','vulkan-jit','vulkan-bda') and obj.get('device_id') == AUTHORIZED_GPU):
+                    obj.get('backend') in ('cuda-driver','vulkan-jit','vulkan-bda','vulkan-rdna3') and obj.get('device_id') == AUTHORIZED_GPU):
                 self.pom_backend = dict(obj)
         if event == "AMD_LANE_STATE":
             keys = ('attempts', 'completed', 'verified', 'discarded')
@@ -367,18 +376,18 @@ class DashboardModel:
             self.stats["stale"] += 1
         if "RUST_VERIFY_FAIL" in stripped: self.stats["rust_failed"] += 1
         winner_lane = ('rx' if event == 'AMD_CANDIDATE_VERIFIED' else
-                       'rtx' if event in ('LIVE_CUDA_NONCE=PASS','NVIDIA_VULKAN_CANDIDATE_VERIFIED') else None)
+                       'rtx' if event in ('LIVE_CUDA_NONCE=PASS','LIVE_H15_CUDA_NONCE=PASS','NVIDIA_VULKAN_CANDIDATE_VERIFIED') else None)
         if (winner_lane and obj.get('target_satisfied') in (True, 'true') and
                 obj.get('rust') == 'PASS' and str(obj.get('nonce', '')).isascii() and
                 str(obj.get('nonce', '')).isdecimal()):
             token = (winner_lane, str(obj['nonce']))
             if token not in self._winner_seen:
                 self._winner_seen.add(token); self.gpu_winners[winner_lane] += 1
-        if event in ("LIVE_SUBMIT_RESULT", "LIVE_CHAIN_STATUS"):
+        if event in ("LIVE_SUBMIT_RESULT", "LIVE_H15_SUBMIT_RESULT", "LIVE_CHAIN_STATUS"):
             state = str(obj.get("state", ""))
             identity = str(obj.get("hash", "")).lower()
             if re.fullmatch(r'[0-9a-f]{64}', identity):
-                if event == 'LIVE_SUBMIT_RESULT':
+                if event in ('LIVE_SUBMIT_RESULT', 'LIVE_H15_SUBMIT_RESULT'):
                     self.last_submission_hash, self.last_submission_state = identity, state
                     if state in ('UNKNOWN_OUTCOME', 'UNKNOWN_AFTER_TIMEOUT', 'SUBMIT_SENT'):
                         if identity not in self._block_seen['chain_observed']:
@@ -387,7 +396,7 @@ class DashboardModel:
                         self.unresolved_block_submissions.discard(identity)
                 elif state in ('CHAIN_OBSERVED', 'CHAIN_CONFIRMED'):
                     self.unresolved_block_submissions.discard(identity)
-            if event == 'LIVE_SUBMIT_RESULT' and re.fullmatch(r'[0-9a-f]{64}', identity):
+            if event in ('LIVE_SUBMIT_RESULT', 'LIVE_H15_SUBMIT_RESULT') and re.fullmatch(r'[0-9a-f]{64}', identity):
                 lane = {'AMD_VULKAN': 'rx', 'CUDA': 'rtx', 'NVIDIA_VULKAN':'rtx', None: 'rtx'}.get(obj.get('source'))
                 previous = self._block_device.get(identity)
                 if lane and previous is None:
@@ -404,7 +413,7 @@ class DashboardModel:
                     self._block_seen[key].add(identity); self.stats[key] += 1
                     lane = self._block_device.get(identity)
                     if lane in self.gpu_block_stats: self.gpu_block_stats[lane][key] += 1
-            if event == "LIVE_SUBMIT_RESULT":
+            if event in ("LIVE_SUBMIT_RESULT", "LIVE_H15_SUBMIT_RESULT"):
                 if state in ("SUBMIT_SENT", "RPC_ACKNOWLEDGED", "RPC_REJECTED", "UNKNOWN_AFTER_TIMEOUT"):
                     count_once("submit_sent")
                 if state == "RPC_ACKNOWLEDGED": count_once("rpc_ack")
@@ -460,7 +469,7 @@ class DashboardModel:
                     not isinstance(state, dict) or not isinstance(state.get("mining"), str) or
                     not isinstance(state.get("inference"), str)):
                 raise ValueError("invalid rates or state object")
-            if state.get('pom_backend', 'UNKNOWN') not in ('UNKNOWN', 'cuda-driver', 'vulkan-jit', 'vulkan-bda'):
+            if state.get('pom_backend', 'UNKNOWN') not in ('UNKNOWN', 'cuda-driver', 'vulkan-jit', 'vulkan-bda', 'vulkan-rdna3'):
                 raise ValueError("invalid PoM execution backend")
             for name in ("pom_msteps_s_1s", "pom_msteps_s_10s", "pom_msteps_s_60s",
                          "kernels_s_1s", "kernels_s_10s", "kernels_s_60s",
@@ -513,7 +522,31 @@ class DashboardModel:
                 self.ai_metrics['service_source'] = 'NATIVE_SAMPLED'
                 self._native_inference_start = None
             self.native = obj
-            if state.get('pom_backend') in ('cuda-driver', 'vulkan-jit', 'vulkan-bda'):
+            stratum = obj.get("stratum")
+            if isinstance(stratum, dict):
+                self.stratum = {
+                    "mode": str(stratum.get("mode", "solo")),
+                    "connected": bool(stratum.get("connected", False)),
+                    "state": str(stratum.get("state", "UNKNOWN")),
+                    "endpoint": str(stratum.get("endpoint", "")),
+                    "worker": str(stratum.get("worker", "")),
+                    "ping_ms": float(stratum.get("ping_ms", 0.0)) if isinstance(stratum.get("ping_ms"), (int, float)) else 0.0,
+                    "difficulty": float(stratum.get("difficulty", 0.0)) if isinstance(stratum.get("difficulty"), (int, float)) else 0.0,
+                    "accepted_shares": int(stratum.get("accepted_shares", 0)) if isinstance(stratum.get("accepted_shares"), int) else 0,
+                    "rejected_shares": int(stratum.get("rejected_shares", 0)) if isinstance(stratum.get("rejected_shares"), int) else 0,
+                    "stale_shares": int(stratum.get("stale_shares", 0)) if isinstance(stratum.get("stale_shares"), int) else 0,
+                    "duplicate_shares": int(stratum.get("duplicate_shares", 0)) if isinstance(stratum.get("duplicate_shares"), int) else 0,
+                    "blocks_submitted": int(stratum.get("blocks_submitted", 0)) if isinstance(stratum.get("blocks_submitted"), int) else 0,
+                    "pending_shares": int(stratum.get("pending_shares", 0)) if isinstance(stratum.get("pending_shares"), int) else 0,
+                    "reconnect_count": int(stratum.get("reconnect_count", 0)) if isinstance(stratum.get("reconnect_count"), int) else 0,
+                    "challenges_passed": int(stratum.get("challenges_passed", 0)) if isinstance(stratum.get("challenges_passed"), int) else 0,
+                    "active_job_id": str(stratum.get("active_job_id", "")),
+                    "window_seed": str(stratum.get("window_seed", "")),
+                    "task_root": str(stratum.get("task_root", "")),
+                    "last_error": str(stratum.get("last_error", "")),
+                    "last_share_status": str(stratum.get("last_share_status", "NONE")),
+                }
+            if state.get('pom_backend') in ('cuda-driver', 'vulkan-jit', 'vulkan-bda', 'vulkan-rdna3'):
                 self.pom_backend = {'schema_version': 1, 'device_id': AUTHORIZED_GPU,
                                     'backend': state['pom_backend']}
             from nexus_gpu_metrics import paired_sample
@@ -1012,7 +1045,22 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
     frame.text(4, 17, f"NODE {sync}", "value" if sync == "SYNCED" else "warning" if sync == "NOT SYNCED" else "muted", 23)
     frame.text(4, 42, "AGE " + (f"{age:.1f}s" if age is not None else "N/A"), "muted", 18)
     frame.text(4, max(60, width - 26), "UP " + uptime_text(model.snapshot()["uptime"]), "text", 23)
-    mining_rows = [("Mining", mining), ("Network / node", model.network.upper() + " / " + sync),
+    st = getattr(model, 'stratum', {}) or {}
+    is_pool = st.get('mode') == 'pool'
+    mm = getattr(model, 'mining_mode_cfg', {}) or {}
+    active_pool_id = mm.get('active_pool_id', 'suprnova')
+    active_pool_name = "Suprnova"
+    for p in mm.get('pools', []):
+        if p.get('id') == active_pool_id:
+            active_pool_name = p.get('name', active_pool_id)
+            break
+    pool_conn = (st.get('state', 'SOLO_GRPC') + (f" ({st.get('ping_ms', 0):.1f} ms)" if st.get('connected') else "")) if is_pool else (sync + " · SOLO gRPC")
+    mining_rows = [("Mining mode", f"POOL ({active_pool_name})" if is_pool else "SOLO (gRPC)"),
+                   ("Connection / ping", pool_conn),
+                   ("Pool diff / shares", f"diff {st.get('difficulty', 0):.4f} · {st.get('accepted_shares', 0)} acc / {st.get('rejected_shares', 0)} rej / {st.get('stale_shares', 0)} stale" if is_pool else "N/A (SOLO)"),
+                   ("Active pool", f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})" if is_pool else "127.0.0.1:22110 (keryxd SOLO)"),
+                   ("Pool last error", st.get('last_error') or "NONE" if is_pool else "NONE"),
+                   ("Mining", mining), ("Network / node", model.network.upper() + " / " + sync),
                    ("DAA / job", model.daa + " / " + model.last_job),
                    ("GPU activity", state.get("gpu_activity", "N/A")),
                    ("Completed / eligible", number(counters.get("gpu_work_units_completed"), 0) + " / " + number(counters.get("eligible_attempts"), 0)),
@@ -1029,6 +1077,14 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
                   ("Submit attempts", str(model.stats["submit_sent"])), ("RPC acknowledged", str(model.stats["rpc_ack"])),
                   ("DAG observed", str(model.stats["chain_observed"])), ("Chain confirmed · observed", str(model.stats["chain_confirmed"])),
                   ("RPC rejected", str(model.stats["rpc_rejected"]), "error" if model.stats["rpc_rejected"] else "value")]
+    if is_pool:
+        block_rows.extend([
+            ("Active pool", f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})"),
+            ("Pool accepted / rejected", f"{st.get('accepted_shares', 0)} / {st.get('rejected_shares', 0)}", "error" if st.get('rejected_shares', 0) else "value"),
+            ("Pool stale shares", str(st.get('stale_shares', 0))),
+            ("Pool ping / difficulty", f"{st.get('ping_ms', 0):.1f} ms / diff {st.get('difficulty', 0):.4f}"),
+            ("Pool last error", st.get('last_error') or "NONE", "error" if st.get('last_error') else "value"),
+        ])
     def activity(y, height, selected, title="LATEST ACTIVITY"):
         frame.box(y, 1, height, width - 3, title)
         if not selected:
@@ -1073,7 +1129,7 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
         frame.rows(6, 1, height - 9, width - 3, "OVERVIEW / COMPACT", rows)
     elif tab == 1:
         backend = model.pom_backend.get('backend') if fresh else None
-        backend_label = {'cuda-driver': 'CUDA DRIVER API', 'vulkan-jit': 'JIT / VULKAN', 'vulkan-bda': 'NATIVE VULKAN (BDA)'}.get(backend, 'BACKEND NOT REPORTED')
+        backend_label = {'cuda-driver': 'CUDA DRIVER API', 'vulkan-jit': 'JIT / VULKAN', 'vulkan-bda': 'NATIVE VULKAN (BDA)', 'vulkan-rdna3': 'NATIVE VULKAN (RDNA3 WMMA)'}.get(backend, 'BACKEND NOT REPORTED')
         panel_h = height - 9; frame.box(6, 1, panel_h, width - 3, display_devices(model.gpu_devices)[0]['name']+' / '+backend_label)
         frame.meter(8, 3, width - 7, "GPU load", g.get("util"), 100, f"{g.get('util', 0):.0f}%")
         frame.meter(10, 3, width - 7, "VRAM", g.get("used"), g.get("total"), f"{g.get('used', 0):.0f} / {g.get('total', 0):.0f} MiB")
@@ -1084,7 +1140,7 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
                 ("Merkle wall / CPU", ms("merkle_wall") + " / " + ms("merkle_cpu")), ("Proof build · latest", ms("proof_build")), ("Rust · last measured", ms("rust_verify")),
                 ("Last measured phase", _largest_reported_phase(latency, fresh)), ("PoM pause", state.get("pause_reason") or "NONE"),
                 ("PoM hashrate · " + chosen, hashrate), ("Hashrate unit", "Final PoM hashes · including stale")]
-        if backend in ('vulkan-jit', 'vulkan-bda'):
+        if backend in ('vulkan-jit', 'vulkan-bda', 'vulkan-rdna3'):
             unsupported = {'Kernel · latest', 'CUDA H2D / D2H', 'GGUF gather wall / CPU',
                            'Merkle wall / CPU', 'Proof build · latest', 'Rust · last measured', 'Last measured phase'}
             rows = [(name if name != 'CUDA H2D / D2H' else 'Transfers',
@@ -1184,28 +1240,63 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
             version_status, role = 'UPDATE AVAILABLE', 'warning'
         elif status == 'CHECKING': version_status, role = 'CHECKING', 'muted'
         else: version_status, role = 'CHECK REQUIRED' if status != 'ERROR' else 'CHECK FAILED', 'warning'
-        rows = [('Version', version_status, role),
-                ('Installed version', 'NEXUS v' + RELEASE_VERSION),
-                ('Automatic updates · U', 'ON' if update.get('enabled', True) else 'OFF'),
-                ('Latest GitHub commit', str(update.get('remote_commit') or 'N/A')[:12]),
-                ('Update detail', update.get('detail', 'Press R to check the latest private release')),
-                ('1 · Mining payout · P', setup.get('payout') or model.mining_payout or 'NOT CONFIGURED'),
-                ('2 · Escrow key · K import', setup.get('key_path') or 'NOT CONFIGURED · N creates a first identity'),
-                ('Escrow public key · C copy', setup.get('pubkey') or model.wallet.get('escrow_public_key') or 'N/A'),
-                ('3 · Wallet certificate · I', setup.get('cert_path') or ('EXISTING DELEGATION' if setup.get('legacy_certificate') else 'NOT CONFIGURED')),
-                ('Wallet authorization', model.wallet.get('authorization', 'UNKNOWN')),
-                ('Configuration', 'SAVED PROFILE · checked at launch' if setup.get('profile_active') else 'EXISTING IDENTITY / DRAFT'),
-                ('Activation · V', 'Verify and save · no automatic restart'),
-                ('Wallet signing', 'Keryx Wallet → Authorise a miner → import signed certificate'),
-                ('Model / H6 anchor', 'VERIFIED · active worker' if fresh and state.get('mining') == 'ACTIVE' else 'Checked at miner startup · not a wallet key'),
-                ('Node endpoint', 'grpc://127.0.0.1:22110 · mainnet'),
-                ('GPU', display_devices(model.gpu_devices)[0]['name']+' · configured UUID'),
-                ('AMD secondary AMD GPU', 'OFFLINE DIAGNOSTICS ONLY · no production admission', 'warning'),
-                ('AMD device mode', next((d['mode'].upper() for d in model.gpu_devices.get('amd_devices', [])), 'NOT DETECTED')),
-                ('AMD capabilities', next((d['capabilities_status'] for d in model.gpu_devices.get('amd_devices', [])), 'UNAVAILABLE')),
-                ('Private storage', 'state/setup · outside Git · existing keys preserved')]
+        mm = getattr(model, 'mining_mode_cfg', {}) or {}
+        mode_val = (mm.get('mode') or 'solo').upper()
+        active_pool_id = mm.get('active_pool_id', 'suprnova')
+        pools = mm.get('pools', [])
+        active_pool = next((p for p in pools if p.get('id') == active_pool_id), None)
+        if not active_pool and pools:
+            active_pool = pools[0]
+        pool_name = active_pool.get('name', 'Suprnova') if active_pool else 'Suprnova'
+        pool_url = (active_pool.get('url') if active_pool else mm.get('pool_url')) or 'NON CONFIGURATA'
+        pool_worker = (active_pool.get('worker') if active_pool else mm.get('pool_worker')) or 'NON CONFIGURATO'
+        pool_pw = '********' if (active_pool and active_pool.get('password')) or mm.get('pool_password') else 'NONE / OPTIONALE'
+        rows = [('Mining mode', mode_val)]
+        if mode_val == 'POOL':
+            rows.extend([
+                ('Selected pool', f"{pool_name} ({'CONFIGURATA' if active_pool and active_pool.get('configured') else 'NON CONFIGURATA'})"),
+                ('Active pool URL', pool_url),
+                ('Active pool worker', pool_worker),
+                ('Active pool password', pool_pw),
+                ('Failover backup pools', f"{len(pools) - 1} configurati" if len(pools) > 1 else "Nessun backup"),
+            ])
+            for idx, p in enumerate(pools):
+                p_id = p.get('id')
+                is_active = (p_id == active_pool_id)
+                p_role = "PRINCIPALE" if is_active else f"BACKUP (Prio {p.get('priority', idx+1)})"
+                rows.append((f"Pool #{idx+1}: {p.get('name')}", f"{p_role} · {p.get('url') or 'NON CONFIGURATA'}"))
+            rows.append(('Add custom pool', 'Aggiungi nuova pool personalizzata'))
+        else:
+            rows.extend([
+                ('Pool URL', f"{pool_url} (inattivo in SOLO)"),
+                ('Pool worker', f"{pool_worker} (inattivo in SOLO)"),
+                ('Pool password', f"{pool_pw} (inattivo in SOLO)"),
+            ])
+        rows.extend([
+            ('Version', version_status, role),
+            ('Installed version', 'NEXUS v' + RELEASE_VERSION),
+            ('Automatic updates · U', 'ON' if update.get('enabled', True) else 'OFF'),
+            ('Latest GitHub commit', str(update.get('remote_commit') or 'N/A')[:12]),
+            ('Update detail', update.get('detail', 'Press R to check the latest private release')),
+            ('1 · Mining payout · P', setup.get('payout') or model.mining_payout or 'NOT CONFIGURED'),
+            ('2 · Escrow key · K import', setup.get('key_path') or 'NOT CONFIGURED · N creates a first identity'),
+            ('Escrow public key · C copy', setup.get('pubkey') or model.wallet.get('escrow_public_key') or 'N/A'),
+            ('3 · Wallet certificate · I', setup.get('cert_path') or ('EXISTING DELEGATION' if setup.get('legacy_certificate') else 'NOT CONFIGURED')),
+            ('Wallet authorization', model.wallet.get('authorization', 'UNKNOWN')),
+            ('Configuration', 'SAVED PROFILE · checked at launch' if setup.get('profile_active') else 'EXISTING IDENTITY / DRAFT'),
+            ('Activation · V', 'Verify and save · no automatic restart'),
+            ('Wallet signing', 'Keryx Wallet → Authorise a miner → import signed certificate'),
+            ('Model / H6 anchor', 'VERIFIED · active worker' if fresh and state.get('mining') == 'ACTIVE' else 'Checked at miner startup · not a wallet key'),
+            ('Node endpoint', 'grpc://127.0.0.1:22110 · mainnet'),
+            ('GPU', display_devices(model.gpu_devices)[0]['name']+' · configured UUID'),
+            ('AMD RX 570', 'OFFLINE DIAGNOSTICS ONLY · no production admission', 'warning'),
+            ('AMD device mode', next((d['mode'].upper() for d in model.gpu_devices.get('amd_devices', [])), 'NOT DETECTED')),
+            ('AMD capabilities', next((d['capabilities_status'] for d in model.gpu_devices.get('amd_devices', [])), 'UNAVAILABLE')),
+            ('Private storage', 'state/setup · outside Git · existing keys preserved'),
+        ])
         frame.rows(6, 1, height - 12, width - 3, 'SETUP / FIRST RUN & UPDATES', rows)
         frame.text(height - 6, 3, model.setup_notice or 'P payout → K import key / N first key → C copy public key → I certificate → V verify', 'value', width - 7)
+        frame.text(height - 5, 3, 'M TOGGLE SOLO/POOL · O POOL URL · W POOL WORKER · X POOL PASSWORD', 'title', width - 7)
         frame.text(height - 4, 3, 'P PAYOUT · K KEY FILE · N FIRST KEY · C COPY PUBLIC KEY · I CERTIFICATE · V VERIFY', 'title', width - 7)
         frame.text(height - 3, 3, 'R CHECK UPDATES · U AUTO UPDATES · A AMD REFRESH · D AMD DIAGNOSTICS', 'title', width - 7)
     else:
@@ -1294,10 +1385,10 @@ def worker_environment(environment):
     """Preserve the admitted route; never re-enable CUDA in a Vulkan-only worker."""
     env = dict(environment)
     backend = env.get("NEXUS_POM_BACKEND", "cuda-driver")
-    if backend not in ("cuda-driver", "vulkan-jit", "vulkan-bda"):
+    if backend not in ("cuda-driver", "vulkan-jit", "vulkan-bda", "vulkan-rdna3"):
         raise ValueError("Unknown worker backend; refusing implicit CUDA fallback")
     env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    if backend in ("vulkan-jit", "vulkan-bda"):
+    if backend in ("vulkan-jit", "vulkan-bda", "vulkan-rdna3"):
         env["CUDA_VISIBLE_DEVICES"] = ""
         env.pop("NEXUS_CUDA_DEVICE_UUID", None)
     else:
@@ -1443,7 +1534,7 @@ def setup_keypress(stdscr, model, root, key):
                     model.setup_notice = refresh_capabilities()
                 else:
                     devices = status()['amd_devices']
-                    if len(devices) != 1: raise ValueError('Select exactly one secondary AMD GPU by PCI id using the GPU configuration CLI')
+                    if len(devices) != 1: raise ValueError('Select exactly one RX 570 by PCI id using the GPU configuration CLI')
                     model.setup_notice = configure_mode('disabled' if devices[0]['mode'] == 'diagnostics' else 'diagnostics', devices[0]['id'])
             except (OSError, ValueError, subprocess.SubprocessError) as error:
                 model.setup_notice = str(error) if isinstance(error, ValueError) else 'AMD configuration unavailable; production unchanged'
@@ -1479,6 +1570,42 @@ def setup_keypress(stdscr, model, root, key):
             if not isinstance(pubkey, str) or not re.fullmatch('[0-9a-f]{64}', pubkey): raise ValueError('Configure an escrow key first')
             model.setup_notice = copy_public_value(pubkey, 'escrow public key')
         except (OSError, ValueError): model.setup_notice = 'Escrow public key unavailable'
+    elif key in (ord('m'), ord('M')):
+        import nexus_mining_mode
+        try:
+            curr = nexus_mining_mode.load()
+            next_mode = 'pool' if curr.get('mode') == 'solo' else 'solo'
+            res = nexus_mining_mode.save({'mode': next_mode}, auto_restart=True)
+            model.setup_notice = f"Mining mode switched to {res['mode'].upper()} (miner restarted)"
+            model.mining_mode_cfg = nexus_mining_mode.load()
+        except Exception as e:
+            model.setup_notice = f"Mining mode error: {e}"
+    elif key in (ord('o'), ord('O'), ord('w'), ord('W'), ord('x'), ord('X')):
+        import nexus_mining_mode
+        field = {'o': 'pool_url', 'w': 'pool_worker', 'x': 'pool_password'}[chr(key).lower()]
+        prompt = {
+            'pool_url': 'Stratum Pool URL (e.g. stratum+tcp://pool:port): ',
+            'pool_worker': 'Pool worker identifier (wallet.worker): ',
+            'pool_password': 'Pool password (optional, Enter for none): '
+        }[field]
+        try:
+            height, width = stdscr.getmaxyx(); stdscr.nodelay(False)
+            curses.echo() if field != 'pool_password' else curses.noecho()
+            curses.curs_set(1)
+            stdscr.move(height - 2, 0); stdscr.clrtoeol()
+            stdscr.addnstr(height - 2, 0, prompt, width - 2); stdscr.refresh()
+            raw_val = stdscr.getstr(height - 2, min(len(prompt), width - 2), 1024).decode('utf-8').strip()
+        except (curses.error, UnicodeError): model.setup_notice = 'Input unavailable'; return
+        finally:
+            stdscr.nodelay(True); model._render_cache = None
+            try: curses.noecho(); curses.curs_set(0)
+            except curses.error: pass
+        try:
+            res = nexus_mining_mode.save({field: raw_val}, auto_restart=True)
+            model.setup_notice = f"{field.replace('_', ' ').capitalize()} updated (miner restarted)"
+            model.mining_mode_cfg = nexus_mining_mode.load()
+        except Exception as e:
+            model.setup_notice = f"Error saving {field}: {e}"
     elif key in tuple(map(ord, 'pPkKnNiIvV')):
         from nexus_setup import configure
         action = {'p':'payout','k':'key','n':'new_key','i':'certificate','v':'verify'}[chr(key).lower()]
@@ -1613,13 +1740,18 @@ def refresh_development_status(model, root):
             model.setup['profile_active'] = PROFILE.exists()
         except (OSError, ValueError, RuntimeError):
             model.setup = {'error': 'Setup configuration unavailable; current worker unchanged'}
+        try:
+            import nexus_mining_mode
+            model.mining_mode_cfg = nexus_mining_mode.load()
+        except Exception:
+            model.mining_mode_cfg = {"mode": "solo", "pool_url": "", "pool_worker": "", "pool_password": ""}
 
 
 class TelemetryFollower:
     """Read a complete log session with bounded buffers, then drain bursts in batches."""
     history_markers = (b"NEXUS_TELEMETRY", b"STARTUP_STATE", b"NODE_INFO", b"NODE_NETWORK", b"SERVICE_STRIKE_POLL", b"AI_SERVICE_STATUS", b"AI_SERVICE_ERROR", b"AI_STARTUP_BACKFILL=", b"OPOI_RUNTIME=", b'"official_rust_verify"',
                        b"AI_REQUEST_", b"AI_RESPONSE_", b"LIVE_SUBMIT_RESULT", b"LIVE_H15_SUBMIT_RESULT", b"LIVE_CHAIN_STATUS", b"ESCROW_CLAIM_SUBMISSION",
-                       b"AMD_LANE_STATE", b"AMD_CANDIDATE_VERIFIED", b"LIVE_CUDA_NONCE=PASS", b"NVIDIA_VULKAN_CANDIDATE_VERIFIED", b"POM_BACKEND_SELECTED")
+                       b"AMD_LANE_STATE", b"AMD_CANDIDATE_VERIFIED", b"LIVE_CUDA_NONCE=PASS", b"LIVE_H15_CUDA_NONCE=PASS", b"NVIDIA_VULKAN_CANDIDATE_VERIFIED", b"POM_BACKEND_SELECTED")
     def __init__(self, path):
         self.path = Path(path).resolve()
         if self.path == Path("/tmp") or str(self.path).startswith("/tmp/"):

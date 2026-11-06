@@ -11,14 +11,19 @@ import uuid
 
 def presentation(mirror, tab, log_filter, height=46, log_before=None):
     from nexus_web_mirror import snapshot_for_model
+    from nexus_presenter import build_presenter_frame
     from nexus_ui_preferences import load, resolved_view, large_gpu_count, blend, contrast
     from nexus_gpu_registry import records, workload_options
     from nexus_notifications import notifications_enabled
     with mirror.lock:
         model, gpu = mirror.model.presentation_copy(), mirror.gpu
     preferences = load()
-    frame = snapshot_for_model(model, gpu, tab, log_filter,
-                               height=height, preferences=preferences, log_before=log_before)
+    import nexus_mining_mode
+    frame = snapshot_for_model(model, gpu, tab, log_filter, log_before=log_before)
+    if hasattr(model, 'stratum') and model.stratum:
+        frame['stratum'] = model.stratum
+    frame['panels'] = build_presenter_frame(height, 160, model, gpu, tab, log_filter,
+                                            preferences=preferences, log_before=log_before).panels
     bg, fg = preferences['background'], preferences['text']
     def readable(color):
         return color if contrast(color, bg) >= 4.5 else fg
@@ -30,7 +35,9 @@ def presentation(mirror, tab, log_filter, height=46, log_before=None):
         'api_active': model.development.get('server_unit') == 'active',
         'mcp_active': model.development.get('mcp', {}).get('server_unit') == 'active',
         'notifications_enabled': notifications_enabled(),
+        'is_paused': nexus_mining_mode.is_miner_paused(),
         'mining_payout': model.mining_payout or model.setup.get('payout') or '',
+        'mining_mode': nexus_mining_mode.public_view(),
         'key_exists': bool(model.setup.get('key_path') or model.wallet.get('escrow_public_key')),
         'devices': [dict(id=r['id'], name=r['name'], vendor=r['vendor'],
                          runtime_lane=r.get('runtime_lane'), options=workload_options(r)) for r in records(model.gpu_devices)],
@@ -50,6 +57,9 @@ def presentation(mirror, tab, log_filter, height=46, log_before=None):
                 'reason': str(handoff.get('reason', ''))[:400]}
     except (OSError, ValueError, TypeError, AttributeError):
         pass  # Missing status never prevents access to controls.
+    if nexus_mining_mode.is_miner_paused():
+        if isinstance(frame.get('state'), dict):
+            frame['state']['mining'] = 'PAUSED'
     frame.pop('escrow_public_key', None)
     frame.pop('setup_key_exists', None)
     return frame

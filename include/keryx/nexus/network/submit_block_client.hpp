@@ -1,6 +1,5 @@
 #pragma once
 #include <functional>
-#include <atomic>
 
 #include "keryx/nexus/network/submission_gate.hpp"
 #include "rpc.pb.h"
@@ -55,7 +54,6 @@ class SubmitBlockClient final {
 public:
   explicit SubmitBlockClient(std::string endpoint);
   ~SubmitBlockClient();
-  void block_new_submissions() noexcept { blocked_.store(true,std::memory_order_release); }
   SubmitBlockResult submit(const protowire::RpcBlock &block,
                            const VerifiedSubmission &verified,
                            bool enable_live_submit,
@@ -71,7 +69,6 @@ public:
                                   std::chrono::milliseconds poll_interval = std::chrono::seconds(1),
                                   std::uint64_t confirmation_blue_score_depth = 6);
 private:
-  std::atomic_bool blocked_{false};
   struct PersistentStream;
   std::unique_ptr<PersistentStream> stream_;
   std::mutex stream_mutex_;

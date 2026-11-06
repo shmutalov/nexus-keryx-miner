@@ -51,6 +51,29 @@ class NativePomTelemetry final {
     bool valid_stale_work_fraction{};
   };
 
+  struct StratumFields {
+    std::string mode{"solo"};
+    bool connected{false};
+    std::string state{"SOLO_GRPC"};
+    std::string endpoint;
+    std::string worker;
+    double ping_ms{0.0};
+    double difficulty{0.0};
+    std::uint64_t accepted_shares{0};
+    std::uint64_t rejected_shares{0};
+    std::uint64_t stale_shares{0};
+    std::uint64_t duplicate_shares{0};
+    std::uint64_t blocks_submitted{0};
+    std::uint64_t pending_shares{0};
+    std::uint64_t reconnect_count{0};
+    std::uint64_t challenges_passed{0};
+    std::string active_job_id;
+    std::string window_seed_hex;
+    std::string task_root_hex;
+    std::string last_error;
+    std::string last_share_status{"NONE"};
+  };
+
   explicit NativePomTelemetry(std::uint64_t start_monotonic_ns)
       : started_ns_(start_monotonic_ns), last_sample_ns_(start_monotonic_ns) {
     history_.push_back({start_monotonic_ns, 0, 0, 0});
@@ -112,6 +135,13 @@ class NativePomTelemetry final {
     pause_reason_ = std::move(pause_reason);
     submission_state_ = std::move(submission);
   }
+  void h15_restore_finished() {
+    std::lock_guard lock(state_mutex_);
+    if (mining_state_ == "PAUSED" && pause_reason_ == "H15_CHAIN_RESTORE") {
+      mining_state_ = "ACTIVE";
+      pause_reason_.clear();
+    }
+  }
   void set_wallet(std::string payout, std::string escrow_public_key,
                   std::string service_identity, bool authorized) {
     std::lock_guard lock(state_mutex_);
@@ -127,6 +157,10 @@ class NativePomTelemetry final {
   void set_pom_backend(std::string backend) {
     std::lock_guard lock(state_mutex_);
     pom_backend_ = std::move(backend);
+  }
+  void set_stratum(StratumFields stratum) {
+    std::lock_guard lock(state_mutex_);
+    stratum_ = std::move(stratum);
   }
 
   Counters counters() const noexcept {
@@ -183,6 +217,7 @@ class NativePomTelemetry final {
     const auto r = sample_rates(now_ns);
     std::string mining, inference, pause, submission, payout, escrow_pubkey, service_identity, gpu_activity, pom_backend;
     bool wallet_authorized{};
+    StratumFields stratum;
     {
       std::lock_guard lock(state_mutex_);
       mining = mining_state_;
@@ -195,6 +230,7 @@ class NativePomTelemetry final {
       gpu_activity = gpu_activity_;
       pom_backend = pom_backend_;
       wallet_authorized = wallet_authorized_;
+      stratum = stratum_;
     }
     const auto elapsed_ns = now_ns >= started_ns_ ? now_ns - started_ns_ : 0;
     std::ostringstream out;
@@ -261,7 +297,28 @@ class NativePomTelemetry final {
         << "\",\"payout_address\":\"" << escape_json(payout)
         << "\",\"escrow_public_key\":\"" << escape_json(escrow_pubkey)
         << "\",\"service_identity\":\"" << escape_json(service_identity)
-        << "\",\"certificate_source\":\"worker_verified\",\"error\":null}}";
+        << "\",\"certificate_source\":\"worker_verified\",\"error\":null}"
+        << ",\"stratum\":{\"mode\":\"" << escape_json(stratum.mode)
+        << "\",\"connected\":" << (stratum.connected ? "true" : "false")
+        << ",\"state\":\"" << escape_json(stratum.state)
+        << "\",\"endpoint\":\"" << escape_json(stratum.endpoint)
+        << "\",\"worker\":\"" << escape_json(stratum.worker)
+        << "\",\"ping_ms\":" << (std::isfinite(stratum.ping_ms) && stratum.ping_ms >= 0.0 ? stratum.ping_ms : 0.0)
+        << ",\"difficulty\":" << (std::isfinite(stratum.difficulty) && stratum.difficulty >= 0.0 ? stratum.difficulty : 0.0)
+        << ",\"accepted_shares\":" << stratum.accepted_shares
+        << ",\"rejected_shares\":" << stratum.rejected_shares
+        << ",\"stale_shares\":" << stratum.stale_shares
+        << ",\"duplicate_shares\":" << stratum.duplicate_shares
+        << ",\"blocks_submitted\":" << stratum.blocks_submitted
+        << ",\"pending_shares\":" << stratum.pending_shares
+        << ",\"reconnect_count\":" << stratum.reconnect_count
+        << ",\"challenges_passed\":" << stratum.challenges_passed
+        << ",\"active_job_id\":\"" << escape_json(stratum.active_job_id)
+        << "\",\"window_seed\":\"" << escape_json(stratum.window_seed_hex)
+        << "\",\"task_root\":\"" << escape_json(stratum.task_root_hex)
+        << "\",\"last_error\":\"" << escape_json(stratum.last_error)
+        << "\",\"last_share_status\":\"" << escape_json(stratum.last_share_status)
+        << "\"}}";
     return out.str();
   }
 
@@ -338,6 +395,7 @@ class NativePomTelemetry final {
   std::string pom_backend_{"UNKNOWN"};
   std::string payout_address_{}, escrow_public_key_{}, service_identity_{};
   bool wallet_authorized_{};
+  StratumFields stratum_{};
 };
 
 }  // namespace keryx::nexus

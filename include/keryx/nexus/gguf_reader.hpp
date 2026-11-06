@@ -112,7 +112,7 @@ private:
   };
   // Keep the bounded cache off the caller stack (several indexes may coexist).
   mutable std::vector<SlabCacheEntry> slab_cache_{256};
-  mutable std::size_t slab_cache_cursor_{};
+  mutable std::mutex slab_cache_mutex_;
   std::uint64_t count_at(std::uint32_t level) const;
   consensus::Hash read_node(const Checkpoint &checkpoint, std::uint64_t index) const;
   consensus::Hash cached_node(std::uint32_t level, std::uint64_t index) const;

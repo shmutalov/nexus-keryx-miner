@@ -26,8 +26,10 @@ public:
     if(path.empty())throw std::runtime_error("Dedicated cgroup v2 required for miner cache guard");
     root_=std::filesystem::path("/sys/fs/cgroup")/path.substr(1);
     const auto leaf=root_.filename().string();
-    if(leaf!="nexus-v002-production.service" && !(leaf.starts_with("nexus-dual-")&&leaf.ends_with(".service")))
-      throw std::runtime_error("Refusing to reclaim a shared/non-miner cgroup");
+    if(leaf!="nexus-v002-production.service" && !(leaf.starts_with("nexus-dual-")&&leaf.ends_with(".service"))) {
+      std::cout<<"MINER_FILE_CACHE_GUARD=SKIPPED scope="<<leaf<<"\n"<<std::flush;
+      return;
+    }
     const int result=request("0 swappiness=0");
     if(result)throw std::runtime_error("Delegated file reclaim unavailable, errno="+std::to_string(result));
     thread_=std::jthread([this](std::stop_token stop){

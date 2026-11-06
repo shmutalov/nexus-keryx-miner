@@ -1,13 +1,14 @@
 #include "keryx/nexus/consensus/pom_v5.hpp"
 #include <algorithm>
-#include <thread>
-#include <mutex>
-#include <deque>
-#include <condition_variable>
-#include <future>
 #include <bit>
+#include <future>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace keryx::nexus::consensus {
 namespace {
@@ -55,12 +56,13 @@ void put(std::vector<std::uint8_t>&out,std::uint64_t v,unsigned n) {
   for(unsigned j=0;j<n;++j)out.push_back(static_cast<std::uint8_t>(v>>(8*j)));
 }
 }
-V5PadSpec official_v5_pad(std::uint8_t tier,const Hash&model,const Hash&root) {
+V5PadSpec official_v5_pad(std::uint8_t tier,const Hash&model,const Hash&root,std::uint64_t daa) {
   if(tier>=v5_pad_tiles_by_tier.size())throw std::out_of_range("v5 tier outside 0..4");
   constexpr std::string_view domain="KERYX-POM-V5-PAD";
   std::vector<std::uint8_t> bytes(domain.begin(),domain.end());bytes.push_back(tier);
   bytes.insert(bytes.end(),model.begin(),model.end());bytes.insert(bytes.end(),root.begin(),root.end());
-  return {blake3_hash(bytes),v5_pad_tiles_by_tier[tier]};
+  const auto tiles = (daa >= pom_h16_activation_daa) ? v5_pad_tiles_by_tier_h16[tier] : v5_pad_tiles_by_tier_h14[tier];
+  return {blake3_hash(bytes),tiles};
 }
 std::array<std::uint64_t,4> v5_pad_seed_words(const Hash&seed) {
   constexpr std::array<std::uint64_t,4> iv{0x510e527fade682d1ULL,0x9b05688c2b3e6c1fULL,0x1f83d9abfb41bd6bULL,0x5be0cd19137e2179ULL};
@@ -127,7 +129,8 @@ V5Proof prove_v5_from_walk_parallel(const Walk &walk, std::uint8_t tier,
   proof.tiles.resize(walk_steps);
   proof.paths.resize(walk_steps);
 
-  if (num_threads == 0 || num_threads > 8) throw std::invalid_argument("v5 proof threads must be at most 8");
+  if (num_threads == 0) num_threads = 1;
+  if (num_threads > walk_steps) num_threads = static_cast<unsigned>(walk_steps);
 
   static ProofPool pool;
   const std::size_t chunk_size = (walk_steps + num_threads - 1) / num_threads;

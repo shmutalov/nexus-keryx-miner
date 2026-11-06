@@ -3,9 +3,13 @@
 
 namespace keryx::nexus::consensus {
 inline constexpr std::uint64_t pom_v5_activation_daa = 140'115'000;
+inline constexpr std::uint64_t pom_h16_activation_daa = 147'000'000;
 inline constexpr std::uint32_t v5_pad_rounds = 1920;
 inline constexpr std::array<std::uint64_t, 5> v5_pad_tiles_by_tier{
     638976, 3213312, 4804608, 6471680, 2450432};
+inline constexpr std::array<std::uint64_t, 5> v5_pad_tiles_by_tier_h14 = v5_pad_tiles_by_tier;
+inline constexpr std::array<std::uint64_t, 5> v5_pad_tiles_by_tier_h16{
+    434176, 3008512, 4599808, 6266880, 2245632};
 struct V5PadSpec {
   Hash seed{};
   std::uint64_t tiles{};
@@ -18,7 +22,7 @@ struct V5Proof {
   std::vector<std::vector<Hash>> paths;
 };
 struct V5ModelProofBuild { Walk walk; V5Proof proof; };
-V5PadSpec official_v5_pad(std::uint8_t tier, const Hash &model_id, const Hash &root);
+V5PadSpec official_v5_pad(std::uint8_t tier, const Hash &model_id, const Hash &root, std::uint64_t daa = 0);
 std::array<std::uint64_t, 4> v5_pad_seed_words(const Hash &seed);
 Hash v5_pad_entry(const Hash &seed, std::uint64_t index);
 std::array<std::uint8_t, tile_bytes> v5_pad_tile(const Hash &seed, std::uint64_t tile);

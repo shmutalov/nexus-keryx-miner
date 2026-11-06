@@ -1,6 +1,7 @@
 #include "keryx/nexus/developer_config.hpp"
 #include "keryx/nexus/consensus/cuda_resident.hpp"
 #include <cuda.h>
+#include "keryx/nexus/pom_vram_admission.hpp"
 #include "keryx/nexus/gpu_device_policy.hpp"
 #include <algorithm>
 #include <array>
@@ -31,7 +32,10 @@ struct Buffer {CUdeviceptr ptr{};CUcontext context{};
   Buffer()=default;Buffer(const Buffer&)=delete;Buffer&operator=(const Buffer&)=delete;
   Buffer(Buffer&&o)noexcept:ptr(o.ptr),context(o.context){o.ptr=0;}
   ~Buffer(){if(ptr){cuCtxSetCurrent(context);cuMemFree(ptr);}}
-  void allocate(std::size_t n){check(cuCtxGetCurrent(&context),"allocation context");check(cuMemAlloc(&ptr,n),"resident cuMemAlloc");}
+  void release_checked(){if(ptr){check(cuCtxSetCurrent(context),"PoM cleanup context");check(cuMemFree(ptr),"PoM cleanup allocation");ptr=0;}}
+  void allocate(std::size_t n){check(cuCtxGetCurrent(&context),"allocation context");const auto result=cuMemAlloc(&ptr,n);
+    if(result==CUDA_ERROR_OUT_OF_MEMORY){std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"PoM OOM budget observation");throw PomVramAdmissionDenied({n,0,free},true);}
+    check(result,"resident cuMemAlloc");}
 };
 struct V5Resources {
   V5PadSpec spec;
@@ -64,6 +68,9 @@ struct CudaResidentSearch::Impl {
   std::uint64_t cached_sponge_timestamp{};
   std::uint64_t cached_sponge_daa{};
   bool sponge_valid{false};
+#ifdef NEXUS_TEST_POM_ALLOCATOR
+  Impl(){tiles=1048576;canonical_bases={4096};canonical_prefix={0,tiles*32};}
+#endif
   Impl(const std::string &uuid,const model::ReadOnlyGguf &gguf,const std::vector<opoi::ResidentTensor>&tensors){
     const char *visible=std::getenv("CUDA_VISIBLE_DEVICES");
     if(uuid!=primary_gpu_uuid()||!visible||uuid!=visible)throw std::runtime_error("resident solver requires exclusive authorized GPU UUID");
@@ -76,6 +83,7 @@ struct CudaResidentSearch::Impl {
     require_cuda_model(device_name,major,minor,std::getenv("NEXUS_PRIMARY_GPU_NAME"));
     check(cuDevicePrimaryCtxRetain(&ctx.value,ctx.device),"retain shared primary context");ctx.retained=true;
     check(cuCtxSetCurrent(ctx.value),"bind shared primary context");resources.context=ctx.value;
+    check(cuCtxSynchronize(),"synchronize shared primary context");
     const auto &canonical=gguf.canonical_tensors();
     if(tensors.size()!=canonical.size()||tensors.empty()||tensors.size()>65535)throw std::runtime_error("canonical resident tensor count mismatch");
     std::vector<std::uint64_t> host_bases,host_offsets,host_prefix{0};
@@ -93,7 +101,7 @@ struct CudaResidentSearch::Impl {
         if(host_uploaded||t.name!="token_embd.weight"||t.bytes!=699269120)
           throw std::runtime_error("unexpected host resident tensor: "+t.name+" bytes="+std::to_string(t.bytes));
         std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"resident upload VRAM budget");
-        if(free<t.bytes+64ULL*1024*1024)throw std::runtime_error("insufficient VRAM for canonical embedding upload and bounded PoM workspace");
+        require_pom_vram({t.bytes,0,free});
         uploads.emplace_back();uploads.back().allocate(t.bytes);ptr=uploads.back().ptr;
         check(cuMemcpyHtoD(ptr,reinterpret_cast<const void*>(t.address),t.bytes),"upload CPU resident tensor");host_uploaded+=t.bytes;
       }
@@ -120,7 +128,7 @@ struct CudaResidentSearch::Impl {
     this->host_lut=host_lut;
     bases.allocate(host_bases.size()*8);prefix.allocate(host_prefix.size()*8);lut.allocate(host_lut.size()*2);winner.allocate(8);sponge.allocate(25*8);h10_seeds.allocate(18432*8);
     check(cuMemcpyHtoD(bases.ptr,host_bases.data(),host_bases.size()*8),"copy tensor descriptors");check(cuMemcpyHtoD(prefix.ptr,host_prefix.data(),host_prefix.size()*8),"copy canonical prefix");check(cuMemcpyHtoD(lut.ptr,host_lut.data(),host_lut.size()*2),"copy chunk LUT");
-    check(cuModuleLoadData(&resources.module,_binary_nexus_resident_cubin_start),"load resident multi-architecture CUDA image");check(cuModuleGetFunction(&kernel,resources.module,"nexus_resident_search_preseeded"),"resident kernel entry point");
+    check(cuModuleLoadData(&resources.module,_binary_nexus_resident_cubin_start),"load resident multi-architecture image");check(cuModuleGetFunction(&kernel,resources.module,"nexus_resident_search_preseeded"),"resident kernel entry point");
     check(cuModuleGetFunction(&v5_kernel,resources.module,"nexus_resident_search_v5"),"v5 resident kernel entry point");
     check(cuModuleGetFunction(&pad_fill_kernel,resources.module,"nexus_v5_pad_fill"),"v5 pad fill entry point");
     check(cuModuleGetFunction(&seed_kernel,resources.module,"nexus_h10_seeds"),"H10 seed entry point");
@@ -131,7 +139,7 @@ struct CudaResidentSearch::Impl {
     witness_pairs.allocate(walk_steps*2*tile_bytes);
     const auto fold_bytes=((tiles+1)&~std::uint64_t(1))*8;
     std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"tile fold cache VRAM budget");
-    if(free<fold_bytes+64ULL*1024*1024)throw std::runtime_error("insufficient VRAM for bounded immutable tile fold cache");
+    require_pom_vram({fold_bytes,0,free});
     tile_folds.allocate(fold_bytes);
     if(fold_bytes>tiles*8)check(cuMemsetD8(tile_folds.ptr+tiles*8,0,fold_bytes-tiles*8),"initialize tile fold padding");
     check(cuStreamCreate(&resources.stream,CU_STREAM_NON_BLOCKING),"resident stream");check(cuEventCreate(&resources.begin,0),"resident begin event");check(cuEventCreate(&resources.end,0),"resident end event");
@@ -232,6 +240,9 @@ bool CudaResidentSearch::diagnostic_headroom_available() const {
   // cache (256 KiB), bounded staging/trace and module overhead.
   return free>=264ULL*1024*1024;
 }
+#ifdef NEXUS_TEST_POM_ALLOCATOR
+CudaResidentSearch::CudaResidentSearch():impl_(std::make_unique<Impl>()){}
+#endif
 bool CudaResidentSearch::v5_ready_for(const V5PadSpec&spec) const noexcept {
   return impl_->v5 && impl_->v5->spec==spec;
 }
@@ -254,10 +265,11 @@ bool CudaResidentSearch::prepare_v5(const V5PadSpec&spec,const std::function<boo
   const auto chunks=(p.tiles+spec.tiles)*32;
   const auto lut_entries=static_cast<std::size_t>(((chunks-1)>>p.shift)+1);
   const auto metadata_bytes=(p.canonical_bases.size()+2)*16+lut_entries*2;
-  if(free<reserve || metadata_bytes>free-reserve || bytes>free-reserve-metadata_bytes)
-    throw std::runtime_error("v5 context pad does not fit: needs "+std::to_string(bytes)+" bytes plus metadata and reserve; free="+std::to_string(free));
+  static_assert(reserve==PomVramBudget::reserve_bytes);
+  require_pom_vram({bytes,metadata_bytes,free});
   auto next=std::make_unique<V5Resources>();next->spec=spec;next->pad_steps=steps;
   next->reciprocal=UINT64_MAX/spec.tiles;
+  try {
   next->pad.allocate(bytes);
   const auto words=v5_pad_seed_words(spec.seed);
   const auto entries=spec.tiles*32;
@@ -286,6 +298,11 @@ bool CudaResidentSearch::prepare_v5(const V5PadSpec&spec,const std::function<boo
   if(cancelled&&cancelled())return false;
   p.v5=std::move(next);
   return true;
+  } catch(const PomVramAdmissionDenied &) {
+    check(cuStreamSynchronize(p.resources.stream),"drain partial v5 allocation");
+    next->lut.release_checked();next->prefix.release_checked();next->bases.release_checked();next->pad.release_checked();
+    throw;
+  }
 }
 std::array<std::uint8_t,tile_bytes> CudaResidentSearch::read_v5_pad_tile(std::uint64_t tile) {
   auto&p=*impl_;if(!p.v5||tile>=p.v5->spec.tiles)throw std::out_of_range("v5 pad is not ready or tile outside pad");

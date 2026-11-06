@@ -215,7 +215,7 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
     throw std::invalid_argument("SubmitBlock nonce does not match verified candidate");
 
   SubmitBlockResult output;
-  if(blocked_.load(std::memory_order_acquire)||(cancelled && cancelled()))return output;
+  if(cancelled && cancelled())return output;
   transition(output, SubmissionState::CandidateValid);
   output.reservation = gate_.reserve(verified);
   const auto candidate_header = consensus::header_from_rpc(block.header());
@@ -237,7 +237,7 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
     channel=submit_channel_;
     }
     while(channel->GetState(true)!=GRPC_CHANNEL_READY) {
-      if(blocked_.load(std::memory_order_acquire)||(cancelled && cancelled()))return done();
+      if(cancelled && cancelled())return done();
       if(std::chrono::system_clock::now()>=deadline)throw std::runtime_error("node RPC channel connection timed out before request was sent");
       channel->WaitForStateChange(channel->GetState(false),
           std::min(deadline,std::chrono::system_clock::now()+std::chrono::milliseconds(10)));
@@ -281,8 +281,7 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
   payload->mutable_block()->CopyFrom(block);
   payload->set_allownondaablocks(false);
   output.timing.prepare_ms=elapsed(phase);phase=std::chrono::steady_clock::now();
-  if(blocked_.load(std::memory_order_acquire)||(cancelled && cancelled())||
-     (verified.still_current && !verified.still_current())) {discard_stream();return done();}
+  if(cancelled && cancelled()) {discard_stream();return done();}
   if(!active->wire->Write(request)) {
     output.timing.write_ms=elapsed(phase);
     discard_stream();

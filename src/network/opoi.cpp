@@ -185,6 +185,9 @@ struct StockLlamaRuntime::Impl {
   ErrorFn last_error{};
   GenerateFn generate{};
   FreeFn free_model{};
+  void (*q8c_release)(int){};
+  void (*q8s_release)(int){};
+  bool scratch_active{true};
   std::string gguf;
   int abi{};
   std::uint32_t context_capacity{};
@@ -242,6 +245,8 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
       api.trace_tokens = symbol<decltype(api.trace_tokens)>(impl_->library,"keryx_llama_trace_tokens");
       api.replay_multi = symbol<decltype(api.replay_multi)>(impl_->library,"keryx_llama_replay_multi");
       api.context_acquire = symbol<decltype(api.context_acquire)>(impl_->library,"keryx_llama_context_acquire");
+      impl_->q8c_release = reinterpret_cast<void (*)(int)>(platform::library_symbol(impl_->library, "ggml_cuda_q8c_release"));
+      impl_->q8s_release = reinterpret_cast<void (*)(int)>(platform::library_symbol(impl_->library, "ggml_cuda_q8s_release"));
     }
   }
   // Match the official Qwen tier-0 cap/floor and KERYX_LLAMA_CTX override.
@@ -298,6 +303,12 @@ std::vector<ResidentTensor> StockLlamaRuntime::resident_tensors() const {
 std::string StockLlamaRuntime::answer(const Challenge &challenge) {
   if (!impl_ || !impl_->model || !impl_->generate) throw std::logic_error("OPoI runtime is not loaded");
   if (challenge.model_id != qwen35_model_id) throw std::invalid_argument("OPoI challenge/model mismatch");
+  if (impl_->context_capacity <= 256) {
+    const std::string prompt = "<|im_start|>system\nYou are a Keryx AI.<|im_end|>\n"
+                               "<|im_start|>user\nChallenge " + challenge.nonce_hex + ": describe yourself.<|im_end|>\n"
+                               "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    return infer(prompt, 32);
+  }
   const auto prompt = official_qwen35_prompt(challenge.nonce_hex);
   return infer(prompt, 64);
 }
@@ -310,6 +321,7 @@ std::string StockLlamaRuntime::infer(std::string_view prompt, std::uint32_t max_
   if (prompt.find('\0') != std::string_view::npos)
     throw std::invalid_argument("AiRequest prompt contains an embedded NUL byte");
   const std::string owned_prompt(prompt);
+  impl_->scratch_active = true;
   if (impl_->trace) impl_->trace->ensure_full_context();
   std::vector<char> output(64 * 1024, '\0');
   const int length = impl_->generate(impl_->model, owned_prompt.c_str(), static_cast<int>(max_tokens), output.data(),
@@ -323,12 +335,15 @@ std::uint32_t StockLlamaRuntime::configure_sequence(std::span<const SequenceLaye
     std::uint32_t n_attn,std::uint32_t n_recur,std::uint32_t heads,std::uint32_t interval) {
   if(!impl_ || !impl_->trace || impl_->abi!=9)throw std::runtime_error("Sequence trace requires ABI9");
   const std::lock_guard lock(impl_->mutex);
+  if (!layers.empty()) impl_->scratch_active = true;
   return impl_->trace->configure_sequence(layers,n_attn,n_recur,heads,interval);
 }
 std::vector<SequenceCapture> StockLlamaRuntime::replay_sequence(const TracedGeneration &capture,
     std::span<const SequenceSpan> spans,std::uint32_t max_chunks) {
   if(!impl_ || !impl_->trace || impl_->abi!=9)throw std::runtime_error("Sequence replay requires ABI9");
-  const std::lock_guard lock(impl_->mutex);return impl_->trace->replay_sequence(capture,spans,max_chunks);
+  const std::lock_guard lock(impl_->mutex);
+  impl_->scratch_active = true;
+  return impl_->trace->replay_sequence(capture,spans,max_chunks);
 }
 int StockLlamaRuntime::abi_version() const noexcept { return impl_ ? impl_->abi : 0; }
 
@@ -336,35 +351,59 @@ void StockLlamaRuntime::use_task_context() {
   if(!impl_ || !impl_->trace || (impl_->abi!=8 && impl_->abi!=9))
     throw std::runtime_error("Task context requires stock llama ABI8/9");
   const std::lock_guard lock(impl_->mutex);
+  if (impl_->scratch_active) {
+    if (impl_->abi == 9) {
+      (void)impl_->trace->configure_sequence({}, 0, 0, 0, 0);
+    }
+    if (impl_->q8s_release) {
+      impl_->q8s_release(0);
+    }
+    if (impl_->q8c_release) {
+      impl_->q8c_release(0);
+    }
+    impl_->trace->use_task_context();
+    if (impl_->q8c_release) {
+      impl_->q8c_release(0);
+    }
+    impl_->scratch_active = false;
+    return;
+  }
   impl_->trace->use_task_context();
 }
 
 std::uint32_t StockLlamaRuntime::configure_trace(std::span<const std::uint8_t> manifest, std::uint32_t positions, std::uint32_t expected_leaves) {
   if (!impl_ || !impl_->trace) throw std::runtime_error("Trace capture requires stock llama ABI6");
   const std::lock_guard lock(impl_->mutex);
+  impl_->scratch_active = true;
   return impl_->trace->configure(manifest, positions, expected_leaves);
 }
 TracedGeneration StockLlamaRuntime::infer_traced(std::string_view prompt, const TracePrefix *prefix,
     std::uint32_t max_tokens, std::uint32_t min_prompt, std::uint32_t answer_bytes_per_position) {
   if (!impl_ || !impl_->trace) throw std::runtime_error("Traced inference requires stock llama ABI6");
   const std::lock_guard lock(impl_->mutex);
+  impl_->scratch_active = true;
   return impl_->trace->generate(prompt, prefix, max_tokens, min_prompt, answer_bytes_per_position);
 }
 std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>> StockLlamaRuntime::replay_trace(
     const TracedGeneration &capture, std::uint32_t position, std::uint32_t leaf_x, std::uint32_t leaf_y) {
   if (!impl_ || !impl_->trace) throw std::runtime_error("Trace replay requires stock llama ABI6");
   const std::lock_guard lock(impl_->mutex);
+  impl_->scratch_active = true;
   return impl_->trace->replay(capture, position, leaf_x, leaf_y);
 }
 
 TracedGeneration StockLlamaRuntime::trace_tokens(std::span<const std::int32_t> tokens) {
   if(!impl_ || !impl_->trace || (impl_->abi!=8 && impl_->abi!=9))throw std::runtime_error("Token trace requires stock llama ABI8/9");
-  const std::lock_guard lock(impl_->mutex);return impl_->trace->trace_tokens(tokens);
+  const std::lock_guard lock(impl_->mutex);
+  impl_->scratch_active = true;
+  return impl_->trace->trace_tokens(tokens);
 }
 std::vector<std::vector<std::uint8_t>> StockLlamaRuntime::replay_trace_multi(const TracedGeneration &capture,
     std::span<const std::pair<std::uint32_t,std::uint32_t>> caps,std::uint32_t slot) {
   if(!impl_ || !impl_->trace || (impl_->abi!=8 && impl_->abi!=9))throw std::runtime_error("Multi replay requires stock llama ABI8/9");
-  const std::lock_guard lock(impl_->mutex);return impl_->trace->replay_multi(capture,caps,slot);
+  const std::lock_guard lock(impl_->mutex);
+  impl_->scratch_active = true;
+  return impl_->trace->replay_multi(capture,caps,slot);
 }
 } // namespace keryx::nexus::opoi
 

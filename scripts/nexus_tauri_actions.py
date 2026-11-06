@@ -11,9 +11,12 @@ ACTIONS = frozenset({'preferences', 'workload', 'gpu_select', 'payout', 'key',
     'new_key', 'certificate', 'verify', 'update_check', 'updates_toggle',
     'api_toggle', 'mcp_toggle', 'api_generate', 'copy_api_key', 'copy_public_key',
     'copy_endpoint', 'notifications_toggle', 'notification_status',
-    'gpu_capabilities_refresh', 'gpu_mode', 'stop', 'restart', 'shutdown'})
+    'gpu_capabilities_refresh', 'gpu_mode', 'stop', 'restart', 'shutdown',
+    'mining_mode', 'pool_config', 'pool_save', 'pool_delete', 'pool_activate',
+    'pool_test_connection', 'pool_reorder', 'force_restart', 'pause'})
 CONFIRM = frozenset({'gpu_select', 'workload', 'payout', 'key', 'new_key', 'certificate',
-    'verify', 'api_generate', 'stop', 'restart', 'shutdown'})
+    'verify', 'api_generate', 'stop', 'restart', 'shutdown', 'mining_mode', 'pool_config',
+    'pool_save', 'pool_delete', 'pool_activate', 'pool_reorder', 'force_restart'})
 
 
 def production_source():
@@ -75,6 +78,13 @@ def action(name, value, confirmed=False):
         subprocess.run(controller_command(name, ROOT, production_source()), check=True,
                        capture_output=True, timeout=5)
         return {'message': 'Miner ' + name + ' requested through the existing controller'}
+    if name == 'force_restart':
+        import nexus_mining_mode
+        res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': 'Miner force restarted (all workers and leases cleared)', 'restart': res}
+    if name == 'pause':
+        import nexus_mining_mode
+        return nexus_mining_mode.toggle_miner_pause()
     if name == 'update_check':
         from nexus_updates import check, status
         check(activate=False, inspect_only=True)
@@ -116,4 +126,59 @@ def action(name, value, confirmed=False):
         if value not in ('disabled', 'diagnostics'):
             raise ValueError('Invalid offline GPU mode')
         return {'message': configure_mode(value)}
+    if name == 'mining_mode':
+        import nexus_mining_mode
+        if not isinstance(value, dict) or 'mode' not in value:
+            raise ValueError('Invalid mining mode value')
+        res = nexus_mining_mode.save({'mode': value['mode']})
+        restart_res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': f"Mining mode set to {res['mode'].upper()} (miner restarted automatically)", 'mining_mode': res, 'restart': restart_res}
+    if name == 'pool_config':
+        import nexus_mining_mode
+        if not isinstance(value, dict):
+            raise ValueError('Invalid pool configuration')
+        res = nexus_mining_mode.save(value)
+        restart_res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': 'Pool configuration saved (miner restarted automatically)', 'mining_mode': res, 'restart': restart_res}
+    if name == 'pool_save':
+        import nexus_mining_mode
+        if not isinstance(value, dict):
+            raise ValueError('Invalid pool data')
+        res = nexus_mining_mode.save_pool(value)
+        pname = value.get('name') or value.get('id') or 'Pool'
+        restart_res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': f"Pool '{pname}' saved (miner restarted automatically)", 'mining_mode': res, 'restart': restart_res}
+    if name == 'pool_delete':
+        import nexus_mining_mode
+        if not isinstance(value, (dict, str)):
+            raise ValueError('Invalid pool id')
+        pid = value.get('id', value) if isinstance(value, dict) else value
+        res = nexus_mining_mode.delete_pool(str(pid))
+        restart_res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': f"Pool '{pid}' removed/reset (miner restarted automatically)", 'mining_mode': res, 'restart': restart_res}
+    if name == 'pool_activate':
+        import nexus_mining_mode
+        if not isinstance(value, (dict, str)):
+            raise ValueError('Invalid pool id')
+        pid = value.get('id', value) if isinstance(value, dict) else value
+        res = nexus_mining_mode.activate_pool(str(pid))
+        restart_res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': f"Pool '{pid}' activated as primary (miner restarted automatically)", 'mining_mode': res, 'restart': restart_res}
+    if name == 'pool_test_connection':
+        import nexus_mining_mode
+        url = value.get('url', value) if isinstance(value, dict) else value
+        res = nexus_mining_mode.test_connection(str(url))
+        if res.get('ok'):
+            msg = f"Connection OK: {res.get('ping_ms', 0):.1f} ms"
+        else:
+            msg = f"Connection FAILED: {res.get('error', 'Unreachable')}"
+        return {'message': msg, 'test_result': res}
+    if name == 'pool_reorder':
+        import nexus_mining_mode
+        order = value.get('order', value) if isinstance(value, dict) else value
+        if not isinstance(order, list):
+            raise ValueError('Order list required')
+        res = nexus_mining_mode.reorder_pools([str(x) for x in order])
+        restart_res = nexus_mining_mode.restart_miner(force=True)
+        return {'message': 'Pool priority order updated (miner restarted automatically)', 'mining_mode': res, 'restart': restart_res}
     raise ValueError('Unsupported desktop action')

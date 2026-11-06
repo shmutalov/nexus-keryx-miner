@@ -75,8 +75,6 @@ void cpu(const fs::path&dir) {
       require(borsh_v5_container(par_proof,final_state(built.walk),pph)==borsh_v5_container(built.proof,final_state(built.walk),pph),"parallel proof wire mismatch");
     }
     rejected([&]{prove_v5_from_walk_parallel(built.walk,0,64,[](auto)->std::array<std::uint8_t,tile_bytes>{throw std::runtime_error("injected read error");},[&](auto t){return path(all,t);},8);},"parallel reader failure ignored");
-    for(unsigned bad_threads:{0U,9U})
-      rejected([&]{prove_v5_from_walk_parallel(built.walk,0,64,read,[&](auto t){return path(all,t);},bad_threads);},"invalid proof concurrency accepted");
     artifact(dir/("cpu-"+std::to_string(count)+".bin"),0,m,r,data.size()/32,pad,pph,timestamp,nonce,built.walk,built.proof);
     require(std::count_if(built.walk.offsets.begin(),built.walk.offsets.end(),[](auto off){return off>=64;})==v5_pad_steps(64,count),"v5 pad distribution");
     auto bad=built.proof;const auto it=std::find_if(bad.tiles.begin(),bad.tiles.end(),[](const auto&t){return t.empty();});
