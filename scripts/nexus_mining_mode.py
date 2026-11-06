@@ -45,7 +45,7 @@ PRESET_SUPRNOVA = {
     "priority": 2,
     "preset": True,
     "configured": True,
-    "note": "stratum+tcp://krx.suprnova.cc:4404 (TLS su 4405)",
+    "note": "stratum+tcp://krx.suprnova.cc:4404 (TLS on 4405)",
 }
 
 
@@ -147,11 +147,11 @@ def validate_pool_password(password: str) -> str:
 def test_connection(url: str, timeout: float = 3.0) -> dict:
     url = (url or "").strip()
     if not url:
-        return {"ok": False, "ping_ms": 0.0, "error": "URL non configurato"}
+        return {"ok": False, "ping_ms": 0.0, "error": "URL not configured"}
     try:
         parts = parse_endpoint_parts(url)
         if not parts["host"] or not parts["port"]:
-            return {"ok": False, "ping_ms": 0.0, "error": "Host o porta non validi"}
+            return {"ok": False, "ping_ms": 0.0, "error": "Invalid host or port"}
         t0 = time.perf_counter()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(timeout)
@@ -199,7 +199,7 @@ def load() -> dict:
             else:
                 custom_pool = {
                     "id": "custom_migrated",
-                    "name": "Pool personalizzata",
+                    "name": "Custom Pool",
                     "url": pool_url,
                     "worker": pool_worker,
                     "password": pool_pw,
@@ -207,7 +207,7 @@ def load() -> dict:
                     "priority": 1,
                     "preset": False,
                     "configured": True,
-                    "note": "Migrata da config v1",
+                    "note": "Migrated from config v1",
                 }
                 cfg["pools"].insert(0, custom_pool)
                 cfg["active_pool_id"] = "custom_migrated"
@@ -488,7 +488,7 @@ def save_pool(pool_data: dict, auto_restart: bool = False) -> dict:
                 "priority": len(current["pools"]) + 1,
                 "preset": False,
                 "configured": bool(url),
-                "note": "Pool personalizzata",
+                "note": "Custom pool",
             }
             current["pools"].append(pool_entry)
         else:
@@ -521,7 +521,7 @@ def save_pool(pool_data: dict, auto_restart: bool = False) -> dict:
                     "priority": len(current["pools"]) + 1,
                     "preset": False,
                     "configured": bool(url),
-                    "note": "Pool personalizzata",
+                    "note": "Custom pool",
                 })
         return current
 
@@ -547,7 +547,7 @@ def delete_pool(pool_id: str, auto_restart: bool = False) -> dict:
             matched["password"] = ""
             matched["configured"] = False
             if pool_id == "keryxpool":
-                matched["note"] = "Non configurata (endpoint non verificabile)"
+                matched["note"] = "Not configured (unverified endpoint)"
         else:
             current["pools"] = [p for p in current["pools"] if p["id"] != pool_id]
         if current.get("active_pool_id") == pool_id:

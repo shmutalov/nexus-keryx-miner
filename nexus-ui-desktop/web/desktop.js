@@ -268,7 +268,7 @@ function inlineActions(panel, name, frame) {
     if (name === "Selected pool") {
       const pools = d.mining_mode?.pools || [];
       const opts = pools.map((p) => [
-        `${p.name} (${p.configured ? (p.url || "OK") : "Non configurata"})`,
+        `${p.name} (${p.configured ? (p.url || "OK") : "Not configured"})`,
         p.id,
       ]);
       if (!opts.length) {
@@ -286,15 +286,15 @@ function inlineActions(panel, name, frame) {
     }
     if (name === "Add custom pool") {
       actions.push(
-        button("+ Aggiungi pool personalizzata", () => {
+        button("+ Add custom pool", () => {
           const defaultWallet = d.mining_payout || "";
           edit(
-            "Aggiungi nuova pool personalizzata",
+            "Add custom pool",
             [
-              { name: "name", label: "Nome pool (es. Backup Pool)", value: "Pool personalizzata" },
-              { name: "url", label: "Stratum URL (es. stratum+tcp://host:4404)", value: "" },
+              { name: "name", label: "Pool name (e.g. Backup Pool)", value: "Custom Pool" },
+              { name: "url", label: "Stratum URL (e.g. stratum+tcp://host:4404)", value: "" },
               { name: "worker", label: "Worker (wallet.worker)", value: defaultWallet ? `${defaultWallet}.worker1` : "" },
-              { name: "password", label: "Password (opzionale, predefinita 'x')", value: "x", required: false },
+              { name: "password", label: "Password (optional, default 'x')", value: "x", required: false },
             ],
             (v) => command("pool_save", {
               name: v.name.trim(),
@@ -314,23 +314,23 @@ function inlineActions(panel, name, frame) {
       const pool = pools[poolIndex];
       if (pool) {
         if (!pool.active) {
-          const btn = button("Attiva", () => command("pool_activate", { id: pool.id }));
-          btn.title = "Imposta come pool principale attiva";
+          const btn = button("Activate", () => command("pool_activate", { id: pool.id }));
+          btn.title = "Set as active primary pool";
           actions.push(btn);
         }
         if (pool.configured && pool.url) {
           const btn = button("Test", () => command("pool_test_connection", { url: pool.url }));
-          btn.title = "Test connessione in tempo reale";
+          btn.title = "Test live pool connection";
           actions.push(btn);
         }
-        const editBtn = button("Modifica", () => {
+        const editBtn = button("Edit", () => {
           edit(
-            `Modifica pool: ${pool.name}`,
+            `Edit pool: ${pool.name}`,
             [
-              { name: "name", label: "Nome pool", value: pool.name },
-              { name: "url", label: "Stratum URL (es. stratum+tcp://host:4404)", value: pool.url },
+              { name: "name", label: "Pool name", value: pool.name },
+              { name: "url", label: "Stratum URL (e.g. stratum+tcp://host:4404)", value: pool.url },
               { name: "worker", label: "Worker (wallet.worker)", value: pool.worker },
-              { name: "password", label: "Password (lascia vuoto per non modificare)", value: "", required: false },
+              { name: "password", label: "Password (leave blank to keep unchanged)", value: "", required: false },
             ],
             (v) => command("pool_save", {
               id: pool.id,
@@ -341,11 +341,11 @@ function inlineActions(panel, name, frame) {
             }),
           );
         });
-        editBtn.title = "Modifica configurazione pool";
+        editBtn.title = "Edit pool configuration";
         actions.push(editBtn);
         if (!pool.preset) {
-          const delBtn = button("Elimina", () => command("pool_delete", { id: pool.id }));
-          delBtn.title = "Elimina pool personalizzata";
+          const delBtn = button("Delete", () => command("pool_delete", { id: pool.id }));
+          delBtn.title = "Delete custom pool";
           actions.push(delBtn);
         }
         if (poolIndex > 0) {
@@ -356,7 +356,7 @@ function inlineActions(panel, name, frame) {
             ids[poolIndex - 1] = tmp;
             command("pool_reorder", { order: ids });
           }, "prio-btn");
-          prioUpBtn.title = "Aumenta priorità failover (sposta su)";
+          prioUpBtn.title = "Increase failover priority (move up)";
           actions.push(prioUpBtn);
         }
         if (poolIndex < pools.length - 1) {
@@ -367,7 +367,7 @@ function inlineActions(panel, name, frame) {
             ids[poolIndex + 1] = tmp;
             command("pool_reorder", { order: ids });
           }, "prio-btn");
-          prioDownBtn.title = "Riduci priorità failover (sposta giù)";
+          prioDownBtn.title = "Decrease failover priority (move down)";
           actions.push(prioDownBtn);
         }
         return actions;
@@ -376,14 +376,14 @@ function inlineActions(panel, name, frame) {
     const mapping = {
       "Active pool URL": [
         [
-          "Modifica URL",
+          "Edit URL",
           () =>
             edit(
               "Stratum Pool URL",
               [
                 {
                   name: "pool_url",
-                  label: "Stratum URL (es. stratum+tcp://krx.suprnova.cc:4404)",
+                  label: "Stratum URL (e.g. stratum+tcp://krx.suprnova.cc:4404)",
                   value: d.mining_mode?.pool_url || "",
                 },
               ],
@@ -393,7 +393,7 @@ function inlineActions(panel, name, frame) {
       ],
       "Active pool worker": [
         [
-          "Modifica Worker",
+          "Edit Worker",
           () =>
             edit(
               "Pool Worker (wallet.worker)",
@@ -410,14 +410,14 @@ function inlineActions(panel, name, frame) {
       ],
       "Active pool password": [
         [
-          "Modifica Password",
+          "Edit Password",
           () =>
             edit(
-              "Pool Password (opzionale)",
+              "Pool Password (optional)",
               [
                 {
                   name: "pool_password",
-                  label: "Password (predefinita 'x')",
+                  label: "Password (default 'x')",
                   value: "",
                   required: false,
                 },

@@ -1248,29 +1248,29 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
         if not active_pool and pools:
             active_pool = pools[0]
         pool_name = active_pool.get('name', 'Suprnova') if active_pool else 'Suprnova'
-        pool_url = (active_pool.get('url') if active_pool else mm.get('pool_url')) or 'NON CONFIGURATA'
-        pool_worker = (active_pool.get('worker') if active_pool else mm.get('pool_worker')) or 'NON CONFIGURATO'
-        pool_pw = '********' if (active_pool and active_pool.get('password')) or mm.get('pool_password') else 'NONE / OPTIONALE'
+        pool_url = (active_pool.get('url') if active_pool else mm.get('pool_url')) or 'NOT CONFIGURED'
+        pool_worker = (active_pool.get('worker') if active_pool else mm.get('pool_worker')) or 'NOT CONFIGURED'
+        pool_pw = '********' if (active_pool and active_pool.get('password')) or mm.get('pool_password') else 'NONE / OPTIONAL'
         rows = [('Mining mode', mode_val)]
         if mode_val == 'POOL':
             rows.extend([
-                ('Selected pool', f"{pool_name} ({'CONFIGURATA' if active_pool and active_pool.get('configured') else 'NON CONFIGURATA'})"),
+                ('Selected pool', f"{pool_name} ({'CONFIGURED' if active_pool and active_pool.get('configured') else 'NOT CONFIGURED'})"),
                 ('Active pool URL', pool_url),
                 ('Active pool worker', pool_worker),
                 ('Active pool password', pool_pw),
-                ('Failover backup pools', f"{len(pools) - 1} configurati" if len(pools) > 1 else "Nessun backup"),
+                ('Failover backup pools', f"{len(pools) - 1} configured" if len(pools) > 1 else "No backup"),
             ])
             for idx, p in enumerate(pools):
                 p_id = p.get('id')
                 is_active = (p_id == active_pool_id)
-                p_role = "PRINCIPALE" if is_active else f"BACKUP (Prio {p.get('priority', idx+1)})"
-                rows.append((f"Pool #{idx+1}: {p.get('name')}", f"{p_role} · {p.get('url') or 'NON CONFIGURATA'}"))
-            rows.append(('Add custom pool', 'Aggiungi nuova pool personalizzata'))
+                p_role = "PRIMARY" if is_active else f"BACKUP (Prio {p.get('priority', idx+1)})"
+                rows.append((f"Pool #{idx+1}: {p.get('name')}", f"{p_role} · {p.get('url') or 'NOT CONFIGURED'}"))
+            rows.append(('Add custom pool', '+ Add custom pool'))
         else:
             rows.extend([
-                ('Pool URL', f"{pool_url} (inattivo in SOLO)"),
-                ('Pool worker', f"{pool_worker} (inattivo in SOLO)"),
-                ('Pool password', f"{pool_pw} (inattivo in SOLO)"),
+                ('Pool URL', f"{pool_url} (inactive in SOLO)"),
+                ('Pool worker', f"{pool_worker} (inactive in SOLO)"),
+                ('Pool password', f"{pool_pw} (inactive in SOLO)"),
             ])
         rows.extend([
             ('Version', version_status, role),

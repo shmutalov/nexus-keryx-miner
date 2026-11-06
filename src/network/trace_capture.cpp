@@ -52,8 +52,8 @@ void TraceCapture::ensure_context_for(std::size_t positions) {
 }
 [[noreturn]] void TraceCapture::fail(const char *operation, int code) const {
   std::string err;
-  if (std::strcmp(operation, "configure") == 0 && api_.last_error) {
-    const char *msg = api_.last_error(model_);
+  if (std::strcmp(operation, "configure") == 0 && api_.error) {
+    const char *msg = api_.error();
     if (msg && *msg) err = std::string(": ") + msg;
   }
   throw std::runtime_error(std::string("ABI6 ") + operation + " failed (" + std::to_string(code) + ")" + err);
