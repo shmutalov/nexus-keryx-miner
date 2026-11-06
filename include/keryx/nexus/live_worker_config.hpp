@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace keryx::nexus {
 inline bool primary_pom_selection(const char *value) {
