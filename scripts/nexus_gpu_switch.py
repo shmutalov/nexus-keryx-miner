@@ -173,15 +173,15 @@ def apply_runtime(request_id=None):
         if not worker and not pending:
             raise ValueError('Worker already stopped; automatic startup refused')
         if pending and pending['worker'] != ([worker] if worker else []):
-            current_workers = worker_identity()
-            if len(current_workers) > 1:
-                raise ValueError('Worker identity changed after configuration confirmation')
+            raise ValueError('Worker identity changed after configuration confirmation')
         started = pending['requested_unix'] if pending else time.time()
+        marker = ROOT / 'state/updates/user-stop.json'
+        if marker.exists() and json.loads(marker.read_text()).get('requested_unix', 0) >= started:
+            raise ValueError('Manual shutdown takes priority over GPU handoff')
         atomic(STATE / 'handoff.json', {'status': 'DRAINING' if worker else 'PREPARING_START',
                                       'worker': worker, 'request_id': request_id})
 
-        # Phase 1: Clear stale markers so manual stops or restart flags do not prevent restart
-        marker = ROOT / 'state/updates/user-stop.json'
+        # Phase 1: Clear stale restart flags do not prevent restart
         try:
             marker.unlink(missing_ok=True)
         except OSError:
@@ -230,7 +230,7 @@ def apply_runtime(request_id=None):
 
         # Phase 4: Explicitly stop systemd unit
         try:
-            subprocess.run(['systemctl', '--user', 'stop', UNIT], capture_output=True, timeout=10)
+            run(['systemctl', '--user', 'stop', UNIT], timeout=15)
         except (OSError, subprocess.SubprocessError):
             pass
 
@@ -328,10 +328,10 @@ def apply_runtime(request_id=None):
 def start_runtime(value, worker, request_id, started):
     from nexus_gpu_devices import STATE, atomic
     marker = ROOT / 'state/updates/user-stop.json'
-    try:
-        marker.unlink(missing_ok=True)
-    except OSError:
-        pass
+    def check_manual_stop():
+        if marker.exists() and json.loads(marker.read_text()).get('requested_unix', 0) >= started:
+            raise ValueError('Manual shutdown takes priority over GPU handoff')
+    check_manual_stop()
     # Explicit, confirmed user restarts are not an automatic crash loop.
     run(['systemctl', '--user', 'reset-failed', UNIT], timeout=10)
     readiness_started = time.monotonic()
@@ -345,7 +345,7 @@ def start_runtime(value, worker, request_id, started):
     from nexus_ui_preferences import preferences_path
     from nexus_workload_admission import read_preferences
     pref_sec = read_preferences(preferences_path())['workloads'].get(AMD_ID)
-    expected_secondary = ('vulkan-rdna3' if pref_sec == 'nexus_rdna3'
+    expected_secondary = ('vulkan-rdna3' if pref_sec in ('nexus_rdna3', 'auto', None)
                           else 'vulkan-bda' if pref_sec == 'nexus_bda'
                           else 'vulkan-jit')
     pref_prim = read_preferences(preferences_path())['workloads'].get(CUDA_UUID)

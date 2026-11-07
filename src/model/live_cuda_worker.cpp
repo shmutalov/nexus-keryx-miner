@@ -1381,7 +1381,7 @@ int main(int argc,char **argv) {
                 << (response_record ? ai::response_state_name(response_record->state) : "UNKNOWN")
                 << "\",\"serve_result\":" << static_cast<int>(result)
                 << ",\"daa\":" << request.daa << ",\"pending\":" << ai_requests.size()
-                << ",\"details\":\"redacted\"}\n" << std::flush;
+                << ",\"details\":\"" << (result == ai::ServeResult::Failed ? "serve_failed" : "ok") << "\"}\n" << std::flush;
       if(result==ai::ServeResult::WaitingReconciliation) {
         pom_lifecycle.pause_for_h15_recovery();
         gpu_ownership.run_pom([&]{resident.reset();engine.reset();});
@@ -1391,8 +1391,14 @@ int main(int argc,char **argv) {
                   << " pom=PAUSED ai_service=ACTIVE\n" << std::flush;
         return;
       }
-      if(result==ai::ServeResult::Failed)
-        throw std::runtime_error("assigned AiRequest could not be served; fail-closed before resuming PoM");
+      if(result==ai::ServeResult::Failed) {
+        std::cerr << "{\"event\":\"AI_RESPONSE_FAILED\",\"request_id\":\""
+                  << request.id << "\",\"daa\":" << request.daa
+                  << ",\"action\":\"logged_fail_resuming_pom\"}\n" << std::flush;
+        telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+        telemetry.set_gpu_activity("WAITING_TEMPLATE");
+        return;
+      }
       telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
       telemetry.set_gpu_activity("WAITING_TEMPLATE");
     };
