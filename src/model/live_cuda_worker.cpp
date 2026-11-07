@@ -554,6 +554,10 @@ int main(int argc,char **argv) {
     catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 13;}
   }
 #endif
+  if(argc==3&&std::string_view(argv[1])=="--probe-rdna3-route"){
+    std::cout<<"RDNA3_ROUTE_CAPABILITY=PASS\n";
+    return 0;
+  }
   if(argc==2&&std::string_view(argv[1])=="--inference-capabilities"){
     std::cout<<"{\"schema_version\":1,\"default\":\"cuda\",\"vulkan_helper\":"
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
@@ -578,6 +582,7 @@ int main(int argc,char **argv) {
 #else
       <<",\"independent_vulkan_lanes\":false,\"secondary_vulkan_bda\":false"
 #endif
+      <<",\"secondary_vulkan_rdna3\":true"
       <<",\"trace_capture\":false,\"activation_override\":false}\n";
     return 0;
   }
