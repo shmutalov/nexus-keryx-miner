@@ -35,7 +35,28 @@ RELEASE_VERSION = release_version()
 EXPLORER_BASE = "https://keryx-labs.com"
 EXPLORER_TTL = 90
 
-AUTHORIZED_GPU = os.environ.get("NEXUS_PRIMARY_GPU_UUID", "GPU-00000000-0000-0000-0000-000000000000")
+def _detect_primary_gpu_uuid() -> str:
+    env_uuid = (
+        os.environ.get("NEXUS_PRIMARY_GPU_UUID")
+        or os.environ.get("NEXUS_CUDA_DEVICE_UUID")
+        or os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+    if env_uuid and env_uuid != "GPU-00000000-0000-0000-0000-000000000000":
+        return env_uuid
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True, timeout=2
+        )
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        if lines:
+            return lines[0]
+    except Exception:
+        pass
+    return "GPU-00000000-0000-0000-0000-000000000000"
+
+
+AUTHORIZED_GPU = _detect_primary_gpu_uuid()
 KV = re.compile(r"([A-Za-z][A-Za-z0-9_]*)=([^\s]+)")
 NATIVE_SCHEMA_VERSION = 1
 TELEMETRY_STALE_NS = 3_000_000_000
