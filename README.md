@@ -196,6 +196,10 @@ Nexus builds upon and incorporates protocols, specifications, and reference impl
   - Sibling rank hashing and load sharing across multi-rig deployments (commits `ae8e38eb`, `5b4b88b1`, `b0d9d18e`).
 - **[Keryx-Labs/keryx-node](https://github.com/Keryx-Labs/keryx-node):**
   - Hardfork 16 DAA scheduling, consensus parameter verification, and node v1.6.7-PoM specifications (commit `bd2f35a7`).
+- **[ocminer](https://github.com/ocminer) ([keryx-miner-supr](https://github.com/ocminer/keryx-miner-supr) / suprminer):**
+  - Stratum v4 pool mining protocol implementation and community pool infrastructure.
+- **[shmutalov](https://github.com/shmutalov) ([keryx-miner-rdna3](https://github.com/shmutalov/keryx-miner-rdna3)):**
+  - AMD GPU Vulkan runtime implementation and RDNA3 architecture support.
 - **Community Mining Pools:**
   - Public Stratum v4 protocol compatibility testing and integration support from **[Suprnova](https://suprnova.cc)** and **[KeryxPool](https://keryxpool.com)**.
 
