@@ -287,7 +287,7 @@ def find_worker_pids() -> list[int]:
                 if entry.stat().st_uid != os.getuid():
                     continue
                 exe = Path(os.readlink(entry / 'exe')).name.removesuffix(' (deleted)')
-                if exe in ('nexus-live-cuda-worker', 'nexus-m21-oracle'):
+                if exe in ('nexus-live-cuda-worker', 'nexus-m21-oracle', 'keryx-miner-rdna3', 'nexus-vulkan-rdna3-worker'):
                     pids.append(int(entry.name))
             except (OSError, ValueError):
                 continue
@@ -654,16 +654,30 @@ def restart_miner(force: bool = True) -> dict:
             pass
 
     unit = "nexus-v002-production.service"
+    amd_unit = "nexus-rx570.service"
     systemctl = "/usr/bin/systemctl"
 
-    # Step 1: Explicitly stop the service
+    nvidia_enabled = True
+    amd_enabled = False
     try:
-        subprocess.run([systemctl, "--user", "stop", unit], capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.SubprocessError):
-        pass
+        from nexus_gpu_selection import configuration as gpu_selection
+        sel = gpu_selection()
+        nvidia_enabled = sel.get("nvidia_pom", True)
+        amd_enabled = sel.get("amd_pom", False)
+    except Exception:
+        nvidia_enabled = True
+        amd_enabled = False
+
+    # Step 1: Explicitly stop services that should be stopped or restarted
+    for u in (unit, amd_unit):
+        try:
+            subprocess.run([systemctl, "--user", "stop", u], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     # Step 2: Ensure any lingering worker processes are fully terminated
     stop_deadline = time.monotonic() + 4.0
+    known_workers = {'nexus-live-cuda-worker', 'keryx-miner-rdna3', 'nexus-vulkan-rdna3-worker'}
     while time.monotonic() < stop_deadline:
         workers_found = False
         try:
@@ -674,7 +688,7 @@ def restart_miner(force: bool = True) -> dict:
                     if entry.stat().st_uid != os.getuid():
                         continue
                     exe = Path(os.readlink(entry / 'exe')).name.removesuffix(' (deleted)')
-                    if exe == 'nexus-live-cuda-worker':
+                    if exe in known_workers:
                         workers_found = True
                         break
                 except (OSError, ValueError):
@@ -685,6 +699,8 @@ def restart_miner(force: bool = True) -> dict:
             break
         if force and time.monotonic() > stop_deadline - 2.5:
             subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "nexus-live-cuda-worker"], capture_output=True)
+            subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "keryx-miner-rdna3"], capture_output=True)
+            subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "nexus-vulkan-rdna3-worker"], capture_output=True)
         time.sleep(0.2)
 
     # Step 3: Clear any orphan GPU lease locks
@@ -705,26 +721,50 @@ def restart_miner(force: bool = True) -> dict:
         pass
 
     # Step 4: Reset any failed state in systemd
+    for u in (unit, amd_unit):
+        try:
+            subprocess.run([systemctl, "--user", "reset-failed", u], capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Step 5: Start enabled services
+    nvidia_started = False
+    if nvidia_enabled:
+        try:
+            res = subprocess.run([systemctl, "--user", "start", unit], capture_output=True, text=True, timeout=15)
+            if res.returncode == 0:
+                nvidia_started = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    amd_started = False
+    if amd_enabled:
+        try:
+            res = subprocess.run([systemctl, "--user", "start", amd_unit], capture_output=True, text=True, timeout=15)
+            if res.returncode == 0:
+                amd_started = True
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    # Step 6: Write handoff confirmation
     try:
-        subprocess.run([systemctl, "--user", "reset-failed", unit], capture_output=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
+        handoff_file = ROOT / "state/gpu-devices/handoff.json"
+        with open(handoff_file, "w") as f:
+            json.dump({
+                "status": "APPLIED",
+                "selection": {"nvidia_pom": nvidia_enabled, "amd_pom": amd_enabled},
+                "updated_unix": time.time()
+            }, f)
+    except Exception:
         pass
 
-    # Step 5: Start the service
-    restart_ok = False
-    try:
-        proc_start = subprocess.run([systemctl, "--user", "start", unit], capture_output=True, text=True, timeout=15)
-        if proc_start.returncode == 0:
-            restart_ok = True
-    except (OSError, subprocess.SubprocessError):
-        restart_ok = False
-
-    # Step 6: Wait up to 5s for the service to report active
+    # Step 7: Wait up to 5s for the primary enabled service to report active
     is_active = False
+    check_unit = unit if nvidia_enabled else (amd_unit if amd_enabled else unit)
     poll_deadline = time.monotonic() + 5.0
     while time.monotonic() < poll_deadline:
         try:
-            chk = subprocess.run([systemctl, "--user", "is-active", unit], capture_output=True, text=True, timeout=3)
+            chk = subprocess.run([systemctl, "--user", "is-active", check_unit], capture_output=True, text=True, timeout=3)
             if chk.stdout.strip() == "active":
                 is_active = True
                 break
@@ -733,9 +773,11 @@ def restart_miner(force: bool = True) -> dict:
         time.sleep(0.3)
 
     return {
-        "restarted": restart_ok or is_active,
+        "restarted": (nvidia_started if nvidia_enabled else True) and (amd_started if amd_enabled else True),
         "is_active": is_active,
-        "unit": unit,
+        "unit": check_unit,
+        "nvidia_active": nvidia_started,
+        "amd_active": amd_started,
         "forced": force,
     }
 

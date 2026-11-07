@@ -15,14 +15,14 @@ class DeviceWorkflows(unittest.TestCase):
     caps=dict(schema_version=1,vulkan_helper=True,primary_vulkan=True,primary_vulkan_bda=True,
               secondary_vulkan_bda=True,independent_vulkan_lanes=True)
     def test_vendor_matrix_not_display_order(self):
-        for vendor,expected in [('AMD',['auto','nexus','nexus_bda']),('Intel',['auto','nexus','nexus_bda']),
+        for vendor,expected in [('AMD',['auto','nexus','nexus_bda','nexus_rdna3']),('Intel',['auto','nexus','nexus_bda','nexus_rdna3']),
                                 ('NVIDIA',['auto','nvidia','nexus','nexus_bda'])]:
             self.assertEqual([v for _,v in workload_options({'vendor':vendor})],expected)
         for vendor in ('AMD','Intel'):
             with self.assertRaises(ValueError):resolve_workload({'vendor':vendor},'nvidia')
     def test_inventory_excludes_hdmi_audio_functions(self):
         import nexus_gpu_devices as devices
-        with tempfile.TemporaryDirectory(dir=os.environ['TMPDIR']) as directory:
+        with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as directory:
             root=Path(directory)
             for name,vendor,code in [('0000:00:00.0','0x1002','0x030000'),
                                      ('0000:00:02.0','0x1002','0x040300'),
@@ -34,10 +34,10 @@ class DeviceWorkflows(unittest.TestCase):
 
     def test_routes_are_independent(self):
         for primary in ('auto','nvidia','nexus','nexus_bda'):
-            for secondary in ('auto','nexus','nexus_bda'):
+            for secondary in ('auto','nexus','nexus_bda','nexus_rdna3'):
                 prefs={'workloads':{CUDA_UUID:primary,AMD_ID:secondary}}
-                self.assertEqual(admission.device_backend({'id':AMD_ID,'vendor':'AMD'},prefs),
-                                 'vulkan-bda' if secondary=='nexus_bda' else 'vulkan-jit')
+                expected_secondary = 'vulkan-bda' if secondary=='nexus_bda' else ('vulkan-rdna3' if secondary=='nexus_rdna3' else 'vulkan-jit')
+                self.assertEqual(admission.device_backend({'id':AMD_ID,'vendor':'AMD'},prefs), expected_secondary)
                 self.assertEqual(admission.device_backend({'id':CUDA_UUID,'vendor':'NVIDIA'},prefs),
                                  {'auto':'cuda-driver','nvidia':'cuda-driver','nexus':'vulkan-jit','nexus_bda':'vulkan-bda'}[primary])
     def test_mixed_vulkan_needs_explicit_worker_capability(self):
