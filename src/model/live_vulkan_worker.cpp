@@ -217,7 +217,11 @@ int main(int argc, char **argv) {
   std::vector<std::string> pos_args;
   for (int i = 1; i < argc; ++i) {
     std::string arg = argv[i];
-    if (arg == "--enable-submit") submit_enabled = true;
+    if (arg == "--inference-capabilities") {
+      std::cout << "{\"schema_version\":1,\"default\":\"vulkan\",\"vulkan_helper\":true,\"primary_vulkan\":true,\"primary_vulkan_bda\":true,\"independent_vulkan_lanes\":true,\"secondary_vulkan_bda\":true,\"secondary_vulkan_rdna3\":false,\"trace_capture\":true,\"activation_override\":false}\n" << std::flush;
+      return 0;
+    }
+    else if (arg == "--enable-submit") submit_enabled = true;
     else if (arg == "--no-submit") submit_enabled = false;
     else if (arg == "--enable-ai-response") ai_responses_enabled = true;
     else if (arg == "--no-ai-response") ai_responses_enabled = false;
@@ -509,6 +513,7 @@ int main(int argc, char **argv) {
                             << " daa=" << block.header().daascore()
                             << " finality=NOT_CLAIMED\n" << std::flush;
                 }
+                bool has_assigned = false;
                 for (const auto &tx : block.transactions()) {
                   if (tx.subnetworkid() == ai::request_subnetwork) {
                     const bool assigned = ai_response_service->discover(
@@ -516,6 +521,7 @@ int main(int argc, char **argv) {
                         service_rpc.providers_available ? &service_rpc.providers : nullptr,
                         ai_current_daa.load(std::memory_order_acquire));
                     if (assigned) {
+                      has_assigned = true;
                       const auto dig = ai::consensus_transaction_id(tx);
                       if (dig) {
                         std::cout << "{\"event\":\"AI_REQUEST_ASSIGNED\",\"request_id\":\""
@@ -525,8 +531,10 @@ int main(int argc, char **argv) {
                     }
                   }
                 }
-                if (!ai_queue.push(block)) {
-                  std::cerr << "bounded AiRequest queue full\n" << std::flush;
+                if (has_assigned) {
+                  if (!ai_queue.push(block)) {
+                    std::cerr << "bounded AiRequest queue full\n" << std::flush;
+                  }
                 }
               }
             }
