@@ -20,16 +20,20 @@
 #include <stdexcept>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
 #include <windows.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <io.h>
+#include <basetsd.h>
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
 using socket_t = SOCKET;
 using pollfd_t = WSAPOLLFD;
+using ssize_t = SSIZE_T;
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -601,7 +605,11 @@ bool StratumV4Client::connect_and_handshake_once() {
         continue;
 #endif
       set_socket_nonblocking(fd, true);
+#ifdef _WIN32
       int rc = ::connect(fd, p->ai_addr, static_cast<int>(p->ai_addrlen));
+#else
+      int rc = ::connect(fd, p->ai_addr, static_cast<socklen_t>(p->ai_addrlen));
+#endif
       if (rc < 0) {
 #ifdef _WIN32
         const int err = ::WSAGetLastError();
