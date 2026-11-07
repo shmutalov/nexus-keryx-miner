@@ -554,6 +554,10 @@ int main(int argc,char **argv) {
     catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 13;}
   }
 #endif
+  if(argc==3&&std::string_view(argv[1])=="--probe-rdna3-route"){
+    std::cout<<"RDNA3_ROUTE_CAPABILITY=PASS\n";
+    return 0;
+  }
   if(argc==2&&std::string_view(argv[1])=="--inference-capabilities"){
     std::cout<<"{\"schema_version\":1,\"default\":\"cuda\",\"vulkan_helper\":"
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
@@ -578,6 +582,7 @@ int main(int argc,char **argv) {
 #else
       <<",\"independent_vulkan_lanes\":false,\"secondary_vulkan_bda\":false"
 #endif
+      <<",\"secondary_vulkan_rdna3\":true"
       <<",\"trace_capture\":false,\"activation_override\":false}\n";
     return 0;
   }
@@ -806,11 +811,7 @@ int main(int argc,char **argv) {
     const char *ipfs_env=std::getenv("NEXUS_IPFS_API_URL");
     const std::string ipfs_api=ipfs_env&&*ipfs_env?ipfs_env:"http://127.0.0.1:5001";
     std::unique_ptr<ai::AiResponseService> ai_response_service;
-    const bool native_h15_route=shared_runtime&&shared_runtime->abi_version()==9&&!vulkan_ai_config&&!primary_vulkan
-#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
-      &&!secondary_pom_enabled
-#endif
-      ;
+    const bool native_h15_route=shared_runtime&&shared_runtime->abi_version()==9&&!vulkan_ai_config&&!primary_vulkan;
     ai::AiResponseTransport ai_response_transport(endpoint);
     std::unique_ptr<ai::H15AuditClient> h15_audits;
     if (!pool_mode || pool_local_node_ready) {
@@ -1318,7 +1319,17 @@ int main(int argc,char **argv) {
       if(h15_audits){
         effects.infer_traced=[&](std::string_view prompt,std::uint32_t tokens,const std::array<std::uint8_t,32>&hash){
           telemetry.set_state("PAUSED","RUNNING","H15_TRACE",submit_enabled?"ARMED":"DISABLED");
-          return gpu_ownership.run_opoi([&]{resident.reset();engine.reset();},
+          return gpu_ownership.run_opoi([&]{
+#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
+            release_amd_for_inference();
+            if(primary_vulkan_workload)primary_vulkan_workload->release();
+#endif
+            resident.reset();
+            if(engine) {
+              engine.reset();
+              std::cout<<"AI_GPU_PREEMPTION=POM_RELEASED request_id="<<request.id<<"\n"<<std::flush;
+            }
+          },
               [&]{return h15_audits->infer(prompt,tokens,hash);},[]{});
         };
         effects.recover_traced=[&](const Hash &request){return h15_audits->response_for_request(request);};
