@@ -77,7 +77,7 @@ pub fn verify_bytes(c: &[u8], tr: &[u8], proof_bytes: &[u8]) -> String {
     assert_eq!(q, tr.len(), "trailing C++ trace bytes");
     if daa >= keryx_consensus_core::config::params::H15_ACTIVATION_DAA {
         let derived = crate::v5::verify_native(
-            seed, chunks, tier, &root, &target, &pph, &proof, states, offsets,
+            seed, chunks, tier, &root, &target, &pph, &proof, states, offsets, daa,
         );
         assert_eq!(derived, claimed_final);
         assert_eq!(proof.pow_value, claimed_pow);
@@ -88,7 +88,8 @@ pub fn verify_bytes(c: &[u8], tr: &[u8], proof_bytes: &[u8]) -> String {
             seed
         );
         let target_met = claimed_pow.iter().rev().cmp(target.iter().rev()) != Ordering::Greater;
-        return format!("OFFICIAL_RUST_REAL_MODEL=PASS era=H15 states=257 offsets=256 Borsh=BYTE_IDENTICAL proof_bytes={} generation={} seed_binding=PASS negative_tile_sibling_pad_root_tier_nonce_timestamp_borsh=PASS target_satisfied={} container={}",wire.len(),generation,target_met,if target_met {"PASS"} else {"TARGET_NOT_MET"});
+        let era = if daa >= crate::v5::H16_ACTIVATION_DAA { "H16" } else { "H15" };
+        return format!("OFFICIAL_RUST_REAL_MODEL=PASS era={era} states=257 offsets=256 Borsh=BYTE_IDENTICAL proof_bytes={} generation={} seed_binding=PASS negative_tile_sibling_pad_root_tier_nonce_timestamp_borsh=PASS target_satisfied={} container={}",wire.len(),generation,target_met,if target_met {"PASS"} else {"TARGET_NOT_MET"});
     }
     let official_offsets = pom_v4::v4_offset_chain(seed, &v4.tiles, chunks / 32);
     for (i, &off) in official_offsets.iter().enumerate() {
