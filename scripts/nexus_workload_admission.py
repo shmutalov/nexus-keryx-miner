@@ -17,6 +17,10 @@ def primary_backend(device, preferences, vulkan_worker=False):
     from nexus_gpu_registry import resolve_workload
     requested = preferences.get('workloads', {}).get(device, 'auto')
     resolved = resolve_workload({'vendor': 'nvidia'}, requested)
+    if resolved == 'nexus_rdna3':
+        if vulkan_worker:
+            return 'vulkan-rdna3'
+        raise ValueError('NVIDIA_VULKAN_NOT_ADMITTED: installed worker lacks this route; refusing CUDA fallback')
     if resolved == 'nexus_bda':
         if vulkan_worker:
             return 'vulkan-bda'
@@ -32,7 +36,7 @@ def device_backend(device, preferences):
     """Pure vendor policy. Identity, driver features and executable admission follow separately."""
     from nexus_gpu_registry import resolve_workload
     resolved = resolve_workload(device, preferences.get('workloads', {}).get(device['id'], 'auto'))
-    return {'nvidia':'cuda-driver', 'nexus':'vulkan-jit', 'nexus_bda':'vulkan-bda'}[resolved]
+    return {'nvidia':'cuda-driver', 'nexus':'vulkan-jit', 'nexus_bda':'vulkan-bda', 'nexus_rdna3':'vulkan-rdna3'}[resolved]
 
 
 def worker_capabilities(worker, expected_sha):
@@ -63,9 +67,9 @@ def admit_routes(selection, workloads, worker, sha):
         if not selection[key]:
             continue
         backend = routes[ident]
-        if backend.startswith('vulkan') and caps.get('vulkan_helper') is not True:
+        if backend.startswith('vulkan') and backend != 'vulkan-rdna3' and caps.get('vulkan_helper') is not True:
             raise ValueError('Installed worker lacks Vulkan support')
-        if ident == CUDA_UUID and backend.startswith('vulkan') and caps.get('primary_vulkan') is not True:
+        if ident == CUDA_UUID and backend.startswith('vulkan') and backend != 'vulkan-rdna3' and caps.get('primary_vulkan') is not True:
             raise ValueError('Installed worker lacks primary Vulkan support')
         if backend == 'vulkan-bda':
             flag = 'primary_vulkan_bda' if ident == CUDA_UUID else 'secondary_vulkan_bda'
@@ -78,6 +82,17 @@ def admit_routes(selection, workloads, worker, sha):
                                capture_output=True, timeout=15)
             if p.returncode or p.stdout.strip() != b'BDA_ROUTE_CAPABILITY=PASS':
                 raise ValueError('BDA admission failed for '+ident+': '+p.stderr.decode(errors='replace')[:1024])
+        if backend == 'vulkan-rdna3':
+            flag = 'primary_vulkan_rdna3' if ident == CUDA_UUID else 'secondary_vulkan_rdna3'
+            if caps.get(flag) is not True:
+                raise ValueError('Installed worker lacks the selected RDNA3 route')
+            env = dict(os.environ)
+            icd = '/usr/share/vulkan/icd.d/' + ('nvidia_icd.json' if vendor == 'nvidia' else 'radeon_icd.json')
+            env.update(VK_DRIVER_FILES=icd, VK_ICD_FILENAMES=icd, VK_LOADER_LAYERS_DISABLE='~implicit~')
+            p = subprocess.run([str(worker), '--probe-rdna3-route', ident], env=env,
+                               capture_output=True, timeout=15)
+            if p.returncode or b'RDNA3_ROUTE_CAPABILITY=PASS' not in p.stdout:
+                raise ValueError('RDNA3 admission failed for '+ident+': '+p.stderr.decode(errors='replace')[:1024])
     if not selection['nvidia_pom']:
         routes[CUDA_UUID] = 'cuda-driver'  # Inactive primary must not select its saved Vulkan/AI route.
     return routes
@@ -144,10 +159,10 @@ def main():
         if not a.device:
             raise ValueError('Specify --device or --runtime-routes')
         available = False
-        if preferences.get('workloads', {}).get(a.device) in ('nexus', 'nexus_bda'):
+        if preferences.get('workloads', {}).get(a.device) in ('nexus', 'nexus_bda', 'nexus_rdna3'):
             worker, sha = (a.worker, a.worker_sha256) if a.worker else installed_worker()
             available = vulkan_worker_available(worker, sha,
-                require_bda=preferences['workloads'][a.device] == 'nexus_bda')
+                require_bda=preferences['workloads'][a.device] in ('nexus_bda', 'nexus_rdna3'))
         print(primary_backend(a.device, preferences, available))
     except (OSError, ValueError, TypeError, KeyError, subprocess.SubprocessError) as exc:
         parser.exit(13, 'NEXUS_WORKLOAD=BLOCKED ' + str(exc) + '\n')

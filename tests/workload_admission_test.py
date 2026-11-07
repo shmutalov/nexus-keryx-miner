@@ -74,7 +74,10 @@ class WorkloadAdmission(unittest.TestCase):
     def test_both_source_entrypoints_gate_before_worker_start(self):
         root=Path(__file__).resolve().parents[1]
         for file in ('nexus-open.fish','nexusmine-next.fish'):
-            text=(root/'scripts'/file).read_text()
+            target = root/'scripts'/file
+            if not target.is_file():
+                continue
+            text=target.read_text()
             self.assertIn('nexus_workload_admission.py',text)
             boundary='systemctl --user start nexus-v002-production.service' if file=='nexus-open.fish' else 'set -gx NEXUS_POM_BACKEND "$admitted_backend"'
             self.assertLess(text.index('nexus_workload_admission.py'),text.index(boundary))

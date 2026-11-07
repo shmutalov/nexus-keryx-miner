@@ -18,13 +18,15 @@ def vendor(device):
 
 
 def automatic_workload(device):
-    return {'nvidia':'nvidia','amd':'nexus','intel':'nexus'}.get(vendor(device))
+    return {'nvidia':'nvidia','amd':'nexus_rdna3','intel':'nexus'}.get(vendor(device))
 
 
 def workload_options(device):
     options=[('Automatic','auto')]
     if vendor(device)=='nvidia':options += [('Nvidia','nvidia'),('Nexus (JIT+Vulkan) · Not recommended','nexus'),('Nexus Native (BDA Vulkan)','nexus_bda')]
-    elif vendor(device) in ('amd','intel'):
+    elif vendor(device)=='amd':
+        options += [('Nexus RDNA3 (Vulkan WMMA)','nexus_rdna3')]
+    elif vendor(device)=='intel':
         options += [('Nexus (JIT+Vulkan)','nexus'),('Nexus Native (BDA Vulkan)','nexus_bda'),('Nexus RDNA3 (Vulkan WMMA)','nexus_rdna3')]
     return options
 

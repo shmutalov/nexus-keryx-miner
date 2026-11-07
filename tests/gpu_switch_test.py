@@ -41,9 +41,9 @@ class Handoff(unittest.TestCase):
         devices.prepare_state()
         preferences.save(dict(preferences.DEFAULTS, workloads={selection.CUDA_UUID:'nvidia'}))
         with patch.object(devices,'amd_devices',return_value=[{'id':selection.AMD_ID}]):
-            switch.request_change('workload',dict(device=selection.AMD_ID,workload='nexus_bda'))
+            switch.request_change('workload',dict(device=selection.AMD_ID,workload='nexus_rdna3'))
         pending=devices.private_json(devices.STATE/'handoff-request.json',{})
-        self.assertEqual(pending['workloads'],{selection.CUDA_UUID:'nvidia',selection.AMD_ID:'nexus_bda'})
+        self.assertEqual(pending['workloads'],{selection.CUDA_UUID:'nvidia',selection.AMD_ID:'nexus_rdna3'})
         self.assertEqual(preferences.load()['workloads'],{selection.CUDA_UUID:'nvidia'})
         self.assertEqual(pending['selection'],pending['previous_selection'])
     def test_secondary_cuda_route_is_rejected(self):
@@ -51,23 +51,23 @@ class Handoff(unittest.TestCase):
             switch.request_change('workload',dict(device=selection.AMD_ID,workload='nvidia'))
         switch.request_switch.assert_not_called()
     def test_unsupported_route_never_queues_a_stop(self):
-        switch.validate_route.side_effect=ValueError('BDA_UNSUPPORTED')
+        switch.validate_route.side_effect=ValueError('RDNA3_UNSUPPORTED')
         with patch.object(devices,'amd_devices',return_value=[{'id':selection.AMD_ID}]):
-            with self.assertRaisesRegex(ValueError,'BDA_UNSUPPORTED'):
-                switch.request_change('workload',dict(device=selection.AMD_ID,workload='nexus_bda'))
+            with self.assertRaisesRegex(ValueError,'RDNA3_UNSUPPORTED'):
+                switch.request_change('workload',dict(device=selection.AMD_ID,workload='nexus_rdna3'))
         switch.request_switch.assert_not_called()
         self.assertEqual(preferences.load()['workloads'],{})
     def test_primary_change_keeps_secondary_preference(self):
-        preferences.save(dict(preferences.DEFAULTS,workloads={selection.AMD_ID:'nexus_bda'}))
+        preferences.save(dict(preferences.DEFAULTS,workloads={selection.AMD_ID:'nexus_rdna3'}))
         switch.request_change('workload',dict(device=selection.CUDA_UUID,workload='nexus'))
         pending=devices.private_json(devices.STATE/'handoff-request.json',{})
-        self.assertEqual(pending['workloads'][selection.AMD_ID],'nexus_bda')
+        self.assertEqual(pending['workloads'][selection.AMD_ID],'nexus_rdna3')
 
     def test_secondary_readiness_requires_rust_parity_acknowledgement(self):
         devices.prepare_state()
         worker=dict(pid=123,starttime='456',kind='nexus-live-cuda-worker')
         snap=dict(status='LIVE',elapsed_ns=1000,age_s=0,state=dict(mining='ACTIVE',pom_backend='cuda-driver'),
-                  gpu_backends={selection.AMD_ID:'vulkan-jit'},gpu_ready={selection.AMD_ID:False})
+                  gpu_backends={selection.AMD_ID:'vulkan-rdna3'},gpu_ready={selection.AMD_ID:False})
         ready=dict(snap,gpu_ready={selection.AMD_ID:True})
         with patch.object(switch,'worker_identity',return_value=[worker]), \
              patch.object(switch,'recent_snapshot',side_effect=[snap,ready]) as read, \
@@ -84,16 +84,17 @@ class Handoff(unittest.TestCase):
             with self.assertRaises(ValueError): switch.require_idle_ai(model)
             model.ai_metrics=original
     def test_wrapper_preserves_vulkan_only_and_exclusive_cuda(self):
-        from nexus_dashboard import worker_environment
-        original=dict(NEXUS_POM_BACKEND='vulkan-jit', CUDA_VISIBLE_DEVICES=selection.CUDA_UUID,
-                      NEXUS_CUDA_DEVICE_UUID=selection.CUDA_UUID)
-        env=worker_environment(original)
-        self.assertEqual(env['CUDA_VISIBLE_DEVICES'],'')
-        self.assertNotIn('NEXUS_CUDA_DEVICE_UUID',env)
-        self.assertEqual(original['CUDA_VISIBLE_DEVICES'],selection.CUDA_UUID)
-        env=worker_environment(dict(NEXUS_POM_BACKEND='cuda-driver',CUDA_VISIBLE_DEVICES='all'))
-        self.assertEqual(env['CUDA_VISIBLE_DEVICES'],selection.CUDA_UUID)
-        with self.assertRaises(ValueError): worker_environment(dict(NEXUS_POM_BACKEND='unknown'))
+        import nexus_dashboard
+        with patch.object(nexus_dashboard, 'AUTHORIZED_GPU', selection.CUDA_UUID):
+            original=dict(NEXUS_POM_BACKEND='vulkan-jit', CUDA_VISIBLE_DEVICES=selection.CUDA_UUID,
+                          NEXUS_CUDA_DEVICE_UUID=selection.CUDA_UUID)
+            env=nexus_dashboard.worker_environment(original)
+            self.assertEqual(env['CUDA_VISIBLE_DEVICES'],'')
+            self.assertNotIn('NEXUS_CUDA_DEVICE_UUID',env)
+            self.assertEqual(original['CUDA_VISIBLE_DEVICES'],selection.CUDA_UUID)
+            env=nexus_dashboard.worker_environment(dict(NEXUS_POM_BACKEND='cuda-driver',CUDA_VISIBLE_DEVICES='all'))
+            self.assertEqual(env['CUDA_VISIBLE_DEVICES'],selection.CUDA_UUID)
+            with self.assertRaises(ValueError): nexus_dashboard.worker_environment(dict(NEXUS_POM_BACKEND='unknown'))
     def test_startup_pending_requires_complete_available_scan(self):
         from nexus_dashboard import DashboardModel
         model=DashboardModel()
