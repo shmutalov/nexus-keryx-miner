@@ -4,28 +4,44 @@
 #include "keryx/nexus/opoi.hpp"
 #include "keryx/nexus/protocol_rules.hpp"
 
-#include <arpa/inet.h>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
-#include <fcntl.h>
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <netdb.h>
-#include <netinet/tcp.h>
 #include <openssl/bn.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
-#include <poll.h>
 #include <sstream>
 #include <stdexcept>
+
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <io.h>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+using socket_t = SOCKET;
+using pollfd_t = WSAPOLLFD;
+#else
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+using socket_t = int;
+using pollfd_t = pollfd;
+#endif
 
 namespace keryx::nexus::stratum {
 
@@ -34,6 +50,59 @@ namespace {
 constexpr std::size_t kMaxStratumLineBytes = 256 * 1024;
 constexpr std::size_t kMaxWindowSeedCache = 16;
 constexpr std::size_t kMaxSeenJobs = 128;
+
+#ifdef _WIN32
+void ensure_winsock_initialized() {
+  static std::once_flag flag;
+  std::call_once(flag, []() {
+    WSADATA wsa;
+    (void)::WSAStartup(MAKEWORD(2, 2), &wsa);
+  });
+}
+#endif
+
+void close_socket_fd(socket_t &fd) noexcept {
+#ifdef _WIN32
+  if (fd != INVALID_SOCKET) {
+    ::shutdown(fd, SD_BOTH);
+    ::closesocket(fd);
+    fd = INVALID_SOCKET;
+  }
+#else
+  if (fd >= 0) {
+    ::shutdown(fd, SHUT_RDWR);
+    ::close(fd);
+    fd = -1;
+  }
+#endif
+}
+
+bool set_socket_nonblocking(socket_t fd, bool nonblocking) {
+#ifdef _WIN32
+  u_long mode = nonblocking ? 1 : 0;
+  return ::ioctlsocket(fd, FIONBIO, &mode) == 0;
+#else
+  const int flags = ::fcntl(fd, F_GETFL, 0);
+  if (flags < 0) return false;
+  return ::fcntl(fd, F_SETFL, nonblocking ? (flags | O_NONBLOCK) : (flags & ~O_NONBLOCK)) >= 0;
+#endif
+}
+
+int socket_poll(pollfd_t *fds, unsigned long nfds, int timeout_ms) {
+#ifdef _WIN32
+  return ::WSAPoll(fds, nfds, timeout_ms);
+#else
+  return ::poll(fds, nfds, timeout_ms);
+#endif
+}
+
+bool is_socket_valid(socket_t fd) noexcept {
+#ifdef _WIN32
+  return fd != INVALID_SOCKET;
+#else
+  return fd >= 0;
+#endif
+}
 
 void need(bool ok, const char *message) {
   if (!ok) {
@@ -337,7 +406,11 @@ std::string compute_stratum_opoi_tag(std::uint64_t nonce) {
 }
 
 struct StratumV4Client::SocketHandle {
-  int fd{-1};
+#ifdef _WIN32
+  socket_t fd{INVALID_SOCKET};
+#else
+  socket_t fd{-1};
+#endif
   SSL_CTX *ssl_ctx{nullptr};
   SSL *ssl{nullptr};
   std::string rx_buffer;
@@ -354,11 +427,7 @@ struct StratumV4Client::SocketHandle {
       SSL_CTX_free(ssl_ctx);
       ssl_ctx = nullptr;
     }
-    if (fd >= 0) {
-      ::shutdown(fd, SHUT_RDWR);
-      ::close(fd);
-      fd = -1;
-    }
+    close_socket_fd(fd);
     rx_buffer.clear();
   }
 };
@@ -368,6 +437,9 @@ StratumV4Client::StratumV4Client(StratumClientConfig config)
       endpoint_(parse_stratum_endpoint(config_.pool_url)),
       socket_(std::make_unique<SocketHandle>()),
       current_share_target_(difficulty_to_target(1.0)) {
+#ifdef _WIN32
+  ensure_winsock_initialized();
+#endif
   endpoints_.push_back(endpoint_);
   for (const auto &backup_url : config_.backup_urls) {
     if (!backup_url.empty() && backup_url != config_.pool_url) {
@@ -458,7 +530,7 @@ bool StratumV4Client::send_line_locked(const std::string &line) {
     outbound_wire_log_.push_back(line);
     return true;
   }
-  if (!socket_ || socket_->fd < 0) {
+  if (!socket_ || !is_socket_valid(socket_->fd)) {
     return false;
   }
   const char *ptr = framed.data();
@@ -468,7 +540,11 @@ bool StratumV4Client::send_line_locked(const std::string &line) {
     if (socket_->ssl) {
       written = SSL_write(socket_->ssl, ptr, static_cast<int>(remaining));
     } else {
+#ifdef _WIN32
+      written = ::send(socket_->fd, ptr, static_cast<int>(remaining), 0);
+#else
       written = ::send(socket_->fd, ptr, remaining, MSG_NOSIGNAL);
+#endif
     }
     if (written <= 0) {
       return false;
@@ -507,40 +583,64 @@ bool StratumV4Client::connect_and_handshake_once() {
       return false;
     }
 
-    int connected_fd = -1;
+    socket_t connected_fd =
+#ifdef _WIN32
+        INVALID_SOCKET;
+#else
+        -1;
+#endif
     for (addrinfo *p = res; p != nullptr; p = p->ai_next) {
-      int fd = ::socket(p->ai_family, p->ai_socktype | SOCK_CLOEXEC,
-                        p->ai_protocol);
+#ifdef _WIN32
+      socket_t fd = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+      if (fd == INVALID_SOCKET)
+        continue;
+#else
+      socket_t fd = ::socket(p->ai_family, p->ai_socktype | SOCK_CLOEXEC,
+                            p->ai_protocol);
       if (fd < 0)
         continue;
-      const int flags = ::fcntl(fd, F_GETFL, 0);
-      ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-      int rc = ::connect(fd, p->ai_addr, p->ai_addrlen);
-      if (rc < 0 && errno == EINPROGRESS) {
-        pollfd pfd{};
-        pfd.fd = fd;
-        pfd.events = POLLOUT;
-        rc = ::poll(&pfd, 1, connect_timeout_ms);
-        if (rc > 0) {
-          int so_error = 0;
-          socklen_t len = sizeof(so_error);
-          if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 &&
-              so_error == 0) {
-            connected_fd = fd;
-            ::fcntl(fd, F_SETFL, flags);
-            break;
+#endif
+      set_socket_nonblocking(fd, true);
+      int rc = ::connect(fd, p->ai_addr, static_cast<int>(p->ai_addrlen));
+      if (rc < 0) {
+#ifdef _WIN32
+        const int err = ::WSAGetLastError();
+        const bool in_progress = (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS);
+#else
+        const int err = errno;
+        const bool in_progress = (err == EINPROGRESS);
+#endif
+        if (in_progress) {
+          pollfd_t pfd{};
+          pfd.fd = fd;
+          pfd.events = POLLOUT;
+          rc = socket_poll(&pfd, 1, connect_timeout_ms);
+          if (rc > 0) {
+            int so_error = 0;
+            socklen_t len = sizeof(so_error);
+#ifdef _WIN32
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&so_error, &len) == 0 &&
+                so_error == 0) {
+#else
+            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &len) == 0 &&
+                so_error == 0) {
+#endif
+              connected_fd = fd;
+              set_socket_nonblocking(fd, false);
+              break;
+            }
           }
         }
       } else if (rc == 0) {
         connected_fd = fd;
-        ::fcntl(fd, F_SETFL, flags);
+        set_socket_nonblocking(fd, false);
         break;
       }
-      ::close(fd);
+      close_socket_fd(fd);
     }
     ::freeaddrinfo(res);
 
-    if (connected_fd < 0) {
+    if (!is_socket_valid(connected_fd)) {
       lock.lock();
       state_ = ConnectionState::Reconnecting;
       record_error_locked("TCP connection failed to " + host + ":" + port);
@@ -548,6 +648,13 @@ bool StratumV4Client::connect_and_handshake_once() {
     }
 
     int one = 1;
+#ifdef _WIN32
+    ::setsockopt(connected_fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+    ::setsockopt(connected_fd, SOL_SOCKET, SO_KEEPALIVE, (const char *)&one, sizeof(one));
+    DWORD tv = static_cast<DWORD>(io_timeout_ms);
+    ::setsockopt(connected_fd, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    ::setsockopt(connected_fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+#else
     ::setsockopt(connected_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     ::setsockopt(connected_fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
     timeval tv{};
@@ -555,13 +662,14 @@ bool StratumV4Client::connect_and_handshake_once() {
     tv.tv_usec = (io_timeout_ms % 1000) * 1000;
     ::setsockopt(connected_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(connected_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 
     SSL_CTX *ssl_ctx = nullptr;
     SSL *ssl = nullptr;
     if (use_tls) {
       ssl_ctx = SSL_CTX_new(TLS_client_method());
       if (!ssl_ctx) {
-        ::close(connected_fd);
+        close_socket_fd(connected_fd);
         lock.lock();
         state_ = ConnectionState::Error;
         record_error_locked("TLS context initialization failed");
@@ -575,11 +683,15 @@ bool StratumV4Client::connect_and_handshake_once() {
       }
       ssl = SSL_new(ssl_ctx);
       SSL_set_tlsext_host_name(ssl, host.c_str());
+#ifdef _WIN32
+      SSL_set_fd(ssl, static_cast<int>(connected_fd));
+#else
       SSL_set_fd(ssl, connected_fd);
+#endif
       if (SSL_connect(ssl) != 1) {
         SSL_free(ssl);
         SSL_CTX_free(ssl_ctx);
-        ::close(connected_fd);
+        close_socket_fd(connected_fd);
         lock.lock();
         state_ = ConnectionState::Reconnecting;
         record_error_locked("TLS handshake failed with " + host + ":" + port);
@@ -593,7 +705,7 @@ bool StratumV4Client::connect_and_handshake_once() {
         SSL_free(ssl);
       if (ssl_ctx)
         SSL_CTX_free(ssl_ctx);
-      ::close(connected_fd);
+      close_socket_fd(connected_fd);
       return false;
     }
     socket_->fd = connected_fd;
@@ -662,7 +774,7 @@ bool StratumV4Client::connect_and_handshake_once() {
 bool StratumV4Client::read_line_once(std::string &out_line) {
   {
     std::lock_guard lock(mutex_);
-    if (!socket_ || socket_->fd < 0)
+    if (!socket_ || !is_socket_valid(socket_->fd))
       return false;
     const auto nl = socket_->rx_buffer.find('\n');
     if (nl != std::string::npos) {
@@ -677,11 +789,16 @@ bool StratumV4Client::read_line_once(std::string &out_line) {
 
   std::array<char, 8192> chunk{};
   ssize_t n = 0;
-  int fd = -1;
+  socket_t fd =
+#ifdef _WIN32
+      INVALID_SOCKET;
+#else
+      -1;
+#endif
   SSL *ssl = nullptr;
   {
     std::lock_guard lock(mutex_);
-    if (!socket_ || socket_->fd < 0)
+    if (!socket_ || !is_socket_valid(socket_->fd))
       return false;
     fd = socket_->fd;
     ssl = socket_->ssl;
@@ -698,33 +815,51 @@ bool StratumV4Client::read_line_once(std::string &out_line) {
       return false;
     }
   } else {
-    pollfd pfd{};
+    pollfd_t pfd{};
     pfd.fd = fd;
     pfd.events = POLLIN;
-    const int prc = ::poll(&pfd, 1, 250);
+    const int prc = socket_poll(&pfd, 1, 250);
     if (prc == 0) {
       out_line.clear();
       return true;
     }
     if (prc < 0) {
+#ifdef _WIN32
+      if (::WSAGetLastError() == WSAEINTR) {
+        out_line.clear();
+        return true;
+      }
+#else
       if (errno == EINTR) {
         out_line.clear();
         return true;
       }
+#endif
       return false;
     }
+#ifdef _WIN32
+    n = ::recv(fd, chunk.data(), static_cast<int>(chunk.size()), 0);
+    if (n < 0) {
+      const int rerr = ::WSAGetLastError();
+      if (rerr == WSAEWOULDBLOCK || rerr == WSAEINTR) {
+        out_line.clear();
+        return true;
+      }
+    }
+#else
     n = ::recv(fd, chunk.data(), chunk.size(), 0);
     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
       out_line.clear();
       return true;
     }
+#endif
     if (n <= 0) {
       return false;
     }
   }
 
   std::lock_guard lock(mutex_);
-  if (!socket_ || socket_->fd < 0)
+  if (!socket_ || !is_socket_valid(socket_->fd))
     return false;
   if (socket_->rx_buffer.size() + static_cast<std::size_t>(n) >
       kMaxStratumLineBytes) {

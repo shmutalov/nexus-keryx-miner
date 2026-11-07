@@ -9,9 +9,16 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <fstream>
+#include <io.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 namespace keryx::nexus {
 // Orthogonal mining/service states. This controller cannot attest canonical duties.
 struct PomPauseCancelled {};
@@ -117,6 +124,24 @@ private:
  void poll(){
    std::lock_guard l(mutex_);const auto now=std::chrono::steady_clock::now();
    if(now<next_)return;next_=now+std::chrono::milliseconds(20);
+#ifdef _WIN32
+   std::error_code ec;
+   if (!std::filesystem::exists(path_, ec)) {
+     if (sequence_ != 0) invalid("CONTROL_UNAVAILABLE");
+     return;
+   }
+   const auto sz = std::filesystem::file_size(path_, ec);
+   if (ec || sz == 0 || sz > 64) { invalid("CONTROL_UNSAFE"); return; }
+   std::string value;
+   {
+     std::ifstream is(path_, std::ios::binary);
+     if (!is) { invalid("CONTROL_UNAVAILABLE"); return; }
+     std::getline(is, value);
+   }
+   if (value.empty()) { invalid("CONTROL_CHANGED_OR_TRUNCATED"); return; }
+   if (!value.empty() && value.back() == '\r') value.pop_back();
+   if (!value.empty() && value.back() == '\n') value.pop_back();
+#else
    const int fd=::open(path_.c_str(),O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);
    if(fd<0){if(errno!=ENOENT||sequence_!=0)invalid("CONTROL_UNAVAILABLE");return;}
    struct Close{int fd;~Close(){::close(fd);}}close{fd};struct stat a{},b{};
@@ -124,6 +149,7 @@ private:
    char buf[65];const auto n=::read(fd,buf,sizeof(buf));
    if(n<=0||n>64||::fstat(fd,&b)||a.st_size!=n||a.st_size!=b.st_size||a.st_mtim.tv_sec!=b.st_mtim.tv_sec||a.st_mtim.tv_nsec!=b.st_mtim.tv_nsec){invalid("CONTROL_CHANGED_OR_TRUNCATED");return;}
    std::string value(buf,n);if(!value.empty()&&value.back()=='\n')value.pop_back();
+#endif
    const auto space=value.find(' ');std::uint64_t seq=0;
    if(space==std::string::npos){invalid("CONTROL_ENCODING");return;}
    const auto result=std::from_chars(value.data(),value.data()+space,seq);
