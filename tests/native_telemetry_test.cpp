@@ -13,6 +13,19 @@ static void require(bool ok, const char *message) {
 int main() {
   constexpr std::uint64_t start = 1'000'000'000ULL;
   NativePomTelemetry telemetry(start);
+  telemetry.set_state("PAUSED", "IDLE", "H15_CHAIN_RESTORE", "ACK");
+  telemetry.h15_restore_finished();
+  auto resumed = telemetry.json_snapshot(start);
+  require(resumed.find("\"mining\":\"ACTIVE\"") != std::string::npos &&
+          resumed.find("\"pause_reason\":\"\"") != std::string::npos &&
+          resumed.find("\"submission\":\"ACK\"") != std::string::npos,
+          "H15 restore must clear its pause while preserving submission");
+  telemetry.set_state("PAUSED", "RUNNING", "AI_INFERENCE", "PENDING");
+  telemetry.h15_restore_finished();
+  auto ai = telemetry.json_snapshot(start);
+  require(ai.find("\"pause_reason\":\"AI_INFERENCE\"") != std::string::npos &&
+          ai.find("\"inference\":\"RUNNING\"") != std::string::npos,
+          "H15 restore must not clear an intervening AI pause");
   telemetry.set_pom_backend("vulkan-jit");
   require(telemetry.json_snapshot(start).find("\"pom_backend\":\"vulkan-jit\"") != std::string::npos,
           "every snapshot must identify the actual execution backend");

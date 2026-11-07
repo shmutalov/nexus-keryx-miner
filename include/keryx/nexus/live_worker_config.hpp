@@ -4,16 +4,25 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace keryx::nexus {
 inline bool primary_pom_selection(const char *value) {
   if (!value || std::string_view(value) == "1") return true;
   if (std::string_view(value) == "0") return false;
   throw std::invalid_argument("NEXUS_PRIMARY_POM_ENABLED must be exactly 0 or 1");
+}
+inline bool is_stratum_endpoint(std::string_view ep) noexcept {
+  return ep.rfind("stratum+tcp://", 0) == 0 ||
+         ep.rfind("stratum+ssl://", 0) == 0 ||
+         ep.rfind("stratum+tls://", 0) == 0 ||
+         ep.rfind("stratum://", 0) == 0 ||
+         ep.rfind("tcp://", 0) == 0;
 }
 struct LiveWorkerConfig {
   std::string endpoint, pay, extra;
@@ -23,6 +32,11 @@ struct LiveWorkerConfig {
   network::WorkerSubmissionPolicy policy;
   bool escrow_claims;
   GpuBackend gpu_backend{GpuBackend::CudaDriver};
+  bool pool_mode{false};
+  std::string pool_url{};
+  std::vector<std::string> backup_pool_urls{};
+  std::string pool_worker{};
+  std::string pool_password{"x"};
 };
 
 // Pure configuration validation: no GPU, RPC, file writes or secret logging.
@@ -68,7 +82,38 @@ inline LiveWorkerConfig parse_live_worker_config(int argc, char **argv,
         hex_field(std::string_view(extra).substr(signature_pos + 6, 128));
     if(pay.rfind("keryx:", 0) != 0 || !escrow_syntax)
       throw std::runtime_error("payout/escrow configuration is malformed (values redacted)");
+    bool pool_mode = is_stratum_endpoint(endpoint);
+    if (const char *mode_env = std::getenv("NEXUS_MINING_MODE")) {
+      const std::string_view mv(mode_env);
+      if (mv == "pool" || mv == "POOL") pool_mode = true;
+      else if (mv == "solo" || mv == "SOLO" || mv.empty()) { /* keep pool_mode from endpoint */ }
+      else throw std::invalid_argument("NEXUS_MINING_MODE must be solo or pool");
+    }
+    std::string pool_url;
+    std::vector<std::string> backup_pool_urls;
+    std::string pool_worker = pay;
+    std::string pool_password = "x";
+    if (pool_mode) {
+      const char *url_env = std::getenv("NEXUS_POOL_URL");
+      pool_url = (url_env && *url_env) ? std::string(url_env) : (is_stratum_endpoint(endpoint) ? endpoint : std::string{});
+      if (pool_url.empty())
+        throw std::runtime_error("pool mode requires NEXUS_POOL_URL or a stratum:// endpoint");
+      if (const char *worker_env = std::getenv("NEXUS_POOL_WORKER"); worker_env && *worker_env)
+        pool_worker = worker_env;
+      if (const char *pass_env = std::getenv("NEXUS_POOL_PASSWORD"); pass_env && *pass_env)
+        pool_password = pass_env;
+      if (const char *backups_env = std::getenv("NEXUS_POOL_BACKUP_URLS"); backups_env && *backups_env) {
+        std::stringstream ss(backups_env);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+          while (!item.empty() && std::isspace(static_cast<unsigned char>(item.front()))) item.erase(item.begin());
+          while (!item.empty() && std::isspace(static_cast<unsigned char>(item.back()))) item.pop_back();
+          if (!item.empty() && is_stratum_endpoint(item)) backup_pool_urls.push_back(item);
+        }
+      }
+    }
     return {endpoint,pay,extra,model_path,tree_path,meta_path,oracle,outdir,
-            nonce_limit,microbatch,submit_policy,escrow_claims_enabled,selected_backend};
+            nonce_limit,microbatch,submit_policy,escrow_claims_enabled,selected_backend,
+            pool_mode,pool_url,backup_pool_urls,pool_worker,pool_password};
 }
 } // namespace keryx::nexus

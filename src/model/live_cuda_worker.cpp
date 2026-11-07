@@ -1,3 +1,4 @@
+#include "keryx/nexus/pom_h15_lifecycle.hpp"
 #include "keryx/nexus/protocol_rules.hpp"
 #include "keryx/nexus/platform/io.hpp"
 #include "keryx/nexus/platform/windows_device_lease.hpp"
@@ -39,6 +40,7 @@
 #include "keryx/nexus/network/submit_block_client.hpp"
 #include "keryx/nexus/ai_response_service.hpp"
 #include "keryx/nexus/h15_audit_client.hpp"
+#include "keryx/nexus/pom_vram_admission.hpp"
 #include "keryx/nexus/escrow_watcher.hpp"
 #include "keryx/nexus/escrow_claim_policy.hpp"
 #include "keryx/nexus/strike_monitor.hpp"
@@ -52,6 +54,9 @@
 #include "keryx/nexus/prepared_rpc_template.hpp"
 #include "keryx/nexus/active_template_job.hpp"
 #include "keryx/nexus/consensus/verified_walk_view.hpp"
+#include "keryx/nexus/stratum_v4_client.hpp"
+#include "keryx/nexus/h15_bridge.h"
+#include "keryx/nexus/trace_manifest_bridge.h"
 #include "messages.pb.h"
 
 #include <algorithm>
@@ -63,7 +68,6 @@
 #include <fstream>
 #include <iostream>
 #include <syncstream>
-#include "keryx/nexus/post_submit_audits.hpp"
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -482,9 +486,68 @@ void request_worker_stop(std::atomic_bool &stop, GpuPreemptionCoordinator &gpu,
     queue.close();
 }
 
+Hash trace_stratum_window_task_root(opoi::StockLlamaRuntime &runtime,
+    std::uint8_t tier, const Hash &window_seed) {
+  if (runtime.abi_version() != 8 && runtime.abi_version() != 9)
+    throw std::runtime_error("Stratum v4 H15 block-task tracing requires stock llama ABI8/9");
+  runtime.use_task_context();
+  std::size_t manifest_bytes = 0, layer_rows = 0;
+  NexusTraceManifestInfo chain_info{};
+  // Block-task tracing uses the canonical stage-2 chain manifest (chain-tier*.bin).
+  if (nexus_ai_h15_manifest(0, tier, 140115000ULL, nullptr, 0, &manifest_bytes,
+                            nullptr, 0, &layer_rows, &chain_info) != 2) {
+    throw std::runtime_error("Stratum v4 H15 chain manifest query failed");
+  }
+  std::vector<std::uint8_t> chain_manifest(manifest_bytes);
+  std::vector<opoi::SequenceLayer> chain_layers(std::max<std::size_t>(1, layer_rows));
+  if (nexus_ai_h15_manifest(0, tier, 140115000ULL, chain_manifest.data(), manifest_bytes,
+                            &manifest_bytes, reinterpret_cast<std::uint32_t *>(chain_layers.data()),
+                            chain_layers.size(), &layer_rows, &chain_info) != 0) {
+    throw std::runtime_error("Stratum v4 H15 chain manifest load failed");
+  }
+  std::array<std::int32_t, 64> tokens{};
+  std::size_t token_count = tokens.size();
+  if (nexus_h15_block_task_tokens(tier, window_seed.data(), tokens.data(), &token_count) != 0 ||
+      token_count == 0) {
+    throw std::runtime_error(std::string("Stratum v4 H15 block_task_tokens failed: ") + nexus_h15_error());
+  }
+  struct ScratchRelease {
+    opoi::StockLlamaRuntime &rt;
+    ~ScratchRelease() noexcept {
+      try { rt.use_task_context(); } catch (...) {}
+    }
+  } scratch_release{runtime};
+  if (runtime.abi_version() == 9) {
+    (void)runtime.configure_sequence({}, 0, 0, 0, 0);
+  }
+  (void)runtime.configure_trace(chain_manifest, static_cast<std::uint32_t>(token_count),
+                                chain_info.position_leaves);
+  const auto traced = runtime.trace_tokens(std::span<const std::int32_t>(tokens.data(), token_count));
+  NexusH15Capture raw{
+      traced.tokens.data(),
+      traced.ubatch.data(),
+      reinterpret_cast<const std::uint8_t *>(traced.leaves.data()),
+      nullptr,
+      traced.tokens.size(),
+      chain_info.position_leaves,
+      0,
+      traced.prompt_positions};
+  Hash task_root{};
+  if (nexus_h15_block_task_root(&raw, tier, window_seed.data(), task_root.data()) != 0) {
+    throw std::runtime_error(std::string("Stratum v4 H15 block_task_root failed: ") + nexus_h15_error());
+  }
+  return task_root;
+}
+
 }
 
 int main(int argc,char **argv) {
+#ifdef NEXUS_STRIKE_LAB_ONLY
+  // This laboratory binary never acquires a GPU as a side effect of invocation.
+  if(!std::getenv("NEXUS_STRIKE_EXCLUSIVE_LIVE_AUTHORIZED")){
+    std::cerr<<"STRIKE_LAB=BLOCKED live GPU/ABI9 requires separate maintenance authorization\n";return 78;
+  }
+#endif
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
   if(argc==3&&std::string_view(argv[1])=="--probe-bda-route"){
     try{probe_bda_route(argv[2]);std::cout<<"BDA_ROUTE_CAPABILITY=PASS\n";return 0;}
@@ -531,12 +594,15 @@ int main(int argc,char **argv) {
 #endif
   AiRequestQueue ai_requests;
   GpuPreemptionCoordinator gpu_ownership;
+  const char *pom_ctrl_env=std::getenv("NEXUS_POM_CONTROL_FILE");
+  PomH15Lifecycle pom_lifecycle(pom_ctrl_env&&*pom_ctrl_env?fs::path(pom_ctrl_env):fs::path(NEXUS_RECOVERY_ROOT)/"pom-control.request");
   std::thread ingress;
   std::thread shutdown_watcher;
   std::unique_ptr<ai::EscrowWatcher> escrow_watcher;
   std::unique_ptr<ai::StrikeMonitor> strike_monitor;
   bool submit_enabled=false;
   bool ai_responses_enabled=false;
+  std::atomic_bool h15_service_initialized{false};
   bool escrow_claims_enabled=false;
   std::future<void> escrow_claim_task;
   std::atomic_uint64_t next_claim_check_ns{0};
@@ -616,30 +682,72 @@ int main(int argc,char **argv) {
 #endif
     );
     const auto escrow_pos=extra.find("/escrow:");
+    const bool pool_mode=config.pool_mode;
+    const auto &pool_url=config.pool_url;
+    const auto &pool_worker=config.pool_worker;
+    const auto &pool_password=config.pool_password;
+    if (!pool_mode) {
+      NativePomTelemetry::StratumFields solo_stratum;
+      solo_stratum.connected = true;
+      solo_stratum.mode = "solo";
+      solo_stratum.state = "SOLO_GRPC";
+      solo_stratum.endpoint = endpoint;
+      solo_stratum.worker = pay;
+      telemetry.set_stratum(solo_stratum);
+    } else {
+      NativePomTelemetry::StratumFields init_stratum;
+      init_stratum.connected = false;
+      init_stratum.mode = "pool";
+      init_stratum.state = "CONNECTING";
+      init_stratum.endpoint = pool_url;
+      init_stratum.worker = pool_worker;
+      telemetry.set_stratum(init_stratum);
+    }
     RustProofVerifier rust_verifier(oracle.string());
     startup.record("CONFIG_VALIDATION", StartupResult::Pass,
                    "arguments, explicit submit policy, RTX UUID, payout and escrow syntax validated; secrets redacted");
 
-    const auto node = probe_node_readiness(endpoint, std::chrono::seconds(10));
-    if (node.network != "mainnet" || !node.synced) {
-      startup.record("NODE_SYNC", StartupResult::Blocked,
-                     "GetCurrentNetwork/GetInfo did not report synced mainnet");
-      return 78;
+    bool pool_local_node_ready = !pool_mode;
+    if (pool_mode && !is_stratum_endpoint(endpoint) &&
+        (!std::getenv("NEXUS_POOL_STANDALONE") || std::string_view(std::getenv("NEXUS_POOL_STANDALONE")) != "1")) {
+      try {
+        const auto probe_node = probe_node_readiness(endpoint, std::chrono::seconds(2));
+        if (probe_node.network == "mainnet" && probe_node.synced &&
+            probe_local_ipfs_api(std::chrono::seconds(2))) {
+          pool_local_node_ready = true;
+        }
+      } catch (...) {
+        pool_local_node_ready = false;
+      }
     }
-    // Node-version admission supplements the DAA-based H15 guard below;
-    // text-only Vulkan generation is not canonical tracing.
-    if(primary_vulkan&&node.version!="1.6.4")
-      throw std::runtime_error("Vulkan AI requires reviewed mainnet protocol rules for the node version; no CUDA fallback");
-    startup.record("NODE_SYNC", StartupResult::Pass,
-                   "bounded GetCurrentNetwork/GetInfo reports synced mainnet; version=" + node.version);
 
-    if (!probe_local_ipfs_api(std::chrono::seconds(2))) {
-      startup.record("IPFS_READY", StartupResult::Blocked,
-                     "local Kubo /api/v0/version did not return HTTP 200; daemon was not started or changed");
-      return 78;
+    if (!pool_mode || pool_local_node_ready) {
+      const auto node = probe_node_readiness(endpoint, std::chrono::seconds(10));
+      if (node.network != "mainnet" || !node.synced) {
+        startup.record("NODE_SYNC", StartupResult::Blocked,
+                       "GetCurrentNetwork/GetInfo did not report synced mainnet");
+        return 78;
+      }
+      // Node-version admission supplements the DAA-based H15 guard below;
+      // text-only Vulkan generation is not canonical tracing.
+      if(primary_vulkan&&node.version!="1.6.4")
+        throw std::runtime_error("Vulkan AI requires reviewed mainnet protocol rules for the node version; no CUDA fallback");
+      startup.record("NODE_SYNC", StartupResult::Pass,
+                     "bounded GetCurrentNetwork/GetInfo reports synced mainnet; version=" + node.version);
+
+      if (!probe_local_ipfs_api(std::chrono::seconds(2))) {
+        startup.record("IPFS_READY", StartupResult::Blocked,
+                       "local Kubo /api/v0/version did not return HTTP 200; daemon was not started or changed");
+        return 78;
+      }
+      startup.record("IPFS_READY", StartupResult::Pass,
+                     "local Kubo HTTP API responded; no daemon process was started or changed");
+    } else {
+      startup.record("NODE_SYNC", StartupResult::Pass,
+                     "Stratum v4 pool mode active; standalone pool transport configured");
+      startup.record("IPFS_READY", StartupResult::Pass,
+                     "Stratum v4 pool mode active; standalone pool transport configured");
     }
-    startup.record("IPFS_READY", StartupResult::Pass,
-                   "local Kubo HTTP API responded; no daemon process was started or changed");
 
     fs::create_directories(outdir);
     model::ReadOnlyGguf gguf(model_path);
@@ -705,44 +813,46 @@ int main(int argc,char **argv) {
       ;
     ai::AiResponseTransport ai_response_transport(endpoint);
     std::unique_ptr<ai::H15AuditClient> h15_audits;
-    try {
-      // Omitted windowDaa asks the node for its current exact service-eligibility window;
-      // widening this to the API maximum would admit miners who are not in the active cohort.
-      service_rpc = probe_ai_service_rpc(endpoint, 0,
-          service_identity ? std::string_view(*service_identity) : std::string_view{},
-          std::chrono::seconds(5), ServiceRpcQuery::ProvidersOnly);
-      const auto listing = ai::provider_listing_status(service_rpc, 0,
-          hex(official_model.data(), official_model.size()),
-          service_identity ? std::string_view(*service_identity) : std::string_view{}, escrow_key);
-      const char *listing_text = listing == ai::ProviderListingStatus::Listed ? "LISTED" :
-          listing == ai::ProviderListingStatus::NotListed ? "NOT_LISTED" : "UNKNOWN";
-      std::cout << "{\"event\":\"AI_SERVICE_RPC_SNAPSHOT\",\"providers_available\":"
-                << (service_rpc.providers_available ? "true" : "false")
-                << ",\"providers\":" << service_rpc.providers.size()
-                << ",\"provider_listing\":\"" << listing_text << "\""
-                << ",\"identity\":\"" << (service_identity ? *service_identity : "UNKNOWN") << "\""
-                << ",\"strikes_state\":\""
-                << (service_rpc.strikes_available ? "AVAILABLE" : "UNKNOWN") << "\""
-                << ",\"consecutive\":" << (service_rpc.strikes.consecutive
-                    ? std::to_string(*service_rpc.strikes.consecutive) : "null")
-                << ",\"lifetime\":" << (service_rpc.strikes.lifetime
-                    ? std::to_string(*service_rpc.strikes.lifetime) : "null")
-                << ",\"pending_burns\":"
-                << (service_rpc.strikes_available ? std::to_string(service_rpc.strikes.pending_burns) : "null")
-                << ",\"suspended_until_daa\":" << (service_rpc.strikes.suspended_until_daa
-                    ? std::to_string(*service_rpc.strikes.suspended_until_daa) : "null") << "}\n" << std::flush;
-      if (listing == ai::ProviderListingStatus::Unknown)
-        throw std::runtime_error("authoritative GetServiceProviders snapshot unavailable: " + service_rpc.providers_error);
-      if(!native_h15_route)protocol::require_legacy_worker_era("mainnet", service_rpc.providers_virtual_daa);
-      std::cout << "PROVIDER_LISTED=" << listing_text
-                << " meaning=current selected-chain cohort; AiRequest assignment remains cohort-gated\n" << std::flush;
-    } catch (const std::exception &e) {
-      // Cohort discovery precedes escrow readiness. Report failure at the
-      // current gate so the original RPC error is preserved, without skipping
-      // the identity gate or admitting mining with an unknown cohort.
-      startup.record("ESCROW_IDENTITY_READY", StartupResult::Blocked,
-                     std::string("cannot obtain authoritative provider cohort for request assignment: ")+e.what());
-      return 78;
+    if (!pool_mode || pool_local_node_ready) {
+      try {
+        // Omitted windowDaa asks the node for its current exact service-eligibility window;
+        // widening this to the API maximum would admit miners who are not in the active cohort.
+        service_rpc = probe_ai_service_rpc(endpoint, 0,
+            service_identity ? std::string_view(*service_identity) : std::string_view{},
+            std::chrono::seconds(5), ServiceRpcQuery::ProvidersOnly);
+        const auto listing = ai::provider_listing_status(service_rpc, 0,
+            hex(official_model.data(), official_model.size()),
+            service_identity ? std::string_view(*service_identity) : std::string_view{}, escrow_key);
+        const char *listing_text = listing == ai::ProviderListingStatus::Listed ? "LISTED" :
+            listing == ai::ProviderListingStatus::NotListed ? "NOT_LISTED" : "UNKNOWN";
+        std::cout << "{\"event\":\"AI_SERVICE_RPC_SNAPSHOT\",\"providers_available\":"
+                  << (service_rpc.providers_available ? "true" : "false")
+                  << ",\"providers\":" << service_rpc.providers.size()
+                  << ",\"provider_listing\":\"" << listing_text << "\""
+                  << ",\"identity\":\"" << (service_identity ? *service_identity : "UNKNOWN") << "\""
+                  << ",\"strikes_state\":\""
+                  << (service_rpc.strikes_available ? "AVAILABLE" : "UNKNOWN") << "\""
+                  << ",\"consecutive\":" << (service_rpc.strikes.consecutive
+                      ? std::to_string(*service_rpc.strikes.consecutive) : "null")
+                  << ",\"lifetime\":" << (service_rpc.strikes.lifetime
+                      ? std::to_string(*service_rpc.strikes.lifetime) : "null")
+                  << ",\"pending_burns\":"
+                  << (service_rpc.strikes_available ? std::to_string(service_rpc.strikes.pending_burns) : "null")
+                  << ",\"suspended_until_daa\":" << (service_rpc.strikes.suspended_until_daa
+                      ? std::to_string(*service_rpc.strikes.suspended_until_daa) : "null") << "}\n" << std::flush;
+        if (listing == ai::ProviderListingStatus::Unknown)
+          throw std::runtime_error("authoritative GetServiceProviders snapshot unavailable: " + service_rpc.providers_error);
+        if(!native_h15_route)protocol::require_legacy_worker_era("mainnet", service_rpc.providers_virtual_daa);
+        std::cout << "PROVIDER_LISTED=" << listing_text
+                  << " meaning=current selected-chain cohort; AiRequest assignment remains cohort-gated\n" << std::flush;
+      } catch (const std::exception &e) {
+        // Cohort discovery precedes escrow readiness. Report failure at the
+        // current gate so the original RPC error is preserved, without skipping
+        // the identity gate or admitting mining with an unknown cohort.
+        startup.record("ESCROW_IDENTITY_READY", StartupResult::Blocked,
+                       std::string("cannot obtain authoritative provider cohort for request assignment: ")+e.what());
+        return 78;
+      }
     }
     std::array<std::uint8_t,32> escrow_secret{};
     std::array<std::uint8_t,32> escrow_pubkey{};
@@ -765,175 +875,192 @@ int main(int argc,char **argv) {
                    "existing escrow secret matches configured x-only key; official payout delegation signature verified");
     telemetry.set_wallet(pay, hex(escrow_pubkey.data(), escrow_pubkey.size()),
                          *service_identity, true);
-    startup.record("AI_REQUEST_SERVICE_READY", StartupResult::Pass,
-                   "official block subscription/backfill feeds bounded AiRequest queue; provider cohort is authoritative for request assignment but current non-membership does not block first PoM; private opening uses stock bridge");
-    if(ipfs_api.rfind("http://127.0.0.1:",0)!=0) {
-      startup.record("AI_RESPONSE_TRANSPORT_READY", StartupResult::Blocked,
-                     "public response publisher must use explicitly configured local IPFS API");
-      return 78;
-    }
     model::SparseMerkleIndex merkle(gguf,tree_path);
-    if(native_h15_route)h15_audits=std::make_unique<ai::H15AuditClient>(*shared_runtime,gguf,merkle,
-        developer_data_root()/"state"/"ai-service"/"h15",escrow_secret,endpoint,official_model);
-    ai::AiResponseConfig ai_config;ai_config.native_h15=bool(h15_audits)&&h15_audits->ready();ai_config.escrow_secret=escrow_secret;ai_config.escrow_pubkey=escrow_pubkey;
-    ai_config.delegation_signature=delegation;ai_config.model_id=official_model;ai_config.payout_address=pay;
-    ai_config.service_identity=*service_identity;ai_config.network="mainnet";ai_config.tier=0;
-    ai_config.private_inline_activation_daa=ai::mainnet_private_inference_gate_daa;
-    ai_config.signed_response_activation_daa=76'316'623ULL;
-    // Keep response intent/reconciliation state across candidate restarts. The session
-    // output directory is timestamped and therefore cannot serve as a recovery journal.
-    ai_config.journal_path=developer_data_root()/"state"/"ai-service"/"ai-response.journal";
-    try {ai_response_service=std::make_unique<ai::AiResponseService>(std::move(ai_config));}
-    catch(const std::exception&e){startup.record("AI_RESPONSE_TRANSPORT_READY",StartupResult::Blocked,
-        std::string("AiResponse production service initialization failed: ")+e.what());return 78;}
-    startup.record("AI_RESPONSE_TRANSPORT_READY", StartupResult::Pass,
-                   "official signed AiResponse serialization, local IPFS add/readback, SubmitTransaction and mempool reconciliation adapters configured; no transaction sent during startup");
-    try {ai_response_service->recover();}
-    catch(const std::exception&e){startup.record("PENDING_REQUEST_RECOVERY",StartupResult::Blocked,
-        std::string("durable AiResponse journal recovery failed closed: ")+e.what());return 78;}
-    startup.record("PENDING_REQUEST_RECOVERY", StartupResult::Pass,
-                   "checksummed response journal recovered; gRPC startup block backfill will rediscover requests and ambiguous submissions are reconciled before any retry");
-    try {
-      const auto state_path = prepare_nexus_escrow_state();
-      claim_journal=state_path.parent_path()/"claim-submissions.jsonl";
-      claim_cadence_file=state_path.parent_path()/"claim-check-unix.sec";
-      if(escrow_claims_enabled&&fs::exists(claim_cadence_file)) {
-        std::ifstream cadence(claim_cadence_file);std::string trailing;
-        if(!(cadence>>last_claim_check_unix)||(cadence>>trailing)||last_claim_check_unix>253402300799ULL)
-          throw std::runtime_error("durable claim cadence record invalid");
+    if (!pool_mode || pool_local_node_ready) {
+      startup.record("AI_REQUEST_SERVICE_READY", StartupResult::Pass,
+                     "official block subscription/backfill feeds bounded AiRequest queue; provider cohort is authoritative for request assignment but current non-membership does not block first PoM; private opening uses stock bridge");
+      if(ipfs_api.rfind("http://127.0.0.1:",0)!=0) {
+        startup.record("AI_RESPONSE_TRANSPORT_READY", StartupResult::Blocked,
+                       "public response publisher must use explicitly configured local IPFS API");
+        return 78;
       }
-      if(escrow_claims_enabled&&fs::exists(claim_journal)) {
-        std::ifstream prior_claims(claim_journal);std::string line;
-        constexpr std::string_view key="\"txid\":\"";
-        const auto is_lower_hex=[](std::string_view sv) noexcept {
-          return sv.size()==64&&std::all_of(sv.begin(),sv.end(),[](char c){
-            return (c>='0'&&c<='9')||(c>='a'&&c<='f');
-          });
-        };
-        while(std::getline(prior_claims,line)) {
-          for(std::size_t pos=0;(pos=line.find(key,pos))!=std::string::npos;pos+=key.size()) {
-            const auto start=pos+key.size();
-            if(start+64<line.size()&&line[start+64]=='"') {
-              const std::string_view candidate(line.data()+start,64);
-              if(is_lower_hex(candidate)) {
-                const std::string txid(candidate);
-                if(own_claim_ids.size()>=10000&&!own_claim_ids.contains(txid))
-                  throw std::runtime_error("claim reconciliation history exceeds bounded capacity");
-                own_claim_ids.insert(txid);
+      if(native_h15_route)h15_audits=std::make_unique<ai::H15AuditClient>(*shared_runtime,gguf,merkle,
+          developer_data_root()/"state"/"ai-service"/"h15",escrow_secret,endpoint,official_model);
+      ai::AiResponseConfig ai_config;ai_config.native_h15=bool(h15_audits)&&h15_audits->ready();ai_config.escrow_secret=escrow_secret;ai_config.escrow_pubkey=escrow_pubkey;
+      ai_config.delegation_signature=delegation;ai_config.model_id=official_model;ai_config.payout_address=pay;
+      ai_config.service_identity=*service_identity;ai_config.network="mainnet";ai_config.tier=0;
+      ai_config.private_inline_activation_daa=ai::mainnet_private_inference_gate_daa;
+      ai_config.signed_response_activation_daa=76'316'623ULL;
+      // Keep response intent/reconciliation state across candidate restarts. The session
+      // output directory is timestamped and therefore cannot serve as a recovery journal.
+      ai_config.journal_path=developer_data_root()/"state"/"ai-service"/"ai-response.journal";
+      try {ai_response_service=std::make_unique<ai::AiResponseService>(std::move(ai_config));}
+      catch(const std::exception&e){startup.record("AI_RESPONSE_TRANSPORT_READY",StartupResult::Blocked,
+          std::string("AiResponse production service initialization failed: ")+e.what());return 78;}
+      startup.record("AI_RESPONSE_TRANSPORT_READY", StartupResult::Pass,
+                     "official signed AiResponse serialization, local IPFS add/readback, SubmitTransaction and mempool reconciliation adapters configured; no transaction sent during startup");
+      try {ai_response_service->recover();}
+      catch(const std::exception&e){startup.record("PENDING_REQUEST_RECOVERY",StartupResult::Blocked,
+          std::string("durable AiResponse journal recovery failed closed: ")+e.what());return 78;}
+      startup.record("PENDING_REQUEST_RECOVERY", StartupResult::Pass,
+                     "checksummed response journal recovered; gRPC startup block backfill will rediscover requests and ambiguous submissions are reconciled before any retry");
+      try {
+        const auto state_path = prepare_nexus_escrow_state();
+        claim_journal=state_path.parent_path()/"claim-submissions.jsonl";
+        claim_cadence_file=state_path.parent_path()/"claim-check-unix.sec";
+        if(escrow_claims_enabled&&fs::exists(claim_cadence_file)) {
+          std::ifstream cadence(claim_cadence_file);std::string trailing;
+          if(!(cadence>>last_claim_check_unix)||(cadence>>trailing)||last_claim_check_unix>253402300799ULL)
+            throw std::runtime_error("durable claim cadence record invalid");
+        }
+        if(escrow_claims_enabled&&fs::exists(claim_journal)) {
+          std::ifstream prior_claims(claim_journal);std::string line;
+          constexpr std::string_view key="\"txid\":\"";
+          const auto is_lower_hex=[](std::string_view sv) noexcept {
+            return sv.size()==64&&std::all_of(sv.begin(),sv.end(),[](char c){
+              return (c>='0'&&c<='9')||(c>='a'&&c<='f');
+            });
+          };
+          while(std::getline(prior_claims,line)) {
+            for(std::size_t pos=0;(pos=line.find(key,pos))!=std::string::npos;pos+=key.size()) {
+              const auto start=pos+key.size();
+              if(start+64<line.size()&&line[start+64]=='"') {
+                const std::string_view candidate(line.data()+start,64);
+                if(is_lower_hex(candidate)) {
+                  const std::string txid(candidate);
+                  if(own_claim_ids.size()>=10000&&!own_claim_ids.contains(txid))
+                    throw std::runtime_error("claim reconciliation history exceeds bounded capacity");
+                  own_claim_ids.insert(txid);
+                  break;
+                }
+              }
+            }
+          }
+        }
+        escrow_watcher = std::make_unique<ai::EscrowWatcher>(escrow_secret, pay, state_path);
+        escrow_watcher->set_claim_construction_enabled(false);
+        startup.record("ESCROW_STATE_RECOVERED", StartupResult::Pass,
+                       "official stock snapshot/journal loaded in separate NEXUS state; source files unchanged; claim construction disabled");
+        const auto hashes = escrow_watcher->start_state_validation();
+        const auto escrow_audit = state_path.parent_path() / "selected-chain-validation.tsv";
+        std::vector<std::string> encoded;
+        encoded.reserve(hashes.size());
+        for (const auto &hash : hashes) encoded.push_back(hex(hash.data(), hash.size()));
+        std::size_t selected = 0, orphaned = 0, unknown = 0, rpc_errors = 0;
+        if (!encoded.empty()) {
+          const auto statuses = probe_blocks_selected_chain(endpoint, encoded, std::chrono::seconds(120));
+          if (statuses.size() != hashes.size())
+            throw std::runtime_error("GetBlock selected-chain validation result count mismatch");
+          for (std::size_t i = 0; i < hashes.size(); ++i) {
+            const auto &status = statuses[i];
+            if (status.hash != encoded[i])
+              throw std::runtime_error("selected-chain validation response correlation mismatch");
+            switch (status.state) {
+              case BlockValidationState::ChainValid:
+                if (status.selected_chain != std::optional<bool>(true))
+                  throw std::runtime_error("CHAIN_VALID result lacks explicit isChainBlock=true");
+                append_escrow_validation_audit(escrow_audit, status);
+                ++selected;
+                if (!escrow_watcher->validation_result(hashes[i], true))
+                  throw std::runtime_error("stock escrow watcher did not consume CHAIN_VALID result");
+                break;
+              case BlockValidationState::OffChain:
+                if (status.selected_chain != std::optional<bool>(false))
+                  throw std::runtime_error("OFF_CHAIN result lacks explicit isChainBlock=false");
+                // The stock transition permanently slashes ghost entries. Preserve the exact
+                // durable state pair before applying that irreversible official transition.
+                backup_escrow_before_offchain(state_path, encoded[i]);
+                append_escrow_validation_audit(escrow_audit, status);
+                ++orphaned;
+                if (!escrow_watcher->validation_result(hashes[i], false))
+                  throw std::runtime_error("stock escrow watcher did not consume OFF_CHAIN result");
+                break;
+              case BlockValidationState::Unknown:
+              case BlockValidationState::Error:
+              case BlockValidationState::Pending: {
+                append_escrow_validation_audit(escrow_audit, status);
+                if (status.state == BlockValidationState::Error) ++rpc_errors;
+                ++unknown;
+                // Stock consumes the validation slot but preserves the entry. Its claim path
+                // now separately quarantines this hash until a later authoritative verdict.
+                const auto detail = "GetBlock selected-chain " + std::string(
+                    status.state == BlockValidationState::Error ? "ERROR" :
+                    status.state == BlockValidationState::Pending ? "PENDING" : "UNKNOWN") +
+                    " for " + encoded[i] + ": " + status.error;
+                if (!escrow_watcher->validation_error(detail))
+                  throw std::runtime_error("stock escrow watcher did not consume inconclusive block status");
                 break;
               }
             }
           }
         }
-      }
-      escrow_watcher = std::make_unique<ai::EscrowWatcher>(escrow_secret, pay, state_path);
-      escrow_watcher->set_claim_construction_enabled(false);
-      startup.record("ESCROW_STATE_RECOVERED", StartupResult::Pass,
-                     "official stock snapshot/journal loaded in separate NEXUS state; source files unchanged; claim construction disabled");
-      const auto hashes = escrow_watcher->start_state_validation();
-      const auto escrow_audit = state_path.parent_path() / "selected-chain-validation.tsv";
-      std::vector<std::string> encoded;
-      encoded.reserve(hashes.size());
-      for (const auto &hash : hashes) encoded.push_back(hex(hash.data(), hash.size()));
-      std::size_t selected = 0, orphaned = 0, unknown = 0, rpc_errors = 0;
-      if (!encoded.empty()) {
-        const auto statuses = probe_blocks_selected_chain(endpoint, encoded, std::chrono::seconds(120));
-        if (statuses.size() != hashes.size())
-          throw std::runtime_error("GetBlock selected-chain validation result count mismatch");
-        for (std::size_t i = 0; i < hashes.size(); ++i) {
-          const auto &status = statuses[i];
-          if (status.hash != encoded[i])
-            throw std::runtime_error("selected-chain validation response correlation mismatch");
-          switch (status.state) {
-            case BlockValidationState::ChainValid:
-              if (status.selected_chain != std::optional<bool>(true))
-                throw std::runtime_error("CHAIN_VALID result lacks explicit isChainBlock=true");
-              append_escrow_validation_audit(escrow_audit, status);
-              ++selected;
-              if (!escrow_watcher->validation_result(hashes[i], true))
-                throw std::runtime_error("stock escrow watcher did not consume CHAIN_VALID result");
-              break;
-            case BlockValidationState::OffChain:
-              if (status.selected_chain != std::optional<bool>(false))
-                throw std::runtime_error("OFF_CHAIN result lacks explicit isChainBlock=false");
-              // The stock transition permanently slashes ghost entries. Preserve the exact
-              // durable state pair before applying that irreversible official transition.
-              backup_escrow_before_offchain(state_path, encoded[i]);
-              append_escrow_validation_audit(escrow_audit, status);
-              ++orphaned;
-              if (!escrow_watcher->validation_result(hashes[i], false))
-                throw std::runtime_error("stock escrow watcher did not consume OFF_CHAIN result");
-              break;
-            case BlockValidationState::Unknown:
-            case BlockValidationState::Error:
-            case BlockValidationState::Pending: {
-              append_escrow_validation_audit(escrow_audit, status);
-              if (status.state == BlockValidationState::Error) ++rpc_errors;
-              ++unknown;
-              // Stock consumes the validation slot but preserves the entry. Its claim path
-              // now separately quarantines this hash until a later authoritative verdict.
-              const auto detail = "GetBlock selected-chain " + std::string(
-                  status.state == BlockValidationState::Error ? "ERROR" :
-                  status.state == BlockValidationState::Pending ? "PENDING" : "UNKNOWN") +
-                  " for " + encoded[i] + ": " + status.error;
-              if (!escrow_watcher->validation_error(detail))
-                throw std::runtime_error("stock escrow watcher did not consume inconclusive block status");
-              break;
-            }
-          }
+        escrow_watcher->flush();
+        std::cout << "ESCROW_CHAIN_VALIDATION selected=" << selected << " orphaned=" << orphaned
+                  << " unknown=" << unknown << " rpc_errors=" << rpc_errors
+                  << " claim_submission=DISABLED unknown_claim_eligibility=DENIED audit="
+                  << escrow_audit.string() << "\n" << std::flush;
+        if (escrow_watcher->validation_in_progress()) {
+          startup.record("ESCROW_VALIDATION_COMPLETE", StartupResult::Blocked,
+                         "bounded GetBlock validation left a request pending; service cannot assume completion");
+          return 78;
         }
-      }
-      escrow_watcher->flush();
-      std::cout << "ESCROW_CHAIN_VALIDATION selected=" << selected << " orphaned=" << orphaned
-                << " unknown=" << unknown << " rpc_errors=" << rpc_errors
-                << " claim_submission=DISABLED unknown_claim_eligibility=DENIED audit="
-                << escrow_audit.string() << "\n" << std::flush;
-      if (escrow_watcher->validation_in_progress()) {
-        startup.record("ESCROW_VALIDATION_COMPLETE", StartupResult::Blocked,
-                       "bounded GetBlock validation left a request pending; service cannot assume completion");
+        startup.record("ESCROW_VALIDATION_COMPLETE", StartupResult::Pass,
+                       "selected-chain verdicts applied; OFF_CHAIN entries backed up before official purge; UNKNOWN/ERROR entries retained and quarantined from claim selection");
+        startup.record("ESCROW_CLAIM_ENGINE_READY", StartupResult::Pass,
+                       std::string(escrow_claims_enabled ? "stock claims explicitly authorized; checks every 1800 seconds after complete backfill; stock maturity, fee and batching retained" : "stock claim engine is durable and disabled for network effects") + "; unknown historical outpoints are individually ineligible" +
+                         (unknown == 0 ? std::string{} : "; unresolved=" + std::to_string(unknown) +
+                          " rpc_errors=" + std::to_string(rpc_errors)));
+      } catch (const std::exception &e) {
+        startup.record("ESCROW_STATE_RECOVERED", StartupResult::Blocked,
+                       std::string("stock escrow recovery/selected-chain validation failed closed: ") + e.what());
         return 78;
       }
-      startup.record("ESCROW_VALIDATION_COMPLETE", StartupResult::Pass,
-                     "selected-chain verdicts applied; OFF_CHAIN entries backed up before official purge; UNKNOWN/ERROR entries retained and quarantined from claim selection");
-      startup.record("ESCROW_CLAIM_ENGINE_READY", StartupResult::Pass,
-                     std::string(escrow_claims_enabled ? "stock claims explicitly authorized; checks every 1800 seconds after complete backfill; stock maturity, fee and batching retained" : "stock claim engine is durable and disabled for network effects") + "; unknown historical outpoints are individually ineligible" +
-                       (unknown == 0 ? std::string{} : "; unresolved=" + std::to_string(unknown) +
-                        " rpc_errors=" + std::to_string(rpc_errors)));
-    } catch (const std::exception &e) {
-      startup.record("ESCROW_STATE_RECOVERED", StartupResult::Blocked,
-                     std::string("stock escrow recovery/selected-chain validation failed closed: ") + e.what());
-      return 78;
-    }
 
-    try {
-      strike_monitor = std::make_unique<ai::StrikeMonitor>(*service_identity,
-          developer_data_root() / "state" / "ai-service" / "strikes.jsonl",
-          [endpoint, identity = *service_identity] {
-            const auto rpc = probe_ai_service_rpc(endpoint, 0, identity, std::chrono::seconds(5),
-                                                   ServiceRpcQuery::StrikesOnly);
-            auto observed = rpc.strikes;
-            if (observed.identity.empty()) observed.identity = identity;
-            if (!rpc.strikes_available && observed.error.empty()) observed.error = "GetServiceStrikes unavailable";
-            return observed;
-          }, [](const ai::StrikeSnapshot &s) {
-            std::cout << "{\"event\":\"SERVICE_STRIKE_POLL\",\"identity\":\"" << s.identity
-                      << "\",\"availability\":\""
-                      << (s.availability == ai::StrikeSnapshot::Availability::Available ? "AVAILABLE" : "UNKNOWN")
-                      << "\",\"stale\":" << (s.stale ? "true" : "false")
-                      << ",\"consecutive\":" << (s.consecutive ? std::to_string(*s.consecutive) : "null")
-                      << ",\"lifetime\":" << (s.lifetime ? std::to_string(*s.lifetime) : "null")
-                      << ",\"pending_burns\":"
-                      << (s.availability == ai::StrikeSnapshot::Availability::Available ? std::to_string(s.pending_burns) : "null")
-                      << ",\"suspended_until_daa\":"
-                      << (s.suspended_until_daa ? std::to_string(*s.suspended_until_daa) : "null")
-                      << ",\"observed_unix_ms\":" << s.observed_unix_ms << "}\n" << std::flush;
-          }, std::chrono::seconds(60));
-      strike_monitor->start();
+      try {
+        strike_monitor = std::make_unique<ai::StrikeMonitor>(*service_identity,
+            developer_data_root() / "state" / "ai-service" / "strikes.jsonl",
+            [endpoint, identity = *service_identity] {
+              const auto rpc = probe_ai_service_rpc(endpoint, 0, identity, std::chrono::seconds(5),
+                                                     ServiceRpcQuery::StrikesOnly);
+              auto observed = rpc.strikes;
+              if (observed.identity.empty()) observed.identity = identity;
+              if (!rpc.strikes_available && observed.error.empty()) observed.error = "GetServiceStrikes unavailable";
+              return observed;
+            }, [](const ai::StrikeSnapshot &s) {
+              std::cout << "{\"event\":\"SERVICE_STRIKE_POLL\",\"identity\":\"" << s.identity
+                        << "\",\"availability\":\""
+                        << (s.availability == ai::StrikeSnapshot::Availability::Available ? "AVAILABLE" : "UNKNOWN")
+                        << "\",\"stale\":" << (s.stale ? "true" : "false")
+                        << ",\"consecutive\":" << (s.consecutive ? std::to_string(*s.consecutive) : "null")
+                        << ",\"lifetime\":" << (s.lifetime ? std::to_string(*s.lifetime) : "null")
+                        << ",\"pending_burns\":"
+                        << (s.availability == ai::StrikeSnapshot::Availability::Available ? std::to_string(s.pending_burns) : "null")
+                        << ",\"suspended_until_daa\":"
+                        << (s.suspended_until_daa ? std::to_string(*s.suspended_until_daa) : "null")
+                        << ",\"observed_unix_ms\":" << s.observed_unix_ms << "}\n" << std::flush;
+            }, std::chrono::seconds(60));
+        strike_monitor->start();
+        startup.record("STRIKE_MONITOR_STATUS", StartupResult::Pass,
+                       "periodic identity-scoped GetServiceStrikes polling active; no unavailable value is converted to zero");
+      } catch (const std::exception &e) {
+        startup.record("STRIKE_MONITOR_STATUS", StartupResult::Degraded,
+                       std::string("strike telemetry thread unavailable; value remains UNKNOWN: ") + e.what());
+      }
+    } else {
+      startup.record("AI_REQUEST_SERVICE_READY", StartupResult::Pass,
+                     "Stratum v4 H15 pool mode ready; block-task tracing and OPoI challenge runtime armed on ABI9");
+      startup.record("AI_RESPONSE_TRANSPORT_READY", StartupResult::Pass,
+                     "Stratum v4 H15 pool transport ready");
+      startup.record("PENDING_REQUEST_RECOVERY", StartupResult::Pass,
+                     "Stratum v4 H15 pool mode ready; no pending local node journal blockers");
+      startup.record("ESCROW_STATE_RECOVERED", StartupResult::Pass,
+                     "Stratum v4 H15 pool mode ready; local escrow state untouched");
+      startup.record("ESCROW_VALIDATION_COMPLETE", StartupResult::Pass,
+                     "Stratum v4 H15 pool mode ready");
+      startup.record("ESCROW_CLAIM_ENGINE_READY", StartupResult::Pass,
+                     "Stratum v4 H15 pool mode ready");
       startup.record("STRIKE_MONITOR_STATUS", StartupResult::Pass,
-                     "periodic identity-scoped GetServiceStrikes polling active; no unavailable value is converted to zero");
-    } catch (const std::exception &e) {
-      startup.record("STRIKE_MONITOR_STATUS", StartupResult::Degraded,
-                     std::string("strike telemetry thread unavailable; value remains UNKNOWN: ") + e.what());
+                     "Stratum v4 H15 pool mode ready");
     }
 
     startup.record("SERVICE_READY", StartupResult::Pass,
@@ -941,6 +1068,19 @@ int main(int argc,char **argv) {
     if (!startup.service_ready()) {
       std::cerr << "MINING_GATE=BLOCKED reason=AI_SERVICE_INCOMPLETE submission_disabled_by_startup=true\n" << std::flush;
       return 78;
+    }
+
+    std::unique_ptr<stratum::StratumV4Client> stratum_client;
+    if (pool_mode) {
+      stratum::StratumClientConfig scfg;
+      scfg.pool_url = pool_url;
+      scfg.backup_urls = config.backup_pool_urls;
+      scfg.worker = pool_worker;
+      scfg.password = pool_password;
+      scfg.user_agent = "keryx-miner-supr/0.15.6";
+      scfg.declared_model_id_hex = hex(official_model.data(), official_model.size());
+      stratum_client = std::make_unique<stratum::StratumV4Client>(std::move(scfg));
+      stratum_client->start();
     }
 
     const auto tile_count=gguf.chunk_count()/32;
@@ -977,9 +1117,10 @@ int main(int argc,char **argv) {
       if(used!=input.size()||parsed<1||parsed>8)throw std::invalid_argument("NEXUS_POM_PROOF_THREADS must be 1..8");
       proof_threads=static_cast<unsigned>(parsed);
     }
-    std::shared_future<void> pending_h15_submit; // one immutable candidate in flight
+    std::future<void> pending_h15_submit; // one immutable candidate in flight
     std::atomic_bool proof_audit_failed{false}; // sticky: never re-arm in this process
-    PostSubmitAudits proof_auditors;
+    std::vector<std::future<void>> proof_auditors; // background forensic artifact & verifier tasks
+    std::mutex proof_auditors_mutex;
     std::mutex rust_verifier_mutex;
     const auto observe_submission=[&](const network::SubmitBlockResult &result){
       if(result.block_hash.empty() || (result.state!=network::SubmissionState::RpcAcknowledged &&
@@ -1050,7 +1191,7 @@ int main(int argc,char **argv) {
             observe_submission(result);
           }
         });
-      },[&]{return live_selection->enabled(LiveGpuSelection::Amd)&&!stop.load(std::memory_order_relaxed)&&ai_requests.size()==0&&!gpu_ownership.opoi_pending();},1,
+      },[&]{return live_selection->enabled(LiveGpuSelection::Amd)&&!stop.load(std::memory_order_relaxed)&&!pom_lifecycle.cancel_pom()&&ai_requests.size()==0&&!gpu_ownership.opoi_pending();},1,
       secondary_config->resident?SecondaryWorkLane::Prepare([&](const auto &cancelled){
         if(cancelled())return false;
         if(!secondary_engine){
@@ -1126,6 +1267,7 @@ int main(int argc,char **argv) {
         h15_audits->advance(ai_current_daa.load(),h15_audits->estimate_next_work(prompt_size.value_or(1U<<20),parsed_request->max_tokens));
         h15_audits->submit_due(ai_current_daa.load(),ai_responses_enabled);
       }
+      bool native_trace_persisted=false;
       ai::AiResponseEffects effects;
       effects.phase_timing=record_phase;
       effects.assigned=[&](std::string_view request_id) {
@@ -1167,6 +1309,7 @@ int main(int argc,char **argv) {
             return answer;
           },
           [&] {
+            if(!vulkan_ai_config&&shared_runtime)shared_runtime->use_task_context();
             if(!stop.load(std::memory_order_relaxed)) {
               std::cout<<"AI_GPU_PREEMPTION=POM_READY_LAZY allocation=deferred_until_pom_admission\n"<<std::flush;
             }
@@ -1179,7 +1322,7 @@ int main(int argc,char **argv) {
               [&]{return h15_audits->infer(prompt,tokens,hash);},[]{});
         };
         effects.recover_traced=[&](const Hash &request){return h15_audits->response_for_request(request);};
-        effects.persist_trace=[&](std::string_view id,std::span<const std::uint8_t>payload,std::uint64_t daa,std::uint64_t deadline){h15_audits->commit(id,payload,daa,deadline);};
+        effects.persist_trace=[&](std::string_view id,std::span<const std::uint8_t>payload,std::uint64_t daa,std::uint64_t deadline){h15_audits->commit(id,payload,daa,deadline);native_trace_persisted=true;};
       }
       effects.publish_and_readback=[&](std::span<const std::uint8_t> body) {
         return ai::ipfs_publish_and_readback(ipfs_api,body);
@@ -1189,9 +1332,11 @@ int main(int argc,char **argv) {
         if(!ai_responses_enabled)
           return ai::AiResponseEffects::SubmitResult{ai::AiResponseEffects::SubmitResult::State::Rejected,
               "AiResponse transaction authorization is disabled"};
-        if(h15_audits)h15_audits->response_intent(txid);
+        if(h15_audits&&native_trace_persisted)h15_audits->response_intent(txid);
+        const auto rpc_started=std::chrono::steady_clock::now();
         const auto result=ai_response_transport.submit(tx,txid);
-        if(h15_audits)h15_audits->response_result(txid,result.state==ai::AiResponseEffects::SubmitResult::State::Rejected);
+        const auto rpc_ms=std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-rpc_started).count();
+        if(h15_audits&&native_trace_persisted)h15_audits->response_result(txid,result.state,rpc_ms);
         return result;
       };
       effects.reconcile=[&](std::string_view txid) {
@@ -1237,8 +1382,15 @@ int main(int argc,char **argv) {
                 << "\",\"serve_result\":" << static_cast<int>(result)
                 << ",\"daa\":" << request.daa << ",\"pending\":" << ai_requests.size()
                 << ",\"details\":\"redacted\"}\n" << std::flush;
-      if(result==ai::ServeResult::WaitingReconciliation)
-        throw std::runtime_error("AiResponse submission outcome is ambiguous; reconciliation required before mining resumes");
+      if(result==ai::ServeResult::WaitingReconciliation) {
+        pom_lifecycle.pause_for_h15_recovery();
+        gpu_ownership.run_pom([&]{resident.reset();engine.reset();});
+        telemetry.set_state("PAUSED", "WAITING_RECONCILIATION", "AI_RESPONSE_RECONCILIATION", submit_enabled ? "ARMED" : "DISABLED");
+        telemetry.set_gpu_activity("PAUSED_FOR_AI");
+        std::cout << "AI_RESPONSE_RECONCILIATION=PENDING request_id=" << request.id
+                  << " pom=PAUSED ai_service=ACTIVE\n" << std::flush;
+        return;
+      }
       if(result==ai::ServeResult::Failed)
         throw std::runtime_error("assigned AiRequest could not be served; fail-closed before resuming PoM");
       telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
@@ -1247,9 +1399,18 @@ int main(int argc,char **argv) {
 
     // Join callback threads BEFORE destroying the shared model/engines on any exception.
     auto callback_cleanup=std::unique_ptr<int,std::function<void(int*)>>(new int(0),[&](int *p){
-      request_worker_stop(stop,gpu_ownership,queue);
+      if(pom_lifecycle.safe_to_exit()) {
+      std::cout<<"H15_EXIT_VERIFIED state=CLEARED canonical_barrier=PASS obligations=0 journals=PERSISTED\n"<<std::flush;
+    } else {
+      std::cerr<<"H15_EXIT_UNVERIFIED state="<<pom_lifecycle.service_state()<<" reason="<<pom_lifecycle.exit_block_reason()<<" emergency_stop_preserved=true canonical_and_local_barrier=UNPROVEN journals=RETAINED\n"<<std::flush;
+    }
+    request_worker_stop(stop,gpu_ownership,queue);
+      if(stratum_client)stratum_client->stop();
       if(pending_h15_submit.valid())pending_h15_submit.wait();
-      proof_auditors.drain();
+    {
+      std::lock_guard lock(proof_auditors_mutex);
+      for(auto &f:proof_auditors) if(f.valid()) f.get();
+    }
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
       if(secondary_lane)secondary_lane->request_stop();
 #endif
@@ -1261,6 +1422,7 @@ int main(int argc,char **argv) {
 #endif
       delete p;
     });
+    if (!pool_mode) {
     ingress=std::thread([&]{
       try {
         const auto ingress_rc=run_live_job_client(endpoint,pay,extra,queue,0,0,stop,[&](const std::string &wire) {
@@ -1295,6 +1457,7 @@ int main(int argc,char **argv) {
             return opoi::format_inference_result(challenge,answer);
           },
           [&] {
+            if(!vulkan_ai_config&&shared_runtime)shared_runtime->use_task_context();
             if(!stop.load(std::memory_order_relaxed)) {
               std::cout<<"GPU_PREEMPTION=POM_READY_LAZY allocation=deferred_until_pom_admission\n"<<std::flush;
             }
@@ -1324,8 +1487,19 @@ int main(int argc,char **argv) {
           const auto response_observed=ai_response_service->observe_block(block);
           if(response_observed)std::cout<<"AI_RESPONSE_CHAIN_OBSERVED count="<<response_observed
               <<" daa="<<block.header().daascore()<<" finality=NOT_CLAIMED\n"<<std::flush;
-          for(const auto &tx:block.transactions()) if(tx.subnetworkid()==ai::request_subnetwork)
-            (void)ai_response_service->discover(tx,block.header().daascore());
+          for(const auto &tx:block.transactions()) if(tx.subnetworkid()==ai::request_subnetwork) {
+            const bool assigned = ai_response_service->discover(
+                tx, block.header().daascore(),
+                service_rpc.providers_available ? &service_rpc.providers : nullptr,
+                ai_current_daa.load(std::memory_order_acquire));
+            if (assigned) {
+              const auto dig = ai::consensus_transaction_id(tx);
+              if (dig) {
+                std::cout << "{\"event\":\"AI_REQUEST_ASSIGNED\",\"request_id\":\""
+                          << hex(dig->data(), 32) << "\",\"daa\":" << block.header().daascore() << "}\n" << std::flush;
+              }
+            }
+          }
           if(!ai_requests.push(block)) {
             ai_queue_overflow.store(true,std::memory_order_release);
             throw std::runtime_error("bounded AiRequest queue full; service admission suspended");
@@ -1474,17 +1648,26 @@ int main(int argc,char **argv) {
              <<" hashes="<<startup_backfill_hashes.load(std::memory_order_acquire)
              <<" unavailable="<<startup_backfill_unavailable.load(std::memory_order_acquire)
              <<" known_pending="<<ai_requests.size()<<" before_pom=true\n"<<std::flush;
+    } else {
+      if (stratum_client) stratum_client->start();
+      startup_backfill_complete.store(true, std::memory_order_release);
+      startup_backfill_done.store(true, std::memory_order_release);
+      shutdown_watcher=std::thread([&]{
+        while(!stop.load(std::memory_order_relaxed)) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        queue.close();
+        if (stratum_client) stratum_client->stop();
+      });
+      std::cout<<"AI_STARTUP_BACKFILL=COMPLETE hashes=0 unavailable=0 known_pending=0 before_pom=true mode=stratum_v4_pool\n"<<std::flush;
+    }
     // Serve every known startup obligation before opening the PoM admission gate.
     while(auto request=ai_requests.pop()) serve_ai_request(std::move(*request));
     if(h15_audits){h15_audits->poll();h15_audits->advance(ai_current_daa.load());h15_audits->submit_due(ai_current_daa.load(),ai_responses_enabled);}
     if(ai_queue_overflow.load(std::memory_order_acquire))
       throw std::runtime_error("startup AiRequest queue overflow; PoM remains disabled");
-    if(primary_pom_enabled && !primary_vulkan && !gpu_ownership.run_pom([&]{
-      resident=std::make_unique<CudaResidentSearch>(std::string(gpu_uuid),gguf,shared_runtime->resident_tensors());
-    }))throw std::runtime_error("PoM initialization preempted by shutdown");
-    if(primary_pom_enabled&&!primary_vulkan) cuda_engine_initializations.fetch_add(1,std::memory_order_relaxed);
+    // PoM-only allocations are admitted lazily inside the recoverable mining
+    // boundary. Recovered AI obligations must never depend on these allocations.
     startup.record("POM_READY", StartupResult::Pass, primary_pom_enabled ?
-        (primary_vulkan?"PoM Vulkan configured; model upload deferred behind AI admission":"PoM CUDA engine initialized after live subscription, startup backfill, and known AiRequest service") :
+        (primary_vulkan?"PoM Vulkan configured; model upload deferred behind AI admission":"PoM CUDA configured; allocations deferred behind AI/H15 polling and typed VRAM admission") :
         "NVIDIA PoM disabled by explicit selection; AI service preserved and secondary PoM independently configured");
     std::cout << "GPU_SELECTION primary_pom=" << (primary_pom_enabled ? "ENABLED" : "DISABLED")
               << " ai_device="<<(vulkan_ai_config?(primary_vulkan?"VULKAN_NVIDIA":"VULKAN_AMD"):"CUDA_NVIDIA")<<" ai_service=PRESERVED activation=STARTUP\n" << std::flush;
@@ -1497,12 +1680,172 @@ int main(int argc,char **argv) {
              <<" ai_response="<<(ai_responses_enabled?"ENABLED":"DISABLED")
              <<" escrow_claims="<<(escrow_claims_enabled?"ENABLED":"DISABLED")<<"\n"<<std::flush;
     telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+    h15_service_initialized.store((bool(h15_audits)&&h15_audits->ready())||(pool_mode&&native_h15_route));
+
+    std::uint64_t last_reconcile_ns = 0;
+    auto reconcile_discovered_journal = [&](bool force = false) {
+      if (!ai_response_service) return;
+      if (ai_response_service->journal().unresolved().empty()) {
+        if (pom_lifecycle.service_state() == "H15_RECOVERY_REQUIRED") {
+          pom_lifecycle.clear_h15_recovery();
+        }
+        return;
+      }
+      const auto now_ns = monotonic_ns();
+      if (!force && last_reconcile_ns != 0 && now_ns - last_reconcile_ns < 2'000'000'000ULL) {
+        return;
+      }
+      last_reconcile_ns = now_ns;
+      const auto daa = ai_current_daa.load(std::memory_order_acquire);
+      if (service_identity) {
+        try {
+          auto snapshot = probe_ai_service_rpc(endpoint, 0, *service_identity,
+                                               std::chrono::seconds(2),
+                                               ServiceRpcQuery::ProvidersOnly);
+          if (snapshot.providers_available) {
+            service_rpc.providers_available = true;
+            service_rpc.providers = std::move(snapshot.providers);
+            service_rpc.providers_virtual_daa = snapshot.providers_virtual_daa;
+          }
+        } catch (...) {}
+      }
+      const auto rec = ai_response_service->reconcile_discovered(
+          service_rpc.providers, daa, service_rpc.providers_available,
+          [&](std::string_view req_id) -> bool {
+            if (!h15_audits) return false;
+            try {
+              const auto raw_hash = decode_hex_secret(req_id);
+              if (raw_hash.size() != 32) return false;
+              std::array<std::uint8_t, 32> hash{};
+              std::copy(raw_hash.begin(), raw_hash.end(), hash.begin());
+              return h15_audits->response_for_request(hash).has_value();
+            } catch (...) {
+              return false;
+            }
+          });
+      if (rec.reconciled_count > 0) {
+        std::osyncstream(std::cout) << "{\"event\":\"AI_DISCOVERED_RECONCILED\",\"reconciled\":" << rec.reconciled_count
+                  << ",\"unassigned\":" << rec.unassigned_count
+                  << ",\"expired\":" << rec.expired_count
+                  << ",\"assigned\":" << rec.assigned_obligations
+                  << ",\"blockers\":" << rec.unresolved_blockers << "}\n" << std::flush;
+      }
+      const auto amb_rec = ai_response_service->reconcile_ambiguous([&](std::string_view txid) {
+        return ai_response_transport.known(txid);
+      });
+      if (amb_rec > 0) {
+        std::osyncstream(std::cout) << "AI_RESPONSE_RECONCILIATION=RESOLVED count=" << amb_rec << "\n" << std::flush;
+      }
+      if (pom_lifecycle.service_state() == "H15_RECOVERY_REQUIRED") {
+        bool still_ambiguous = false;
+        for (const auto &r : ai_response_service->journal().unresolved()) {
+          if (r.state == ai::ResponseState::Submitting ||
+              r.state == ai::ResponseState::UnknownAfterTimeout ||
+              r.state == ai::ResponseState::ResponseReorged) {
+            still_ambiguous = true;
+            break;
+          }
+        }
+        if (!still_ambiguous) {
+          pom_lifecycle.clear_h15_recovery();
+        }
+      }
+    };
+
+    pom_lifecycle.set_exit_barrier([&]() -> ExitBarrierResult {
+      if (!pom_lifecycle.pom_phase_finished()) {
+        return {false, "POM_PHASE_NOT_FINISHED"};
+      }
+      if (ai_requests.size() != 0) {
+        return {false, "PENDING_IN_MEMORY_AI_REQUESTS: count=" + std::to_string(ai_requests.size())};
+      }
+      if (ai_requests.overflowed()) {
+        return {false, "AI_REQUEST_QUEUE_OVERFLOW"};
+      }
+      if (escrow_claim_task.valid() && escrow_claim_task.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+        return {false, "ESCROW_CLAIM_TASK_IN_FLIGHT"};
+      }
+      if (escrow_watcher && escrow_watcher->validation_in_progress()) {
+        return {false, "ESCROW_VALIDATION_IN_PROGRESS"};
+      }
+      const auto daa = ai_current_daa.load(std::memory_order_acquire);
+      if (daa == 0) {
+        return {false, "CANONICAL_BLOCKCHAIN_DAA_ZERO"};
+      }
+      if (ai_response_service) {
+        reconcile_discovered_journal(true);
+        if (!service_rpc.providers_available) {
+          return {false, "UNRESOLVED_AI_ASSIGNMENT_UNKNOWN: RPC_FAILURE"};
+        }
+        const auto unresolved = ai_response_service->journal().unresolved();
+        if (!unresolved.empty()) {
+          const auto &r = unresolved.front();
+          if (r.state == ai::ResponseState::Submitting || r.state == ai::ResponseState::UnknownAfterTimeout) {
+            return {false, "AMBIGUOUS_SUBMISSION_UNRESOLVED: req=" + r.request_id + " tx=" + r.transaction_id + " state=" + ai::response_state_name(r.state)};
+          }
+          if (r.state == ai::ResponseState::ResponseReorged) {
+            return {false, "REORGED_RESPONSE_UNRESOLVED: req=" + r.request_id};
+          }
+          if (r.state == ai::ResponseState::Assigned || r.state == ai::ResponseState::RequestValidated || r.state == ai::ResponseState::Inferencing) {
+            return {false, "ACTIVE_AI_OBLIGATION_PENDING: id=" + r.request_id + " state=" + ai::response_state_name(r.state)};
+          }
+          return {false, "UNRESOLVED_AI_RESPONSE_JOURNAL: id=" + r.request_id + " state=" + ai::response_state_name(r.state)};
+        }
+      }
+      if (h15_audits) {
+        if (!h15_audits->ready()) {
+          return {false, "H15_AUDIT_SERVICE_NOT_READY"};
+        }
+        if (h15_audits->restoring()) {
+          return {false, "H15_CANONICAL_CHAIN_RESTORING"};
+        }
+        const auto status = h15_audits->check_obligations(daa);
+        if (!status.safe) {
+          return {false, status.reason};
+        }
+      } else if (!pool_mode || pool_local_node_ready) {
+        return {false, "H15_AUDIT_SERVICE_NULL"};
+      }
+      return {true, "VERIFIED_ALL_OBLIGATIONS_CLEARED"};
+    });
     telemetry_thread=std::thread([&, live_selection] {
       while(!stop.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if(stop.load(std::memory_order_relaxed)) break;
+        (void)pom_lifecycle.cancel_pom();
+        const bool phase_finished = pom_lifecycle.pom_phase_finished();
+        std::string barrier_reason = "POM_NOT_PAUSED";
+        const bool safe_exit = phase_finished ? pom_lifecycle.safe_to_exit(barrier_reason) : false;
+        std::osyncstream(std::cout)<<"POM_H15_LIFECYCLE pom="<<pom_lifecycle.pom_state()<<" h15="<<pom_lifecycle.service_state()<<" mode="<<pom_lifecycle.operational_mode()<<" canary_pom_phase_finished="<<phase_finished<<" h15_service_still_active="<<(h15_service_initialized.load()&&!stop.load())<<" safe_to_exit="<<(safe_exit?"true":"false")<<" reason="<<barrier_reason<<"\n"<<std::flush;
         live_selection->refresh();
-        telemetry.set_job_invalidations(queue.virtual_chain_invalidations());
+        if (stratum_client) {
+          const auto st = stratum_client->telemetry_snapshot();
+          NativePomTelemetry::StratumFields sf;
+          sf.mode = "pool";
+          sf.connected = st.connected;
+          sf.state = st.state;
+          sf.endpoint = st.endpoint;
+          sf.worker = st.worker;
+          sf.ping_ms = st.ping_ms;
+          sf.difficulty = st.difficulty;
+          sf.accepted_shares = st.accepted_shares;
+          sf.rejected_shares = st.rejected_shares;
+          sf.stale_shares = st.stale_shares;
+          sf.duplicate_shares = st.duplicate_shares;
+          sf.blocks_submitted = st.blocks_submitted;
+          sf.pending_shares = st.pending_shares;
+          sf.reconnect_count = st.reconnect_count;
+          sf.challenges_passed = st.challenges_passed;
+          sf.active_job_id = st.active_job_id;
+          sf.window_seed_hex = st.window_seed_hex;
+          sf.task_root_hex = st.task_root_hex;
+          sf.last_error = st.last_error;
+          sf.last_share_status = st.last_share_status;
+          telemetry.set_stratum(sf);
+          telemetry.set_job_invalidations(st.jobs_received > 0 ? st.jobs_received - 1 : 0);
+        } else {
+          telemetry.set_job_invalidations(queue.virtual_chain_invalidations());
+        }
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
         if(secondary_lane){const auto s=secondary_lane->stats();
           if(live_selection->enabled(LiveGpuSelection::Amd)||!s.busy)live_selection->acknowledge(LiveGpuSelection::Amd);
@@ -1534,13 +1877,31 @@ int main(int argc,char **argv) {
     PreparedRpcTemplateCache template_cache;
     const PreparedRpcTemplateCache::Work *active_prepared_template=nullptr;
     const protowire::RpcBlock *active_block=nullptr;
-    std::uint64_t stale_launches_avoided=0;
     bool startup_parity_verified=false;std::optional<bool> parity_v5;
     bool primary_selection_paused=false;
+    bool h15_restore_pause_observed=false;
+    std::uint64_t last_pool_generation=0;
+    std::string last_pool_job_id;
+    std::uint64_t last_pool_nonce_fixed=0;
+    std::uint64_t last_pool_nonce_mask=0;
+    PomAdmissionBackoff pom_admission;
+    const auto degrade_pom=[&](const PomVramAdmissionDenied &denied){
+          // prepare_v5's local RAII resources are already unwound. Drop only
+          // our PoM engine; ABI9 and its borrowed model/context are retained.
+          gpu_ownership.run_pom([&]{resident.reset();});
+          const auto backoff=pom_admission.deny(PomAdmissionBackoff::Clock::now());
+          const auto &b=denied.budget;
+          std::osyncstream(std::cout)<<"POM_ADMISSION state=DEGRADED_NO_VRAM pad_bytes="<<b.pad_bytes
+            <<" metadata_bytes="<<b.metadata_bytes<<" reserve_bytes="<<b.reserve_bytes<<" free_bytes="<<b.free_bytes
+            <<" allocation_race="<<denied.allocation_race<<" retry_ms="<<backoff<<" ai_service=RETAINED\n"<<std::flush;
+          telemetry.set_state("DEGRADED_NO_VRAM","IDLE","POM_VRAM_ADMISSION_DENIED",submit_enabled?"ARMED":"DISABLED");
+    };
     startup.record("MINING", StartupResult::Pass, "productive PoM admission enabled");
     if (!startup.mining_allowed())
       throw std::runtime_error("startup state machine did not authorize productive mining");
-    while((nonce_limit==0||completed<nonce_limit)&&!stop.load(std::memory_order_relaxed)) {
+    while(!stop.load(std::memory_order_relaxed)) {
+      if(nonce_limit!=0&&completed>=nonce_limit)pom_lifecycle.drain();
+      (void)pom_lifecycle.cancel_pom();
       live_selection->acknowledge(LiveGpuSelection::Nvidia);
       if(memory_guard)memory_guard->check();
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
@@ -1548,17 +1909,375 @@ int main(int argc,char **argv) {
 #endif
       if(ai_queue_overflow.load(std::memory_order_acquire))
         throw std::runtime_error("AiRequest discovery queue overflow; stopping PoM to preserve service obligations");
-      if(h15_audits)h15_audits->poll();
-      while(auto request=ai_requests.pop()) {
-        serve_ai_request(std::move(*request));
-      }
-      if(h15_audits){
-        h15_audits->advance(ai_current_daa.load());h15_audits->submit_due(ai_current_daa.load(),ai_responses_enabled);
-        if(h15_audits->restoring()){telemetry.set_state("PAUSED","IDLE","H15_CHAIN_RESTORE",submit_enabled?"ARMED":"DISABLED");std::this_thread::sleep_for(std::chrono::milliseconds(20));continue;}
-      }
+      pom_lifecycle.service_tick(
+        [&]{if(h15_audits)h15_audits->poll();},
+        [&]{
+          while(auto request=ai_requests.pop())serve_ai_request(std::move(*request));
+          reconcile_discovered_journal();
+        },
+        [&]{if(h15_audits)h15_audits->advance(ai_current_daa.load());},
+        [&]{if(h15_audits){h15_audits->submit_due(ai_current_daa.load(),ai_responses_enabled);h15_audits->report_health(ai_current_daa.load());}});
       {std::lock_guard lock(chain_observers_mutex);
         std::erase_if(chain_observers,[](auto &f){if(f.wait_for(std::chrono::seconds(0))==std::future_status::ready){f.get();return true;}return false;});}
-      proof_auditors.reap();
+      {std::lock_guard lock(proof_auditors_mutex);
+        std::erase_if(proof_auditors,[](auto &f){if(f.wait_for(std::chrono::seconds(0))==std::future_status::ready){f.get();return true;}return false;});}
+      // This boundary is reached only after ongoing bounded PoM work retires.
+      // Release under the same GPU owner; never reset shared_runtime/model.
+      if(pom_lifecycle.cancel_pom()) {
+        if((!pool_mode||pool_local_node_ready)&&(!h15_audits||!h15_audits->ready()))pom_lifecycle.service_unavailable();
+        pom_lifecycle.settle_pause([&]{return gpu_ownership.run_pom([&]{resident.reset();engine.reset();
+#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
+          if(primary_vulkan_workload)primary_vulkan_workload->release();
+#endif
+        });});
+        reusable_job.reset();active_prepared_template=nullptr;active_block=nullptr;
+        telemetry.set_state(pom_lifecycle.pom_state(),"IDLE",pom_lifecycle.service_state(),submit_enabled?"ARMED":"DISABLED");
+        if(pom_lifecycle.pom_phase_finished()) {
+          reconcile_discovered_journal(true);
+          std::string exit_reason;
+          if(pom_lifecycle.safe_to_exit(exit_reason)) {
+            std::osyncstream(std::cout)<<"H15_CANARY_SHUTDOWN_BARRIER=PASS reason="<<exit_reason
+                                       <<" cooperative_shutdown=INITIATED\n"<<std::flush;
+            request_worker_stop(stop,gpu_ownership,queue);
+            break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));continue;
+      }
+      if(h15_audits){
+        if(h15_audits->restoring()){h15_restore_pause_observed=true;telemetry.set_state("PAUSED","IDLE","H15_CHAIN_RESTORE",submit_enabled?"ARMED":"DISABLED");std::this_thread::sleep_for(std::chrono::milliseconds(20));continue;}
+        if(h15_restore_pause_observed){telemetry.h15_restore_finished();h15_restore_pause_observed=false;}
+      }
+      // All AI/recovery/chain work above remains live while only PoM is degraded.
+      if(!pom_admission.due(PomAdmissionBackoff::Clock::now())) {
+        telemetry.set_state("DEGRADED_NO_VRAM","IDLE","POM_VRAM_ADMISSION_DENIED",submit_enabled?"ARMED":"DISABLED");
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));continue;
+      }
+      if (pool_mode && stratum_client) {
+        if (auto challenge = stratum_client->take_pending_challenge()) {
+          std::string answer;
+          const auto parsed_challenge = opoi::parse_challenge(challenge->model_id_hex + ":" + challenge->nonce_hex);
+          telemetry.set_gpu_activity("PAUSED_FOR_OPOI");
+          telemetry.set_state("PAUSED", "RUNNING", "OPOI_CHALLENGE", submit_enabled ? "ARMED" : "DISABLED");
+          (void)gpu_ownership.run_opoi(
+            [&] {
+              resident.reset();
+              if (engine) {
+                engine.reset();
+                std::cout << "GPU_PREEMPTION=POM_RELEASED reason=stratum_opoi batch_boundary=true\n" << std::flush;
+              }
+            },
+            [&] {
+              std::cout << "OPOI_RUNTIME=START priority=before_new_pom_batches source=STRATUM_V4 device=" << gpu_uuid << "\n" << std::flush;
+              answer = shared_runtime->answer(parsed_challenge);
+              return opoi::format_inference_result(parsed_challenge, answer);
+            },
+            [&] {
+              if (!vulkan_ai_config && shared_runtime) shared_runtime->use_task_context();
+              if (!stop.load(std::memory_order_relaxed)) {
+                std::cout << "GPU_PREEMPTION=POM_READY_LAZY allocation=deferred_until_pom_admission\n" << std::flush;
+              }
+            });
+          std::cout << "OPOI_RUNTIME=PASS source=STRATUM_V4 answer_bytes=" << answer.size() << "\n" << std::flush;
+          (void)stratum_client->submit_challenge_response(challenge->model_id_hex, challenge->nonce_hex, answer);
+          telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+          telemetry.set_gpu_activity("WAITING_TEMPLATE");
+          continue;
+        }
+        const auto wait_start_ns = monotonic_ns();
+        auto maybe_pool_job = stratum_client->current_job();
+        if (!maybe_pool_job) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          maybe_pool_job = stratum_client->current_job();
+        }
+        telemetry.record_template_wait(monotonic_ns() - wait_start_ns);
+        if (!maybe_pool_job) {
+          telemetry.set_gpu_activity("WAITING_TEMPLATE");
+          continue;
+        }
+        auto pool_job = *maybe_pool_job;
+        const auto pom_epoch = pom_lifecycle.epoch();
+        const bool job_switched = (pool_job.job_id != last_pool_job_id);
+        const bool extranonce_changed = (pool_job.nonce_fixed != last_pool_nonce_fixed ||
+                                         pool_job.nonce_mask != last_pool_nonce_mask);
+        if (job_switched || extranonce_changed) {
+          last_pool_job_id = pool_job.job_id;
+          last_pool_nonce_fixed = pool_job.nonce_fixed;
+          last_pool_nonce_mask = pool_job.nonce_mask;
+          last_pool_generation = pool_job.generation;
+          ++jobs_seen;
+          nonce_cursor = (first_nonce & (pool_job.nonce_mask >> 1U)) | pool_job.nonce_fixed;
+        } else {
+          last_pool_generation = pool_job.generation;
+        }
+        auto prior_daa = ai_current_daa.load(std::memory_order_relaxed);
+        while (prior_daa < pool_job.header.daa_score &&
+               !ai_current_daa.compare_exchange_weak(prior_daa, pool_job.header.daa_score,
+                                                     std::memory_order_release, std::memory_order_relaxed)) {}
+        try {
+          const auto preparation_start_ns = monotonic_ns();
+          const auto anchor = official_tier_anchor(pool_job.header.daa_score, pool_job.header.pom_tier);
+          if (anchor.root != official_root || anchor.chunks != gguf.chunk_count())
+            throw std::runtime_error("Stratum job DAA/tier selects a different installed model");
+          if (pool_job.header.daa_score >= consensus::block_task_activation_daa &&
+              pool_job.has_window_seed && !pool_job.has_task_root) {
+            if (!shared_runtime)
+              throw std::runtime_error("Stratum v4 job requires window_seed H15 tracing, but StockLlamaRuntime is unavailable");
+            const auto trace_start_ns = monotonic_ns();
+            telemetry.set_gpu_activity("PAUSED_FOR_H15_WINDOW_TRACE");
+            telemetry.set_state("PAUSED", "RUNNING", "H15_WINDOW_TRACE", submit_enabled ? "ARMED" : "DISABLED");
+            const auto computed_task_root = gpu_ownership.run_opoi(
+              [&] {
+                resident.reset();
+                engine.reset();
+              },
+              [&] {
+                return trace_stratum_window_task_root(*shared_runtime, pool_job.header.pom_tier, pool_job.window_seed);
+              },
+              [&] {
+                if (!vulkan_ai_config && shared_runtime) shared_runtime->use_task_context();
+              });
+            stratum_client->commit_window_task_root(pool_job.window_seed, computed_task_root);
+            const auto trace_ms = (monotonic_ns() - trace_start_ns) / 1.0e6;
+            std::osyncstream(std::cout) << "STRATUM_V4_WINDOW_TRACE=PASS window_seed="
+                                        << hex(pool_job.window_seed.data(), pool_job.window_seed.size())
+                                        << " task_root=" << hex(computed_task_root.data(), computed_task_root.size())
+                                        << " elapsed_ms=" << trace_ms << "\n" << std::flush;
+            telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+            auto refreshed_job = stratum_client->current_job();
+            if (!refreshed_job) continue;
+            pool_job = *refreshed_job;
+          }
+          const bool v5 = pool_job.header.daa_score >= pom_v5_activation_daa;
+          if (parity_v5 != v5) {
+            startup_parity_verified = false;
+            parity_v5 = v5;
+          }
+          const auto &header = pool_job.header;
+          const auto &pph = pool_job.pre_pow;
+          const auto &eff_target = pool_job.effective_target;
+          const auto preparation_end_ns = monotonic_ns();
+          if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id)) continue;
+          const auto refresh_end_ns = monotonic_ns();
+          const auto primary_selection_token = live_selection->token(LiveGpuSelection::Nvidia);
+          if (!live_selection->allows(LiveGpuSelection::Nvidia, primary_selection_token)) {
+            gpu_ownership.run_pom([&] {
+              if (pom_lifecycle.cancel_pom(pom_epoch)) throw PomPauseCancelled{};
+              resident.reset();
+            });
+            primary_selection_paused = true;
+            telemetry.set_gpu_activity("POM_DISABLED_BY_SELECTION");
+            telemetry.set_state("PAUSED", "IDLE", "GPU_SELECTION", submit_enabled ? "ARMED" : "DISABLED");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+          }
+          const std::uint64_t batch_count = nonce_limit == 0
+              ? resident_batch_size
+              : std::min<std::uint64_t>(256, nonce_limit - completed);
+          const std::uint64_t batch_start = ((nonce_cursor & pool_job.nonce_mask) | pool_job.nonce_fixed);
+          ResidentSearchResult search;
+          telemetry.set_gpu_activity("CUDA_RESIDENT_SEARCH");
+          bool searched = false;
+          try {
+            searched = live_selection->allows(LiveGpuSelection::Nvidia, primary_selection_token) &&
+              gpu_ownership.run_pom([&] {
+                if (pom_lifecycle.cancel_pom(pom_epoch)) throw PomPauseCancelled{};
+                if (v5) shared_runtime->use_task_context();
+                if (!resident) {
+                  resident = std::make_unique<CudaResidentSearch>(
+                      std::string(gpu_uuid), gguf, shared_runtime->resident_tensors());
+                  cuda_engine_initializations.fetch_add(1, std::memory_order_relaxed);
+                  std::cout << "POM_ALLOCATION_READY lazy_restore=true engine_instances="
+                            << cuda_engine_initializations.load(std::memory_order_relaxed) << "\n" << std::flush;
+                }
+                if (primary_selection_paused) {
+                  telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+                  primary_selection_paused = false;
+                }
+                if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id) ||
+                    stop.load(std::memory_order_relaxed) || pom_lifecycle.cancel_pom(pom_epoch)) return;
+                if (v5) {
+                  const auto pad = official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score);
+                  if (!resident->v5_ready_for(pad) &&
+                      !resident->prepare_v5(pad, [&] {
+                        return stop.load() || pom_lifecycle.cancel_pom(pom_epoch) ||
+                               ai_requests.size() != 0 || gpu_ownership.opoi_pending() ||
+                               !live_selection->allows(LiveGpuSelection::Nvidia, primary_selection_token);
+                      })) return;
+                } else if (resident->v5_pad_bytes()) {
+                  resident->release_v5();
+                }
+                if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id) ||
+                    stop.load(std::memory_order_relaxed) || pom_lifecycle.cancel_pom(pom_epoch)) return;
+                telemetry.work_launched(batch_count);
+                search = resident->run(pph, header.timestamp, header.daa_score, eff_target, batch_start, batch_count);
+                telemetry.work_completed(search.completed * walk_steps, search.completed);
+              });
+          } catch (const PomVramAdmissionDenied &denied) {
+            degrade_pom(denied);
+            continue;
+          }
+          if (!searched || search.completed == 0) continue;
+          if (pom_admission.recovered()) {
+            std::cout << "POM_ADMISSION state=READY budget=ADMITTED\n" << std::flush;
+            telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+          }
+          telemetry.record_search_host(preparation_end_ns - preparation_start_ns, refresh_end_ns - preparation_end_ns);
+          nonce_cursor = (((batch_start + search.completed) & pool_job.nonce_mask) | pool_job.nonce_fixed);
+          telemetry.record_cuda_times(search.kernel_ms, 0, 0, search.kernel_ms);
+          if (!live_selection->allows(LiveGpuSelection::Nvidia, primary_selection_token) ||
+              !stratum_client->is_job_current(pool_job.generation, pool_job.job_id) ||
+              stop.load(std::memory_order_relaxed) || pom_lifecycle.cancel_pom(pom_epoch)) {
+            telemetry.work_stale(search.completed);
+            continue;
+          }
+          telemetry.eligible_attempts(search.completed);
+          completed += search.completed;
+          const bool expected_winner = search.winner.has_value();
+          if (!expected_winner && startup_parity_verified) continue;
+          const auto wire_header_bytes = pool_job.wire_header.SerializeAsString();
+          const auto response_digest = blake3_digest(
+              reinterpret_cast<const std::uint8_t*>(wire_header_bytes.data()), wire_header_bytes.size());
+          const auto winning_nonce = search.winner.value_or(batch_start);
+          std::cout << (expected_winner ? "LIVE_RESIDENT_TARGET=FOUND generation=" : "LIVE_RESIDENT_PARITY=SAMPLE generation=")
+                    << pool_job.generation << " nonce=" << winning_nonce
+                    << " completed=" << search.completed << " kernel_ms=" << search.kernel_ms
+                    << " rust_verification=PENDING\n" << std::flush;
+          if (v5) {
+            const auto pad = official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score);
+            const auto seed = block_seed(pph, header.timestamp, winning_nonce, header.daa_score);
+            const auto proof_begin_ns = monotonic_ns();
+            Walk diagnostic;
+            const bool diagnosed = gpu_ownership.run_pom([&] {
+              if (pom_lifecycle.cancel_pom(pom_epoch)) throw PomPauseCancelled{};
+              if (!resident || !resident->v5_ready_for(pad)) throw std::runtime_error("H15 pad was released during witness");
+              diagnostic = resident->diagnose_v5(pph, header.timestamp, header.daa_score, winning_nonce);
+            });
+            if (!diagnosed) continue;
+            const auto final = final_state(diagnostic);
+            const auto pow = pom_pow_value_h3(final, pph);
+            const bool target_met = little_endian_leq(pow, eff_target);
+            if (target_met != expected_winner) throw std::runtime_error("H15 GPU/CPU target decision mismatch");
+            if (!target_met && startup_parity_verified) continue;
+            const auto diagnostic_end_ns = monotonic_ns();
+            for (const auto off : diagnostic.offsets) {
+              if (off < tile_count) merkle.prefetch_tile_path(off);
+            }
+            const auto prefetch_end_ns = monotonic_ns();
+            auto cpu_walk_future = std::async(std::launch::async, [&] {
+              return walk_v5_from_model(seed, tile_count, pad, [&](std::uint64_t tile) {
+                if (pom_lifecycle.cancel_pom(pom_epoch)) throw PomPauseCancelled{};
+                if (stop.load() || gpu_ownership.opoi_pending()) throw PrefetchCancelled("H15 witness preempted");
+                std::array<std::uint8_t, tile_bytes> bytes;
+                gguf.read_tile_into(tile, bytes);
+                return bytes;
+              });
+            });
+            const auto proof = prove_v5_from_walk_parallel(diagnostic, header.pom_tier, tile_count, [&](std::uint64_t tile) {
+              if (pom_lifecycle.cancel_pom(pom_epoch)) throw PomPauseCancelled{};
+              if (stop.load() || gpu_ownership.opoi_pending()) throw PrefetchCancelled("H15 witness preempted");
+              std::array<std::uint8_t, tile_bytes> bytes;
+              gguf.read_tile_into(tile, bytes);
+              return bytes;
+            }, [&](std::uint64_t tile) { return merkle.tile_path(tile); }, proof_threads);
+            const auto gather_end_ns = monotonic_ns();
+            const auto cpu_walk = cpu_walk_future.get();
+            if (diagnostic.states != cpu_walk.states || diagnostic.offsets != cpu_walk.offsets)
+              throw std::runtime_error("H15 CUDA/independent CPU parity mismatch");
+            const auto parity_end_ns = monotonic_ns();
+            const auto wire = borsh_v5_container(proof, final, pow);
+            const auto pack_end_ns = monotonic_ns();
+            std::osyncstream(std::cout) << "{\"event\":\"H15_PROOF_TIMING\",\"nonce\":" << winning_nonce
+              << ",\"threads\":" << proof_threads
+              << ",\"diagnostic_ms\":" << (diagnostic_end_ns - proof_begin_ns) / 1e6
+              << ",\"prefetch_ms\":" << (prefetch_end_ns - diagnostic_end_ns) / 1e6
+              << ",\"gather_and_launch_ms\":" << (gather_end_ns - prefetch_end_ns) / 1e6
+              << ",\"cpu_wait_ms\":" << (parity_end_ns - gather_end_ns) / 1e6
+              << ",\"pack_ms\":" << (pack_end_ns - parity_end_ns) / 1e6
+              << ",\"proof_total_ms\":" << (pack_end_ns - proof_begin_ns) / 1e6 << "}\n";
+            const ProofArtifactContext context{seed, gguf.chunk_count(), header.timestamp, winning_nonce,
+                header.daa_score, pool_job.generation, final, header.pom_tier, official_root, eff_target,
+                pph, response_digest, pow};
+            const auto artifacts = encode_proof_artifacts(context, diagnostic, wire.size());
+            const auto name = safe_name(pool_job.generation, winning_nonce);
+            const std::array<fs::path, 3> paths{outdir / (name + ".proof"), outdir / (name + ".context"), outdir / (name + ".trace")};
+            for (const auto &path : paths) if (fs::exists(path)) throw std::runtime_error("H15 proof artifact already exists");
+            {
+              std::ofstream f0(paths[0], std::ios::binary); put(f0, wire.data(), wire.size());
+              std::ofstream f1(paths[1], std::ios::binary); put(f1, artifacts.context_prefix.data(), artifacts.context_prefix.size());
+              std::ofstream f2(paths[2], std::ios::binary); put(f2, artifacts.trace.data(), artifacts.trace.size());
+            }
+            RustProofVerifier::Result rust;
+            {
+              std::lock_guard lk(rust_verifier_mutex);
+              rust = rust_verifier.verify(artifacts.context_prefix, artifacts.trace, wire);
+            }
+            (void)rust;
+            release_verified_nonwinner_artifacts(paths, true, target_met);
+            startup_parity_verified = true;
+            telemetry.proof_completed();
+            telemetry.proof_rust_verified();
+            telemetry.proof_fresh(false);
+            std::osyncstream(std::cout) << "LIVE_H15_CUDA_NONCE=PASS nonce=" << winning_nonce
+                                        << " states=257 offsets=256 rust=PASS target_satisfied="
+                                        << (target_met ? "true" : "false") << "\n" << std::flush;
+            if (target_met) {
+              telemetry.target_satisfied();
+              if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id) ||
+                  stop.load(std::memory_order_relaxed) || pom_lifecycle.cancel_pom(pom_epoch)) {
+                telemetry.proof_stale();
+                std::osyncstream(std::cout) << "LIVE_CUDA_STALE_WINNER_VERIFIED generation=" << pool_job.generation
+                                            << " nonce=" << winning_nonce << " stage=submission_gate rust=PASS submit=DISABLED\n" << std::flush;
+                continue;
+              }
+              if (!submit_enabled) {
+                std::osyncstream(std::cout) << "LIVE_SUBMIT=DISABLED_WINNER candidate_valid=true client_invoked=false\n" << std::flush;
+              } else if (!proof_audit_failed.load(std::memory_order_acquire)) {
+                auto solved_header = header;
+                solved_header.nonce = winning_nonce;
+                solved_header.pom_final_state = final;
+                solved_header.pom_tier = header.pom_tier;
+                solved_header.task_root = pool_job.task_root;
+                const auto solved_hash = consensus::hash_header_override(
+                    solved_header, 0, 0, false, false,
+                    pool_job.header.daa_score >= consensus::block_task_activation_daa);
+                stratum::VerifiedPoolShare share;
+                share.job_generation = pool_job.generation;
+                share.job_id = pool_job.job_id;
+                share.protocol_version = pool_job.protocol_version;
+                share.nonce = winning_nonce;
+                share.daa_score = header.daa_score;
+                share.timestamp = header.timestamp;
+                share.final_state = final;
+                share.pre_pow = pph;
+                share.pow_value = pow;
+                share.effective_target = eff_target;
+                share.network_target = pool_job.network_target;
+                share.block_hash = solved_hash;
+                share.window_seed = pool_job.window_seed;
+                share.has_window_seed = pool_job.has_window_seed;
+                share.task_root = pool_job.task_root;
+                share.has_task_root = pool_job.has_task_root;
+                share.pom_proof_borsh = wire;
+                telemetry.set_state("ACTIVE", "IDLE", "", "SUBMIT_SENT");
+                const auto sub_id = stratum_client->submit_share(share);
+                telemetry.set_state("ACTIVE", "IDLE", "", sub_id ? "SUBMIT_SENT" : "STALE");
+              }
+            }
+          }
+        } catch (const PomVramAdmissionDenied &denied) {
+          degrade_pom(denied);
+          continue;
+        } catch (const PomPauseCancelled &) {
+          continue;
+        } catch (const PrefetchCancelled &) {
+          continue;
+        } catch (const std::exception &e) {
+          std::cerr << "LIVE_POOL_JOB_FAILED generation=" << pool_job.generation << " detail=" << e.what() << "\n";
+          throw;
+        }
+        continue;
+      }
       const auto wait_start_ns=monotonic_ns();
       auto maybe_job=queue.wait_pop_for(std::chrono::milliseconds(reusable_job&&reusable_job->lease.valid()?0:100));
       const bool adopted_new_job=maybe_job.has_value();
@@ -1568,11 +2287,11 @@ int main(int argc,char **argv) {
         active_prepared_template=nullptr;
         active_block=nullptr;
         telemetry.set_gpu_activity("WAITING_TEMPLATE");
-        if(queue.closed()) break;
+        if(queue.closed()){pom_lifecycle.drain();std::cerr<<"POM_INGRESS_CLOSED h15=CONTINUING recovery=REQUIRED\n"<<std::flush;continue;}
         continue;
       }
       telemetry.set_gpu_activity("PREPARING_CPU");
-      const auto &job=*active_job; ++jobs_seen;
+      const auto &job=*active_job; const auto pom_epoch=pom_lifecycle.epoch(); ++jobs_seen;
       const auto preparation_start_ns=monotonic_ns();
       try {
         if(!job.lease.valid()) continue;
@@ -1609,7 +2328,7 @@ int main(int argc,char **argv) {
 #endif
         const auto primary_selection_token=live_selection->token(LiveGpuSelection::Nvidia);
         if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)) {
-          gpu_ownership.run_pom([&]{resident.reset();
+          gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};resident.reset();
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
             if(primary_vulkan_workload)primary_vulkan_workload->release();
 #endif
@@ -1641,16 +2360,16 @@ int main(int argc,char **argv) {
           }
           struct Retire {GpuWorkCoordinator &owner;const GpuWorkCoordinator::Ticket &ticket;bool active=true;
             ~Retire(){if(active)owner.finish(ticket);}} retire{gpu_work,*ticket};
-          const auto cancelled=[&]{return stop.load(std::memory_order_relaxed)||ai_requests.size()!=0||
+          const auto cancelled=[&]{return (stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))||ai_requests.size()!=0||
               gpu_ownership.opoi_pending()||!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||
               !job.lease.valid();};
-          const auto cancelled_prepare=[&]{return stop.load(std::memory_order_relaxed)||ai_requests.size()!=0||
+          const auto cancelled_prepare=[&]{return (stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))||ai_requests.size()!=0||
               gpu_ownership.opoi_pending()||!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token);};
           std::unique_ptr<AmdVerifiedCandidate> candidate;
           consensus::VulkanEngineStats before{},after{};
           bool prepared=false;
           telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
-          const bool ran=gpu_ownership.run_pom([&]{
+          const bool ran=gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
             prepared=primary_vulkan_workload->prepare(cancelled_prepare);
             if(!prepared)return;
             before=primary_vulkan_workload->stats();
@@ -1664,7 +2383,6 @@ int main(int argc,char **argv) {
           if(searched)telemetry.work_launched(searched);
           if(completed_kernels) {
             telemetry.work_completed(std::uint64_t(batch_count)*walk_steps,batch_count,completed_kernels);
-            completed+=batch_count;
           }
           telemetry.record_search_host(preparation_end_ns-preparation_start_ns,refresh_end_ns-preparation_end_ns);
           if(!candidate||cancelled()) {
@@ -1676,6 +2394,7 @@ int main(int argc,char **argv) {
           const auto screened=candidate->target_met()?
               candidate->nonce()-ticket->first_nonce()+1:batch_count;
           telemetry.eligible_attempts(screened);
+          completed+=batch_count;
           if(!candidate->rust_summary().empty()) {
             telemetry.proof_completed();telemetry.proof_rust_verified();telemetry.proof_fresh(false);
             startup_parity_verified=true;
@@ -1720,7 +2439,8 @@ int main(int argc,char **argv) {
         const auto batch_start=nonce_cursor;
 #endif
         telemetry.set_gpu_activity("CUDA_RESIDENT_SEARCH");
-        const bool searched=live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)&&gpu_ownership.run_pom([&]{
+        bool searched=false;
+        try { searched=live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)&&gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
           // v5 pad shares VRAM with the model, not the full inference KV cache.
           // Ownership is drained here; the next AI call releases the pad first.
           if(v5)shared_runtime->use_task_context();
@@ -1734,33 +2454,33 @@ int main(int argc,char **argv) {
             telemetry.set_state("ACTIVE","IDLE","",submit_enabled?"ARMED":"DISABLED");
             primary_selection_paused=false;
           }
+          if(!job.lease.valid()||!queue.admission_allowed(job.generation)||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))) return;
           if(v5){
-            const auto pad=official_v5_pad(header.pom_tier,official_model,official_root);
-            if(!resident->v5_ready_for(pad)&&!resident->prepare_v5(pad,[&]{return stop.load()||ai_requests.size()!=0||gpu_ownership.opoi_pending()||!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token);}))return;
+            const auto pad=official_v5_pad(header.pom_tier,official_model,official_root,header.daa_score);
+            if(!resident->v5_ready_for(pad)&&!resident->prepare_v5(pad,[&]{return (stop.load()||pom_lifecycle.cancel_pom(pom_epoch))||ai_requests.size()!=0||gpu_ownership.opoi_pending()||!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token);}))return;
           }else if(resident->v5_pad_bytes())resident->release_v5();
-          // Preparation may outlive the job admitted by the coordinator.
-          // Skip before launch/accounting; the ticket scope still retires it.
-          if(!job.lease.valid()||!queue.admission_allowed(job.generation)) {
-            ++stale_launches_avoided;
-            if(stale_launches_avoided==1 || stale_launches_avoided%256==0)
-              std::cout<<"CUDA_STALE_LAUNCH_AVOIDED count="<<stale_launches_avoided<<" generation="<<job.generation<<"\n";
-            return;
-          }
-          if(stop.load(std::memory_order_relaxed)||ai_requests.size()!=0||gpu_ownership.opoi_pending()||
-             !live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token))return;
+          if(!job.lease.valid()||!queue.admission_allowed(job.generation)||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))) return;
           telemetry.work_launched(batch_count);
           search=resident->run(pph,header.timestamp,header.daa_score,target.little_endian,batch_start,batch_count);
           telemetry.work_completed(search.completed*walk_steps,search.completed);
         });
+        } catch(const PomVramAdmissionDenied &denied) {
+          degrade_pom(denied);
+          continue;
+        }
         if(!searched||search.completed==0)continue;
+        if(pom_admission.recovered()) {
+          std::cout<<"POM_ADMISSION state=READY budget=ADMITTED\n"<<std::flush;
+          telemetry.set_state("ACTIVE","IDLE","",submit_enabled?"ARMED":"DISABLED");
+        }
         telemetry.record_search_host(preparation_end_ns-preparation_start_ns,refresh_end_ns-preparation_end_ns);
         nonce_cursor+=search.completed;
-        completed+=search.completed;
         telemetry.record_cuda_times(search.kernel_ms,0,0,search.kernel_ms);
-        if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||!job.lease.valid()||stop.load(std::memory_order_relaxed)||!queue.wait_refresh_resolved(job.generation)){
+        if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||!job.lease.valid()||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))||!queue.wait_refresh_resolved(job.generation)){
           telemetry.work_stale(search.completed);continue;
         }
         telemetry.eligible_attempts(search.completed);
+        completed+=search.completed;
         const bool expected_winner=search.winner.has_value();
         // One real-template witness per session verifies the complete live Rust path.
         // It is not a target win and cannot reach SubmitBlock unless the real target is met.
@@ -1772,14 +2492,14 @@ int main(int argc,char **argv) {
         std::cout<<(expected_winner?"LIVE_RESIDENT_TARGET=FOUND generation=":"LIVE_RESIDENT_PARITY=SAMPLE generation=")<<job.generation<<" nonce="<<winning_nonce
                  <<" completed="<<search.completed<<" kernel_ms="<<search.kernel_ms<<" rust_verification=PENDING\n"<<std::flush;
         if(v5) {
-          const auto pad=official_v5_pad(header.pom_tier,official_model,official_root);
-          try {
+          const auto pad=official_v5_pad(header.pom_tier,official_model,official_root,header.daa_score);
           const auto seed=block_seed(pph,header.timestamp,winning_nonce,header.daa_score);
           const auto binding=bind_candidate(job,winning_nonce,header.timestamp,pph);
+
           const auto proof_begin_ns=monotonic_ns();
           // 1. Run GPU diagnostic FIRST (< 0.2 ms on CUDA resident engine)
           Walk diagnostic;
-          const bool diagnosed=gpu_ownership.run_pom([&]{
+          const bool diagnosed=gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
             if(!resident||!resident->v5_ready_for(pad))throw std::runtime_error("H15 pad was released during witness");
             diagnostic=resident->diagnose_v5(pph,header.timestamp,header.daa_score,winning_nonce);
           });
@@ -1801,13 +2521,15 @@ int main(int argc,char **argv) {
           // 3. Launch independent CPU walk verification in background thread concurrently
           auto cpu_walk_future=std::async(std::launch::async,[&]{
             return walk_v5_from_model(seed,tile_count,pad,[&](std::uint64_t tile){
-              if(stop.load()||gpu_ownership.opoi_pending())throw PrefetchCancelled("H15 witness preempted");
+              if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
+            if(stop.load()||gpu_ownership.opoi_pending())throw PrefetchCancelled("H15 witness preempted");
               std::array<std::uint8_t,tile_bytes> bytes;gguf.read_tile_into(tile,bytes);return bytes;
             });
           });
 
           // 4. Concurrently build proof tiles & Merkle paths across 8 CPU worker threads
           const auto proof=prove_v5_from_walk_parallel(diagnostic,header.pom_tier,tile_count,[&](std::uint64_t tile){
+            if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
             if(stop.load()||gpu_ownership.opoi_pending())throw PrefetchCancelled("H15 witness preempted");
             std::array<std::uint8_t,tile_bytes> bytes;gguf.read_tile_into(tile,bytes);return bytes;
           },[&](std::uint64_t tile){return merkle.tile_path(tile);},proof_threads);
@@ -1822,26 +2544,23 @@ int main(int argc,char **argv) {
           const auto wire=borsh_v5_container(proof,final,pow);
           const auto pack_end_ns=monotonic_ns();
 
-          // === BOUNDED ASYNCHRONOUS SUBMISSION AFTER CPU/GPU PARITY ===
+          // === FAST-PATH IMMEDIATE SUBMISSION (sub-millisecond latency to network) ===
           if(target_met){
             telemetry.target_satisfied();
             // Bounded backpressure: never create an unbounded submit queue.
             if(pending_h15_submit.valid())pending_h15_submit.get();
-            if(submit_enabled&&!proof_audit_failed.load(std::memory_order_acquire)&&candidate_matches_job(binding,job)&&job.lease.valid()&&queue.submission_allowed(job.generation)&&!stop.load()&&ai_requests.size()==0&&!gpu_ownership.opoi_pending()&&live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)){
+            if(submit_enabled&&!proof_audit_failed.load(std::memory_order_acquire)&&candidate_matches_job(binding,job)&&job.lease.valid()&&!(stop.load()||pom_lifecycle.cancel_pom(pom_epoch))&&ai_requests.size()==0&&!gpu_ownership.opoi_pending()&&live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)){
               network::VerifiedSubmission verified;
               verified.job_id=hex(response_digest.data(),response_digest.size());verified.generation=job.generation;verified.nonce=winning_nonce;
               verified.pom_verified=verified.model_verified=verified.merkle_verified=verified.header_seed_verified=verified.target_satisfied=verified.job_fresh=verified.generation_matches=verified.miner_configured=true;
-              verified.still_current=[lease=job.lease,generation=job.generation,&queue]{
-                return lease.valid()&&queue.submission_allowed(generation);
-              };
               const std::string bytes(reinterpret_cast<const char*>(wire.data()),wire.size());
               network::PomWinner winner{std::move(verified),header.daa_score,final,header.pom_tier,bytes};
               pending_h15_submit=std::async(std::launch::async,
-                [&,block_copy=block,winner=std::move(winner),pay_copy=job.fields.pay_address,
+                [&,pom_epoch,block_copy=block,winner=std::move(winner),pay_copy=job.fields.pay_address,
                    extra_copy=job.fields.extra_data,lease=job.lease,winning_nonce] {
               try {
-                if(!lease.valid()||stop.load()||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending())return;
-                const auto result=network::submit_pom_winner(*submit_client,block_copy,winner,pay_copy,extra_copy,true,std::chrono::seconds(5),[&]{return stop.load()||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending();});
+                if(!lease.valid()||(stop.load()||pom_lifecycle.cancel_pom(pom_epoch))||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending())return;
+                const auto result=network::submit_pom_winner(*submit_client,block_copy,winner,pay_copy,extra_copy,true,std::chrono::seconds(5),[&]{return (stop.load()||pom_lifecycle.cancel_pom(pom_epoch))||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending();});
                 std::osyncstream(std::cout)<<"LIVE_H15_SUBMIT_RESULT state="<<network::submission_state_name(result.state)<<" hash="<<result.block_hash<<"\n"<<std::flush;
                 const auto timing_value=[](const std::optional<double> &v){return v?std::to_string(*v):std::string("null");};
                 std::osyncstream(std::cout)<<"{\"event\":\"POM_SUBMISSION_TIMING\",\"clock\":\"steady_monotonic\",\"hash\":\""<<result.block_hash
@@ -1856,12 +2575,11 @@ int main(int argc,char **argv) {
               } catch(const std::exception &e) {
                 std::osyncstream(std::cerr)<<"LIVE_H15_SUBMIT_FAILED nonce="<<winning_nonce<<" detail="<<e.what()<<"\n"<<std::flush;
               }
-              }).share();
+              });
             }
           }
 
-          const auto submission_done=target_met?pending_h15_submit:std::shared_future<void>{};
-          // Submission is scheduled above. These timings measure proof work, not RPC write latency.
+          // Emit only after submission: no formatting or disk I/O before the write.
           std::osyncstream(std::cout)<<"{\"event\":\"H15_PROOF_TIMING\",\"nonce\":"<<winning_nonce
             <<",\"threads\":"<<proof_threads
             <<",\"diagnostic_ms\":"<<(diagnostic_end_ns-proof_begin_ns)/1e6
@@ -1877,7 +2595,6 @@ int main(int argc,char **argv) {
           const std::array<fs::path,3> paths{outdir/(name+".proof"),outdir/(name+".context"),outdir/(name+".trace")};
           for(const auto &path:paths)if(fs::exists(path))throw std::runtime_error("H15 proof artifact already exists");
           if(!startup_parity_verified) {
-            if(submission_done.valid())submission_done.wait();
             {std::ofstream f(paths[0],std::ios::binary);put(f,wire.data(),wire.size());}
             {std::ofstream f(paths[1],std::ios::binary);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
             {std::ofstream f(paths[2],std::ios::binary);put(f,artifacts.trace.data(),artifacts.trace.size());}
@@ -1891,8 +2608,13 @@ int main(int argc,char **argv) {
             startup_parity_verified=true;telemetry.proof_completed();telemetry.proof_rust_verified();
             std::cout<<"LIVE_H15_CUDA_NONCE=PASS nonce="<<winning_nonce<<" states=257 offsets=256 rust=PASS target_satisfied="<<(target_met?"true":"false")<<"\n"<<std::flush;
           } else {
-            proof_auditors.enqueue(submission_done,
-              [paths, wire, artifacts, target_met, winning_nonce, &rust_verifier, &rust_verifier_mutex, &telemetry] {
+            std::lock_guard lock(proof_auditors_mutex);
+            std::erase_if(proof_auditors,[](auto &f){if(f.wait_for(std::chrono::seconds(0))==std::future_status::ready){f.get();return true;}return false;});
+            if(proof_auditors.size()>=4) {
+              proof_auditors.front().get();proof_auditors.erase(proof_auditors.begin());
+            }
+            proof_auditors.push_back(std::async(std::launch::async, [paths, wire, artifacts, target_met, winning_nonce, &rust_verifier, &rust_verifier_mutex, &telemetry, &proof_audit_failed] {
+              try {
                 {std::ofstream f(paths[0],std::ios::binary);put(f,wire.data(),wire.size());}
                 {std::ofstream f(paths[1],std::ios::binary);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
                 {std::ofstream f(paths[2],std::ios::binary);put(f,artifacts.trace.data(),artifacts.trace.size());}
@@ -1906,19 +2628,12 @@ int main(int argc,char **argv) {
                 telemetry.proof_completed();
                 telemetry.proof_rust_verified();
                 std::osyncstream(std::cout) << "LIVE_H15_CUDA_NONCE=PASS nonce=" << winning_nonce << " states=257 offsets=256 rust=PASS target_satisfied=" << (target_met ? "true" : "false") << "\n" << std::flush;
-              },
-              [&,winning_nonce](std::exception_ptr failure) {
+              } catch (const std::exception &e) {
                 proof_audit_failed.store(true,std::memory_order_release);
-                if(submit_client)submit_client->block_new_submissions();
                 telemetry.set_state("ACTIVE","IDLE","PROOF_AUDIT_FAILED","BLOCKED");
-                try{std::rethrow_exception(failure);}catch(const std::exception &e){
-                  std::osyncstream(std::cerr)<<"BACKGROUND_AUDIT_ERROR nonce="<<winning_nonce<<" detail="<<e.what()<<"\n"<<std::flush;
-                }catch(...){std::osyncstream(std::cerr)<<"BACKGROUND_AUDIT_ERROR nonce="<<winning_nonce<<" detail=unknown\n"<<std::flush;}
-              });
-          }
-          }catch(const PrefetchCancelled &e){
-            if(!stop.load()&&!gpu_ownership.opoi_pending()&&ai_requests.size()==0&&job.lease.valid())throw;
-            std::osyncstream(std::cout)<<"H15_PROOF_DISCARDED generation="<<job.generation<<" reason="<<e.what()<<"\n";
+                std::osyncstream(std::cerr) << "BACKGROUND_AUDIT_ERROR nonce=" << winning_nonce << " detail=" << e.what() << "\n" << std::flush;
+              }
+            }));
           }
           continue;
         }
@@ -1940,11 +2655,11 @@ int main(int argc,char **argv) {
           if(binding_status==CandidateBindingStatus::IntegrityMismatch)
             throw std::runtime_error("live candidate/job binding integrity mismatch before gather");
           auto end=monotonic_ns();auto cpu_end=thread_cpu_ns();profile_phase(job.generation,nonce,"seed_binding",phase,end,{},cpu_end-cpu_phase);phase=end;cpu_phase=cpu_end;
-          const auto may_continue=[&](){return live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)&&job.lease.valid()&&!stop.load(std::memory_order_relaxed)&&
+          const auto may_continue=[&](){return live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)&&job.lease.valid()&&!(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))&&
               (!lookahead||(!gpu_ownership.opoi_pending()&&queue.admission_allowed(job.generation)));};
           std::vector<model::SparseMerkleIndex::TileRootInput> sibling_roots;
           sibling_roots.reserve(walk_steps);
-          const bool gathered=gpu_ownership.run_pom([&]{
+          const bool gathered=gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
             if(!resident)throw std::runtime_error("resident model missing before winner tile gather");
             if(!may_continue()||gpu_ownership.opoi_pending())
               throw PrefetchCancelled("job refresh, OPoI, or shutdown cancelled winner gather");
@@ -1985,7 +2700,7 @@ int main(int argc,char **argv) {
           p.gather_wall_ms=static_cast<double>(end-phase)/1.0e6;
           p.gather_cpu_ms=static_cast<double>(cpu_end-cpu_phase)/1.0e6;
           phase=end;cpu_phase=cpu_end;
-          if(!job.lease.valid()||stop.load(std::memory_order_relaxed))
+          if(!job.lease.valid()||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch)))
             throw PrefetchCancelled("job lease or shutdown changed during tile gather");
           p.cpu=walk_v4_from_tile_sequence(p.seed,tile_count,p.input.tiles);
           if(p.cpu.offsets!=p.input.offsets)throw std::runtime_error("CPU reference offset disagreement");
@@ -2004,7 +2719,7 @@ int main(int argc,char **argv) {
           return p;
         };
         for(std::size_t base=0;base<1;base++) {
-          if(!job.lease.valid()||stop.load(std::memory_order_relaxed)) break;
+          if(!job.lease.valid()||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))) break;
           if(!queue.admission_allowed(job.generation)) {
             if(!queue.wait_refresh_resolved(job.generation)) break;
           }
@@ -2024,7 +2739,7 @@ int main(int argc,char **argv) {
           const auto &binding=prepared.binding;const auto &input=prepared.input;const auto &cpu=prepared.cpu;
           const auto &seeds=prepared.seeds;const auto &tile_ids=prepared.tile_ids;
           const auto &slots=prepared.slots;const auto &packed=prepared.packed;
-          if(!job.lease.valid()||stop.load(std::memory_order_relaxed)) {
+          if(!job.lease.valid()||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))) {
             std::cout<<"LIVE_CUDA_STALE_DISCARD generation="<<job.generation<<" nonce="<<nonce<<" stage=before_kernel elapsed_ms="<<(monotonic_ns()-nonce_started_ns)/1.0e6<<"\n"<<std::flush;
             break;
           }
@@ -2036,11 +2751,11 @@ int main(int argc,char **argv) {
           telemetry.set_gpu_activity("CUDA_ACTIVE");
           CudaWalkBatch gpu;bool ran=false;const auto cuda_wall_start_ns=monotonic_ns();
           const bool may_prefetch=false&&base+1<count&&nonce!=std::numeric_limits<std::uint64_t>::max()&&
-              job.lease.valid()&&!stop.load(std::memory_order_relaxed)&&!gpu_ownership.opoi_pending()&&
+              job.lease.valid()&&!(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))&&!gpu_ownership.opoi_pending()&&
               queue.admission_allowed(job.generation);
           std::future<std::pair<bool,CudaWalkBatch>> cuda_future;
           if(may_prefetch){
-            cuda_future=std::async(std::launch::async,[&](){CudaWalkBatch result;const bool executed=gpu_ownership.run_pom([&]{
+            cuda_future=std::async(std::launch::async,[&](){CudaWalkBatch result;const bool executed=gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
               if(resident&&!resident->diagnostic_headroom_available())resident.reset();
               if(!engine){engine=std::make_unique<CudaWalkEngine>(std::string(gpu_uuid),1,true);cuda_engine_initializations.fetch_add(1,std::memory_order_relaxed);}
               engine->run(tile_count,model_identity,seeds,packed,tile_ids,slots,true,result);
@@ -2055,7 +2770,7 @@ int main(int argc,char **argv) {
                           std::string("\"overlapped_cuda\":true,\"completed\":")+(prefetched?"true":"false"));
             auto result=cuda_future.get();ran=result.first;gpu=std::move(result.second);
           }else{
-            ran=gpu_ownership.run_pom([&]{
+            ran=gpu_ownership.run_pom([&]{if(pom_lifecycle.cancel_pom(pom_epoch))throw PomPauseCancelled{};
               const bool retained=resident&&resident->diagnostic_headroom_available();
               if(!retained)resident.reset();
               std::cout<<"RESIDENT_PROOF_RETENTION="<<(retained?"KEPT":"RELEASED")<<" diagnostic_reserve_preserved=true\n"<<std::flush;
@@ -2104,7 +2819,7 @@ int main(int argc,char **argv) {
           profile_phase(job.generation,nonce,"walk_copy_final_state_target",phase_ns,phase_end_ns,
                         std::string("\"target_satisfied\":")+(target_met?"true":"false"),
                         thread_cpu_ns()-phase_cpu_ns);
-          const bool current_after_kernel=job.lease.valid()&&!stop.load(std::memory_order_relaxed)&&
+          const bool current_after_kernel=job.lease.valid()&&!(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))&&
               queue.wait_refresh_resolved(job.generation);
           if(!current_after_kernel&&!target_met) {
             telemetry.work_stale();
@@ -2145,7 +2860,7 @@ int main(int argc,char **argv) {
           const auto proof_build_ms=(monotonic_ns()-proof_start_ns)/1.0e6;
           telemetry.record_proof_times(proof_build_ms, 0.0);
           const bool current_after_proof=job.lease.valid()&&binding.lease.valid()&&
-              !stop.load(std::memory_order_relaxed)&&queue.wait_refresh_resolved(job.generation);
+              !(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))&&queue.wait_refresh_resolved(job.generation);
           if(!current_after_proof&&!target_met) {
             telemetry.proof_stale();
             std::cout<<"LIVE_CUDA_STALE_DISCARD generation="<<job.generation<<" nonce="<<nonce<<" stage=after_proof proof_build_ms="<<proof_build_ms<<" elapsed_ms="<<(monotonic_ns()-nonce_started_ns)/1.0e6<<"\n"<<std::flush;
@@ -2195,7 +2910,7 @@ int main(int argc,char **argv) {
           telemetry.record_proof_times(proof_build_ms, rust_verify_ms);
           profile_phase(job.generation,nonce,"official_rust_verify",rust_start_ns,monotonic_ns(),
                         "\"verifier_child_cpu_ms\":"+std::to_string(rust_child_cpu_ms));
-          const bool current_after_rust=live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)&&job.lease.valid()&&!stop.load(std::memory_order_relaxed)&&
+          const bool current_after_rust=live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)&&job.lease.valid()&&!(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))&&
               queue.wait_refresh_resolved(job.generation);
           if(!current_after_rust) {
             if(!target_met) {
@@ -2223,8 +2938,7 @@ int main(int argc,char **argv) {
                    <<" cuda_engine_instances="<<cuda_engine_initializations.load(std::memory_order_relaxed)
                    <<" submit="<<(submit_enabled?"ARMED":"DISABLED")<<"\n"<<std::flush;
           if(target_met) {
-            if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||!job.lease.valid()||stop.load(std::memory_order_relaxed)||
-               !queue.submission_allowed(job.generation))
+            if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||!job.lease.valid()||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch)))
               { persist_proof_artifacts(); std::cout<<"LIVE_CUDA_STALE_WINNER_VERIFIED generation="<<job.generation<<" nonce="<<nonce<<" stage=submission_gate rust=PASS submit=DISABLED\n"<<std::flush;break; }
             if(!submit_enabled) {
               persist_proof_artifacts();
@@ -2251,7 +2965,7 @@ int main(int argc,char **argv) {
               try {
                 return network::submit_pom_winner(
                     *submit_client,block,winner,job.fields.pay_address,
-                    job.fields.extra_data,submit_enabled);
+                    job.fields.extra_data,submit_enabled&&!proof_audit_failed.load(std::memory_order_acquire));
               } catch (...) {
                 persist_proof_artifacts();
                 throw;
@@ -2264,7 +2978,8 @@ int main(int argc,char **argv) {
               const auto timing_value=[](const std::optional<double> &v){return v?std::to_string(*v):std::string("null");};
               std::osyncstream(std::cout)<<"{\"event\":\"POM_SUBMISSION_TIMING\",\"clock\":\"steady_monotonic\",\"hash\":\""<<result.block_hash
                 <<"\",\"state\":\""<<network::submission_state_name(result.state)<<"\",\"channel_reused\":"<<(result.timing.channel_reused?"true":"false")
-                <<",\"assembly_ms\":"<<timing_value(result.timing.assembly_ms)<<",\"validation_ms\":"<<timing_value(result.timing.validation_ms)
+                <<",\"stream_reused\":"<<(result.timing.stream_reused?"true":"false")
+                  <<",\"assembly_ms\":"<<timing_value(result.timing.assembly_ms)<<",\"validation_ms\":"<<timing_value(result.timing.validation_ms)
                 <<",\"connect_ms\":"<<timing_value(result.timing.connect_ms)<<",\"stream_ms\":"<<timing_value(result.timing.stream_ms)
                 <<",\"prepare_ms\":"<<timing_value(result.timing.prepare_ms)<<",\"write_ms\":"<<timing_value(result.timing.write_ms)
                 <<",\"response_ms\":"<<timing_value(result.timing.response_ms)<<",\"finish_ms\":"<<timing_value(result.timing.finish_ms)
@@ -2274,9 +2989,31 @@ int main(int argc,char **argv) {
           }
 
         }
-      } catch(const std::exception &e) {std::cerr<<"LIVE_JOB_FAILED generation="<<job.generation<<" detail="<<e.what()<<"\n";throw;}
+      } catch(const PomVramAdmissionDenied &denied) {degrade_pom(denied);continue;}
+      catch(const PomPauseCancelled &) {continue;}
+      catch(const std::exception &e) {std::cerr<<"LIVE_JOB_FAILED generation="<<job.generation<<" detail="<<e.what()<<"\n";throw;}
+    }
+    // A manual emergency exit is never a canonical drain completion.
+    try {
+      if(h15_audits)h15_audits->report_exit_health(ai_current_daa.load());
+      if(ai_response_service){
+        const auto unresolved=ai_response_service->journal().unresolved();
+        std::osyncstream(std::cout)<<"AI_EXIT_RECOVERY pending_records="<<unresolved.size()<<" canonical_clearance=UNKNOWN\n";
+        for(const auto &r:unresolved)std::osyncstream(std::cout)<<"AI_EXIT_PENDING request="<<r.request_id<<" response="<<r.transaction_id<<" state="<<ai::response_state_name(r.state)<<" recovery=REQUIRED\n";
+      }
+    } catch(const std::exception &e){std::cerr<<"H15_EXIT_RECOVERY_SNAPSHOT state=UNKNOWN recovery=REQUIRED journals=RETAINED\n";}
+    if(pom_lifecycle.safe_to_exit()) {
+      std::cout<<"H15_EXIT_VERIFIED state=CLEARED canonical_barrier=PASS obligations=0 journals=PERSISTED\n"<<std::flush;
+    } else {
+      std::cerr<<"H15_EXIT_UNVERIFIED state="<<pom_lifecycle.service_state()<<" reason="<<pom_lifecycle.exit_block_reason()<<" emergency_stop_preserved=true canonical_and_local_barrier=UNPROVEN journals=RETAINED\n"<<std::flush;
     }
     request_worker_stop(stop,gpu_ownership,queue);
+    if(stratum_client)stratum_client->stop();
+    if(pending_h15_submit.valid())pending_h15_submit.get();
+    {
+      std::lock_guard lock(proof_auditors_mutex);
+      for(auto &f:proof_auditors) if(f.valid()) f.get();
+    }
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
     if(secondary_lane){secondary_lane->request_stop();secondary_lane->join();secondary_lane->rethrow_if_failed();}
 #endif
@@ -2291,6 +3028,11 @@ int main(int argc,char **argv) {
     return nonce_limit==0||completed==nonce_limit?0:3;
   } catch(const std::exception &e) {
     startup.fail_current(e.what());
+    if(pom_lifecycle.safe_to_exit()) {
+      std::cout<<"H15_EXIT_VERIFIED state=CLEARED canonical_barrier=PASS obligations=0 journals=PERSISTED\n"<<std::flush;
+    } else {
+      std::cerr<<"H15_EXIT_UNVERIFIED state="<<pom_lifecycle.service_state()<<" reason="<<pom_lifecycle.exit_block_reason()<<" emergency_stop_preserved=true canonical_and_local_barrier=UNPROVEN journals=RETAINED\n"<<std::flush;
+    }
     request_worker_stop(stop,gpu_ownership,queue);
     if(telemetry_started&&telemetry_thread.joinable()) telemetry_thread.join();
     if(ingress.joinable())ingress.join();

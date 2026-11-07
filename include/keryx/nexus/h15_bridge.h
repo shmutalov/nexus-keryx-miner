@@ -33,6 +33,8 @@ int nexus_h15_capture(const NexusH15Capture *, uint8_t, const uint8_t *,
                       void **, uint8_t *);
 int nexus_h15_plaintext(void *, NexusH15Buffer *);
 int nexus_h15_prefix(uint8_t, const uint8_t *, int32_t *, size_t *, uint32_t *);
+int nexus_h15_block_task_tokens(uint8_t, const uint8_t *, int32_t *, size_t *);
+int nexus_h15_block_task_root(const NexusH15Capture *, uint8_t, const uint8_t *, uint8_t *);
 int nexus_h15_open(void *, const NexusH15Api *, const uint8_t *,
                    const uint8_t *, const uint64_t *, size_t, const uint8_t *,
                    size_t, NexusH15Buffer *);
@@ -70,6 +72,8 @@ int nexus_h15_service_response_intent(void *, const uint8_t *, uint64_t);
 int nexus_h15_service_response_result(void *, const uint8_t *, uint8_t);
 int nexus_h15_service_response_for_request(const void *, const uint8_t *,
                                            NexusH15Buffer *);
+int nexus_h15_service_health(void *, uint64_t, NexusH15Buffer *);
+int nexus_h15_service_rpc_observed(void *, const uint8_t *, uint8_t, uint64_t);
 int nexus_h15_service_due(void *, uint64_t, uint64_t, NexusH15Buffer *);
 #ifdef __cplusplus
 }

@@ -48,8 +48,8 @@ const notice = (message) => {
   $("notice").hidden = !message;
 };
 const role = (name) => (roles.has(name) ? name : "text");
-function button(title, callback) {
-  const e = make("button", title);
+function button(title, callback, cls) {
+  const e = make("button", title, cls);
   e.type = "button";
   e.onclick = () =>
     Promise.resolve()
@@ -133,7 +133,7 @@ function edit(title, fields, submit, preview = false) {
     input.name = field.name;
     input.type = field.type || "text";
     input.value = field.value || "";
-    input.required = true;
+    input.required = field.required !== false;
     if (input.type === "text") input.maxLength = 1024;
     label.append(input);
     $("edit-fields").append(label);
@@ -252,7 +252,232 @@ function inlineActions(panel, name, frame) {
     }
   }
   if (tab === 7) {
+    if (name === "Mining mode") {
+      actions.push(
+        select(
+          [
+            ["SOLO (Default)", "solo"],
+            ["POOL (Stratum v4)", "pool"],
+          ],
+          d.mining_mode?.mode || "solo",
+          (v) => command("mining_mode", { mode: v }),
+        ),
+      );
+      return actions;
+    }
+    if (name === "Selected pool") {
+      const pools = d.mining_mode?.pools || [];
+      const opts = pools.map((p) => [
+        `${p.name} (${p.configured ? (p.url || "OK") : "Not configured"})`,
+        p.id,
+      ]);
+      if (!opts.length) {
+        opts.push(["Suprnova (Preset)", "suprnova"]);
+        opts.push(["KeryxPool (Preset)", "keryxpool"]);
+      }
+      actions.push(
+        select(
+          opts,
+          d.mining_mode?.active_pool_id || "suprnova",
+          (v) => command("pool_activate", { id: v }),
+        ),
+      );
+      return actions;
+    }
+    if (name === "Add custom pool") {
+      actions.push(
+        button("+ Add custom pool", () => {
+          const defaultWallet = d.mining_payout || "";
+          edit(
+            "Add custom pool",
+            [
+              { name: "name", label: "Pool name (e.g. Backup Pool)", value: "Custom Pool" },
+              { name: "url", label: "Stratum URL (e.g. stratum+tcp://host:4404)", value: "" },
+              { name: "worker", label: "Worker (wallet.worker)", value: defaultWallet ? `${defaultWallet}.worker1` : "" },
+              { name: "password", label: "Password (optional, default 'x')", value: "x", required: false },
+            ],
+            (v) => command("pool_save", {
+              name: v.name.trim(),
+              url: v.url.trim(),
+              worker: v.worker.trim(),
+              password: v.password,
+            }),
+          );
+        }),
+      );
+      return actions;
+    }
+    if (name.startsWith("Pool #")) {
+      const idxStr = name.replace("Pool #", "").split(":")[0].trim();
+      const poolIndex = parseInt(idxStr, 10) - 1;
+      const pools = d.mining_mode?.pools || [];
+      const pool = pools[poolIndex];
+      if (pool) {
+        if (!pool.active) {
+          const btn = button("Activate", () => command("pool_activate", { id: pool.id }));
+          btn.title = "Set as active primary pool";
+          actions.push(btn);
+        }
+        if (pool.configured && pool.url) {
+          const btn = button("Test", () => command("pool_test_connection", { url: pool.url }));
+          btn.title = "Test live pool connection";
+          actions.push(btn);
+        }
+        const editBtn = button("Edit", () => {
+          edit(
+            `Edit pool: ${pool.name}`,
+            [
+              { name: "name", label: "Pool name", value: pool.name },
+              { name: "url", label: "Stratum URL (e.g. stratum+tcp://host:4404)", value: pool.url },
+              { name: "worker", label: "Worker (wallet.worker)", value: pool.worker },
+              { name: "password", label: "Password (leave blank to keep unchanged)", value: "", required: false },
+            ],
+            (v) => command("pool_save", {
+              id: pool.id,
+              name: v.name.trim(),
+              url: v.url.trim(),
+              worker: v.worker.trim(),
+              password: v.password || undefined,
+            }),
+          );
+        });
+        editBtn.title = "Edit pool configuration";
+        actions.push(editBtn);
+        if (!pool.preset) {
+          const delBtn = button("Delete", () => command("pool_delete", { id: pool.id }));
+          delBtn.title = "Delete custom pool";
+          actions.push(delBtn);
+        }
+        if (poolIndex > 0) {
+          const prioUpBtn = button("▲", () => {
+            const ids = pools.map((p) => p.id);
+            const tmp = ids[poolIndex];
+            ids[poolIndex] = ids[poolIndex - 1];
+            ids[poolIndex - 1] = tmp;
+            command("pool_reorder", { order: ids });
+          }, "prio-btn");
+          prioUpBtn.title = "Increase failover priority (move up)";
+          actions.push(prioUpBtn);
+        }
+        if (poolIndex < pools.length - 1) {
+          const prioDownBtn = button("▼", () => {
+            const ids = pools.map((p) => p.id);
+            const tmp = ids[poolIndex];
+            ids[poolIndex] = ids[poolIndex + 1];
+            ids[poolIndex + 1] = tmp;
+            command("pool_reorder", { order: ids });
+          }, "prio-btn");
+          prioDownBtn.title = "Decrease failover priority (move down)";
+          actions.push(prioDownBtn);
+        }
+        return actions;
+      }
+    }
     const mapping = {
+      "Active pool URL": [
+        [
+          "Edit URL",
+          () =>
+            edit(
+              "Stratum Pool URL",
+              [
+                {
+                  name: "pool_url",
+                  label: "Stratum URL (e.g. stratum+tcp://krx.suprnova.cc:4404)",
+                  value: d.mining_mode?.pool_url || "",
+                },
+              ],
+              (v) => command("pool_config", { pool_url: v.pool_url.trim() }),
+            ),
+        ],
+      ],
+      "Active pool worker": [
+        [
+          "Edit Worker",
+          () =>
+            edit(
+              "Pool Worker (wallet.worker)",
+              [
+                {
+                  name: "pool_worker",
+                  label: "wallet.worker identifier",
+                  value: d.mining_mode?.pool_worker || "",
+                },
+              ],
+              (v) => command("pool_config", { pool_worker: v.pool_worker.trim() }),
+            ),
+        ],
+      ],
+      "Active pool password": [
+        [
+          "Edit Password",
+          () =>
+            edit(
+              "Pool Password (optional)",
+              [
+                {
+                  name: "pool_password",
+                  label: "Password (default 'x')",
+                  value: "",
+                  required: false,
+                },
+              ],
+              (v) => command("pool_config", { pool_password: v.pool_password }),
+            ),
+        ],
+      ],
+      "Pool URL": [
+        [
+          "Edit Pool URL",
+          () =>
+            edit(
+              "Stratum Pool URL",
+              [
+                {
+                  name: "pool_url",
+                  label: "Stratum URL (e.g. stratum+tcp://pool:port)",
+                  value: d.mining_mode?.pool_url || "",
+                },
+              ],
+              (v) => command("pool_config", { pool_url: v.pool_url.trim() }),
+            ),
+        ],
+      ],
+      "Pool worker": [
+        [
+          "Edit Worker",
+          () =>
+            edit(
+              "Pool Worker (wallet.worker)",
+              [
+                {
+                  name: "pool_worker",
+                  label: "wallet.worker identifier",
+                  value: d.mining_mode?.pool_worker || "",
+                },
+              ],
+              (v) => command("pool_config", { pool_worker: v.pool_worker.trim() }),
+            ),
+        ],
+      ],
+      "Pool password": [
+        [
+          "Edit Password",
+          () =>
+            edit(
+              "Pool Password (optional)",
+              [
+                {
+                  name: "pool_password",
+                  label: "Password (leave empty if not required)",
+                  value: "",
+                  required: false,
+                },
+              ],
+              (v) => command("pool_config", { pool_password: v.pool_password }),
+            ),
+        ],
+      ],
       Version: [["Check for updates", () => command("update_check")]],
       "Automatic updates": [
         [
@@ -309,11 +534,15 @@ function rowNode(row, panel, frame) {
     e = make("div", undefined, "row");
   if (name) e.append(make("span", name, "name"));
   const controls = inlineActions(panel, name, frame);
-  const hideValue = tab === 1 && name === "Workload" && controls.length;
+  const hideValue = (tab === 1 && name === "Workload" && controls.length) || (tab === 7 && (name === "Mining mode" || name === "Selected pool") && controls.length);
   if (!hideValue) e.append(make("span", value, "value " + role(color)));
   if (controls.length) {
     e.classList.add("action-row");
     const c = make("div", undefined, "row-actions");
+    if (name && name.startsWith("Pool #")) {
+      e.classList.add("pool-row");
+      c.classList.add("pool-actions");
+    }
     c.append(...controls);
     e.append(c);
     if (hideValue) c.classList.add("workload-select");
@@ -392,7 +621,7 @@ function panelNode(panel, frame, index) {
         : sorted.at(-1)?.[2] || "text";
       entries.push(["", text, color, null]);
     }
-    if (tab === 3 || (tab === 1 && index === 2)) {
+    if (tab === 3 || (tab === 1 && panel.title && panel.title.startsWith("TOTALS"))) {
       rows.classList.add("split-rows");
       const count = Math.ceil(entries.length / 2);
       for (let i = 0; i < 2; i++) {
@@ -417,7 +646,7 @@ function panelNode(panel, frame, index) {
       );
   }
   if (tab === 1) {
-    card.classList.add(index < 2 ? "device-card" : "totals-card");
+    card.classList.add(panel.title && panel.title.startsWith("TOTALS") ? "totals-card" : "device-card");
   }
   if (frame.desktop.effective_view === "rig" && (tab === 0 || tab === 1)) {
     card.classList.remove(
@@ -502,19 +731,23 @@ function controlsPage(frame) {
     return body;
   }
   const mining = group("MINER SESSION", "session");
+  const isPaused = Boolean(frame.desktop && frame.desktop.is_paused);
+  const miningStatusText = isPaused
+    ? (frame.status === "LIVE" ? "LIVE · " : "Telemetry " + frame.status + " · ") + "PAUSED"
+    : (frame.status === "LIVE" ? "LIVE · " : "Telemetry " + frame.status + " · ") + (frame.state.mining || "N/A");
   mining.append(
     make(
       "div",
-      (frame.status === "LIVE"
-        ? "LIVE · "
-        : "Telemetry " + frame.status + " · ") + (frame.state.mining || "N/A"),
-      "value",
+      miningStatusText,
+      isPaused ? "value warning" : "value",
     ),
   );
-  const buttons = make("div", undefined, "row-actions");
+  const buttons = make("div", undefined, "row-actions session-actions");
   buttons.append(
-    button("Stop miner", () => command("stop")),
-    button("Restart miner", () => command("restart")),
+    button("Restart", () => command("restart"), "btn-green"),
+    button(isPaused ? "Resume" : "Pause", () => command("pause"), "btn-orange"),
+    button("Force restart", () => command("force_restart"), "btn-orange"),
+    button("Stop miner", () => command("stop"), "btn-red"),
   );
   mining.append(
     buttons,
@@ -660,7 +893,7 @@ function theme(frame) {
 }
 function fitActivity() {
   const grid = $("panels");
-  if (tab === 0) {
+  if (tab === 0 && !document.body.classList.contains("miner-rig-view")) {
     const network = grid.querySelector(".network-card"),
       pipeline = grid.querySelector(".pipeline-card"),
       gpu = grid.querySelector(".gpu-card");
@@ -871,6 +1104,15 @@ document.addEventListener("keydown", (event) => {
   if (event.altKey && /^[1-9]$/.test(event.key)) {
     event.preventDefault();
     selectPage(Number(event.key) - 1);
+  }
+  if (["PageDown", "PageUp", "Home", "End"].includes(event.key) && !event.altKey && !event.ctrlKey) {
+    const panels = $("panels");
+    if (panels) {
+      if (event.key === "PageDown") panels.scrollBy({ top: 320, behavior: "smooth" });
+      else if (event.key === "PageUp") panels.scrollBy({ top: -320, behavior: "smooth" });
+      else if (event.key === "Home") panels.scrollTo({ top: 0, behavior: "smooth" });
+      else if (event.key === "End") panels.scrollTo({ top: panels.scrollHeight, behavior: "smooth" });
+    }
   }
 });
 document.addEventListener("visibilitychange", () => {

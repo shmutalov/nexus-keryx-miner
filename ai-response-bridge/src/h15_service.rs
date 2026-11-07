@@ -657,6 +657,7 @@ impl Service {
             },
         );
         self.restore.entry(anchor).or_default().insert(response);
+        if self.health(submitted).is_err(){log::warn!("H15_HEALTH unavailable; canonical obligation retained");}
         Ok(response)
     }
     pub fn anchors(&self) -> Vec<Hash> {
@@ -1147,7 +1148,7 @@ impl Service {
             }
             tasks.push((deadline, *id, seed, path, Some(op.partials), Some(child)));
         }
-        tasks.sort_by_key(|t| (t.0 <= now, t.0, t.1));
+        tasks.sort_by_key(|t| (t.0 <= now && self.node_awaits.get(&t.1)!=Some(&true), t.0, t.1));
         if let Some(next) = next_work {
             let mut jobs: Vec<_> = tasks
                 .iter()
@@ -1180,12 +1181,16 @@ impl Service {
                     end.saturating_add(self.next_span)
                         > now.saturating_add(next).saturating_add(270000)
                 });
-            if !span_urgent && !recovery::replays_urgent(now, next, &jobs) {
+            // A nominally late duty still explicitly awaited by the node must
+            // not starve behind an unending ingress of new inference requests.
+            // Eligibility/backlog bounds above remain unchanged.
+            let overdue_awaited=tasks.iter().any(|t|t.0<=now && self.node_awaits.get(&t.1)==Some(&true));
+            if !overdue_awaited && !span_urgent && !recovery::replays_urgent(now, next, &jobs) {
                 return Ok(());
             }
         }
         if let Some((deadline, id, seed, path, prev, draw_block)) =
-            tasks.into_iter().find(|t| next_work.is_none() || t.0 > now)
+            tasks.into_iter().find(|t| next_work.is_none() || t.0 > now || self.node_awaits.get(&t.1)==Some(&true))
         {
             let p = self.pending.get_mut(&id).unwrap();
             if now > deadline.saturating_add(p::OPENING_BACKLOG_CAP_DAA) {
@@ -1223,6 +1228,7 @@ impl Service {
                         })
                 })
                 .collect();
+            let replay_started=std::time::Instant::now();
             let bodies = match cached.map(Ok).unwrap_or_else(|| {
                 let start = std::time::Instant::now();
                 let result = build(&p.capture, seed, id, &path, prev.as_deref());
@@ -1239,7 +1245,7 @@ impl Service {
                 Err(e) => {
                     p.state.failures = p.state.failures.saturating_add(1);
                     p.state.policy.replay_retry_ms =
-                        ms.saturating_add(recovery::replay_backoff_ms(p.state.failures));
+                        ms.saturating_add(recovery::replay_deadline_backoff_ms(p.state.failures,now,deadline));
                     persist(&self.dir, &id, &p.state)?;
                     log::warn!(
                         "H15 replay failed; immutable duty retained for bounded-backoff retry: {}",
@@ -1251,6 +1257,9 @@ impl Service {
             if bodies.len() != kinds.len() {
                 return Err("invalid native opening bundle".into());
             }
+            let replay_ms=replay_started.elapsed().as_millis();
+            let mut candidate=p.state.clone();
+            let signing_started=std::time::Instant::now();
             for (i, body) in bodies.into_iter().enumerate() {
                 if !p::opening_fits_seeded(body.len()) || body.get(1..33) != Some(id.as_slice()) {
                     return Err("opening binding/cap".into());
@@ -1259,7 +1268,7 @@ impl Service {
                 let seeded = opening::seeded(&body, &seed).ok_or("seed envelope")?;
                 let payload = signing(&self.secret, &seeded)?;
                 let tx = audit_txid(&payload);
-                p.state.pieces.push(Piece {
+                candidate.pieces.push(Piece {
                     payload,
                     id: tx,
                     path: path.clone(),
@@ -1275,11 +1284,16 @@ impl Service {
                     last_ms: 0,
                 });
             }
-            verify_pieces(&self.secret, &self.binding, &p.state, &p.capture)?;
-            p.state.failures = 0;
-            p.state.retry_after = 0;
-            p.state.policy.replay_retry_ms = 0;
-            persist(&self.dir, &id, &p.state)?;
+            let signing_ms=signing_started.elapsed().as_millis();
+            verify_pieces(&self.secret, &self.binding, &candidate, &p.capture)?;
+            candidate.failures = 0;
+            candidate.retry_after = 0;
+            candidate.policy.replay_retry_ms = 0;
+            persist(&self.dir, &id, &candidate)?;
+            p.state=candidate;
+            println!("H15_OPENING_PROFILE replay_ms={} signing_ms={} margin_daa={} phase_depth={}",replay_ms,signing_ms,deadline as i128-now as i128,path.len());
+            if self.observe_timing("replay",replay_ms.min(u64::MAX as u128) as u64).is_err(){log::warn!("H15_TIMING unavailable; verified proof retained");}
+            if self.observe_timing("signing",signing_ms.min(u64::MAX as u128) as u64).is_err(){log::warn!("H15_TIMING unavailable; verified proof retained");}
         }
         Ok(())
     }
@@ -1289,38 +1303,33 @@ impl Service {
         if !self.restore.is_empty() {
             return Ok(Vec::new());
         }
-        let mut out = Vec::new();
-        for (id, p) in &mut self.pending {
-            if p.state.retired {
-                continue;
-            }
-            let mut changed = false;
-            for x in &mut p.state.pieces {
-                let node_allows = p.state.policy.node.as_ref().is_none_or(|o| {
+        let mut eligible = Vec::new();
+        for (id,p) in &self.pending {
+            if p.state.retired {continue;}
+            for (index,x) in p.state.pieces.iter().enumerate() {
+                let node_allows=p.state.policy.node.as_ref().is_none_or(|o| {
                     o.pieces & (1u32 << x.kind) != 0
-                        && (x.kind != 1 || x.path == o.path)
-                        && opening::SignedPayload::split(&x.payload)
-                            .and_then(|s| opening::seed_block(s.body))
-                            .is_some_and(|seed| p::trace_seed(&seed, id) == o.seed)
+                    && (x.kind != 1 || x.path == o.path)
+                    && opening::SignedPayload::split(&x.payload)
+                        .and_then(|s| opening::seed_block(s.body))
+                        .is_some_and(|seed| p::trace_seed(&seed,id)==o.seed)
                 });
-                if node_allows
-                    && out.len() < 32
-                    && x.accepted.is_none()
-                    && now_daa <= x.deadline.saturating_add(p::OPENING_BACKLOG_CAP_DAA)
-                    && (x.last_ms == 0
-                        || now_ms.saturating_sub(x.last_ms)
-                            >= if x.attempts < 10 { 3000 } else { 60000 })
-                {
-                    changed = true;
-                    x.attempts = x.attempts.saturating_add(1);
-                    x.last_ms = now_ms;
-                    out.push(x.payload.clone());
+                if node_allows && x.accepted.is_none()
+                    && now_daa<=x.deadline.saturating_add(p::OPENING_BACKLOG_CAP_DAA)
+                    && (x.last_ms==0 || now_ms.saturating_sub(x.last_ms)>=if x.attempts<10{3000}else{60000}) {
+                    eligible.push((x.deadline,*id,index));
                 }
             }
-            if changed {
-                persist(&self.dir, id, &p.state)?;
-            }
         }
+        // Earliest authoritative deadline first, independent of response hash order.
+        eligible.sort_unstable();eligible.truncate(32);
+        let mut out=Vec::new();let mut changed=BTreeSet::new();
+        for (_,id,index) in eligible {
+            let x=&mut self.pending.get_mut(&id).unwrap().state.pieces[index];
+            x.attempts=x.attempts.saturating_add(1);x.last_ms=now_ms;
+            out.push(x.payload.clone());changed.insert(id);
+        }
+        for id in changed {persist(&self.dir,&id,&self.pending[&id].state)?;}
         Ok(out)
     }
 
@@ -2178,4 +2187,18 @@ pub unsafe extern "C" fn nexus_h15_service_response_for_request(
             .map_or(Vec::new(), |h| h.to_vec());
         unsafe { output(bytes, out) }
     })
+}
+
+mod health;
+/// # Safety
+/// Exclusive live service pointer; id spans 32 readable bytes. Outcome is ACK/REJECT/UNKNOWN.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_h15_service_rpc_observed(ptr:*mut c_void,id:*const u8,outcome:u8,latency:u64)->i32 {
+    guard(|| {if ptr.is_null(){return Err("missing service".into());}let id=unsafe{view(id,32,32)}?.try_into().unwrap();unsafe{&*(ptr as *const Service)}.rpc_observed(id,outcome,latency)})
+}
+/// # Safety
+/// Exclusive live service pointer; out is a writable Buffer slot.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_h15_service_health(ptr:*mut c_void,daa:u64,out:*mut Buffer)->i32 {
+    guard(|| {if ptr.is_null(){return Err("missing service".into());}let b=unsafe{&*(ptr as *const Service)}.health(daa)?;unsafe{output(b,out)}})
 }

@@ -303,14 +303,12 @@ std::vector<consensus::Hash> SparseMerkleIndex::tile_path(std::uint64_t tile)con
     if(slab_begin>=cp6->count)throw std::runtime_error("Merkle slab index outside checkpoint");
     slab_count=std::min<std::uint64_t>(64,cp6->count-slab_begin);
     bool cached_slab=false;
+    const auto slot_index=(slab_begin/64)%slab_cache_.size();
     {
-      std::lock_guard lock(cache_mutex_);
-      for(const auto &entry:slab_cache_) {
-        if(entry.begin==slab_begin && entry.count==slab_count) {
-          slab=entry.nodes;
-          cached_slab=true;
-          break;
-        }
+      std::lock_guard lock(slab_cache_mutex_);
+      const auto &entry=slab_cache_[slot_index];
+      if(entry.begin==slab_begin && entry.count==slab_count) {
+        slab=entry.nodes;cached_slab=true;
       }
     }
     if(!cached_slab) {
@@ -319,12 +317,11 @@ std::vector<consensus::Hash> SparseMerkleIndex::tile_path(std::uint64_t tile)con
       const auto off=cp6->offset+slab_begin*32;
       if(off>static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))throw std::runtime_error("Merkle slab offset exceeds off_t");
       const auto bytes=slab_count*sizeof(consensus::Hash);tree_file_->read_at(slab.data(),bytes,off);
-      std::lock_guard lock(cache_mutex_);
-      auto &slot=slab_cache_[slab_cache_cursor_];
+      std::lock_guard lock(slab_cache_mutex_);
+      auto &slot=slab_cache_[slot_index];
       slot.begin=slab_begin;
       slot.count=slab_count;
       slot.nodes=slab;
-      slab_cache_cursor_=(slab_cache_cursor_+1)%slab_cache_.size();
     }
   }
   while(count>1){const auto sibling=(idx^1U)<count?(idx^1U):idx;consensus::Hash node{};

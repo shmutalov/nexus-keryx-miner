@@ -118,7 +118,7 @@ bool allowed_transition(ResponseState from, ResponseState to) {
     case ResponseState::ResponseSigned: return to == ResponseState::ResponsePublished || to == ResponseState::TransactionPrepared;
     case ResponseState::ResponsePublished: return to == ResponseState::ResponseSigned || to == ResponseState::TransactionPrepared;
     case ResponseState::TransactionPrepared: return to == ResponseState::Submitting;
-    case ResponseState::Submitting: return to == ResponseState::RpcAcknowledged || to == ResponseState::RpcRejected || to == ResponseState::UnknownAfterTimeout;
+    case ResponseState::Submitting: return to == ResponseState::RpcAcknowledged || to == ResponseState::RpcRejected || to == ResponseState::UnknownAfterTimeout || to == ResponseState::ChainObserved;
     case ResponseState::UnknownAfterTimeout: return to == ResponseState::RpcAcknowledged || to == ResponseState::RpcRejected || to == ResponseState::ChainObserved;
     case ResponseState::RpcAcknowledged: return to == ResponseState::ChainObserved || to == ResponseState::Finalized;
     case ResponseState::ChainObserved: return to == ResponseState::Finalized || to == ResponseState::ResponseReorged;
@@ -460,9 +460,181 @@ AiResponseService::AiResponseService(AiResponseConfig config)
     : config_(std::move(config)), journal_(config_.journal_path) {}
 void AiResponseService::recover() { journal_.recover(); }
 bool AiResponseService::discover(const protowire::RpcTransaction &transaction,
-                                 std::uint64_t containing_daa) {
+                                 std::uint64_t containing_daa,
+                                 const std::vector<ServiceProvider> *providers,
+                                 std::optional<std::uint64_t> current_daa) {
   const auto request=parse_request(transaction,containing_daa,nullptr,config_.network);
-  return request ? journal_.begin(request->stable_id) : false;
+  if (!request) return false;
+  const auto id = request->stable_id;
+
+  const bool model_mismatch = !config_.model_id.empty() && request->model_id != config_.model_id;
+  if (model_mismatch) {
+    (void)journal_.begin(id);
+    (void)journal_.transition(id, ResponseState::NotAssigned);
+    return false;
+  }
+
+  (void)journal_.begin(id);
+  const auto deadline = service_response_deadline(
+      containing_daa, config_.tier, request->max_tokens,
+      containing_daa >= mainnet_signed_response_activation_daa)
+      .value_or(containing_daa + stock_response_window_daa);
+
+  {
+    std::lock_guard lock(discovered_mutex_);
+    discovered_requests_[id] = DiscoveredRequestInfo{
+        id, containing_daa, request->model_id, request->is_private,
+        request->prompt_or_private_envelope, request->max_tokens, deadline};
+  }
+
+  if (providers != nullptr) {
+    const auto escrow_hex = hex_encode(config_.escrow_pubkey.data(), config_.escrow_pubkey.size());
+    const auto assignment = classify_assignment(*request, config_.service_identity,
+                                                escrow_hex, config_.tier, *providers);
+    if (assignment == Assignment::NotAssigned) {
+      (void)journal_.transition(id, ResponseState::NotAssigned);
+      return false;
+    }
+    if (assignment == Assignment::Invalid) {
+      (void)journal_.transition(id, ResponseState::Failed);
+      return false;
+    }
+    const auto now_daa = current_daa.value_or(containing_daa);
+    if (now_daa > deadline) {
+      (void)journal_.transition(id, ResponseState::Expired);
+      return false;
+    }
+    (void)journal_.transition(id, ResponseState::Assigned);
+    return true;
+  }
+  return true;
+}
+
+ReconciliationResult AiResponseService::reconcile_discovered(
+    const std::vector<ServiceProvider> &providers,
+    std::uint64_t current_daa,
+    bool providers_available,
+    const std::function<bool(std::string_view request_id)> &has_audit_obligation) {
+  ReconciliationResult result{};
+  const auto unresolved = journal_.unresolved();
+  const auto escrow_hex = hex_encode(config_.escrow_pubkey.data(), config_.escrow_pubkey.size());
+  const auto model_hex = hex_encode(config_.model_id.data(), config_.model_id.size());
+
+  const auto id_equal = [](std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+      if (std::tolower(static_cast<unsigned char>(a[i])) !=
+          std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    return true;
+  };
+
+  const bool is_provider_listed = providers_available && std::any_of(
+      providers.begin(), providers.end(), [&](const auto &p) {
+        return p.tier == config_.tier && id_equal(p.model_id, model_hex) &&
+               id_equal(p.identity, config_.service_identity) &&
+               id_equal(p.escrow_pubkey, escrow_hex);
+      });
+
+  for (const auto &record : unresolved) {
+    if (record.state != ResponseState::Discovered) continue;
+    const auto &id = record.request_id;
+
+    std::optional<DiscoveredRequestInfo> info;
+    {
+      std::lock_guard lock(discovered_mutex_);
+      auto it = discovered_requests_.find(id);
+      if (it != discovered_requests_.end()) info = it->second;
+    }
+
+    if (info) {
+      if (!config_.model_id.empty() && info->model_id != config_.model_id) {
+        if (journal_.transition(id, ResponseState::NotAssigned)) {
+          result.unassigned_count++;
+          result.reconciled_count++;
+        }
+        continue;
+      }
+      if (current_daa > info->deadline) {
+        if (journal_.transition(id, ResponseState::Expired)) {
+          result.expired_count++;
+          result.reconciled_count++;
+        }
+        continue;
+      }
+      if (!providers_available) {
+        result.unresolved_blockers++;
+        continue;
+      }
+      Request req;
+      req.stable_id = id;
+      req.model_id = info->model_id;
+      req.max_tokens = info->max_tokens;
+      req.is_private = info->is_private;
+      req.prompt_or_private_envelope = info->envelope;
+      const auto assignment = classify_assignment(req, config_.service_identity,
+                                                  escrow_hex, config_.tier, providers);
+      if (assignment == Assignment::NotAssigned) {
+        if (journal_.transition(id, ResponseState::NotAssigned)) {
+          result.unassigned_count++;
+          result.reconciled_count++;
+        }
+      } else if (assignment == Assignment::Invalid) {
+        if (journal_.transition(id, ResponseState::Failed)) {
+          result.reconciled_count++;
+        }
+      } else {
+        (void)journal_.transition(id, ResponseState::Assigned);
+        result.assigned_obligations++;
+        result.unresolved_blockers++;
+      }
+    } else {
+      if (!providers_available) {
+        result.unresolved_blockers++;
+        continue;
+      }
+      const bool audit_active = has_audit_obligation && has_audit_obligation(id);
+      if (audit_active) {
+        (void)journal_.transition(id, ResponseState::Assigned);
+        result.assigned_obligations++;
+        result.unresolved_blockers++;
+        continue;
+      }
+      if (!is_provider_listed) {
+        if (journal_.transition(id, ResponseState::NotAssigned)) {
+          result.unassigned_count++;
+          result.reconciled_count++;
+        }
+      } else {
+        result.unresolved_blockers++;
+      }
+    }
+  }
+  return result;
+}
+
+std::size_t AiResponseService::reconcile_ambiguous(
+    const std::function<bool(std::string_view txid)> &known) {
+  if (!known) return 0;
+  std::size_t reconciled = 0;
+  for (const auto &record : journal_.unresolved()) {
+    if ((record.state == ResponseState::Submitting ||
+         record.state == ResponseState::UnknownAfterTimeout) &&
+        !record.transaction_id.empty()) {
+      bool is_known = false;
+      try { is_known = known(record.transaction_id); } catch (...) { is_known = false; }
+      if (is_known && journal_.transition(record.request_id, ResponseState::RpcAcknowledged)) {
+        ++reconciled;
+      }
+    }
+  }
+  return reconciled;
+}
+
+std::optional<DiscoveredRequestInfo> AiResponseService::get_discovered_info(std::string_view request_id) const {
+  std::lock_guard lock(discovered_mutex_);
+  auto it = discovered_requests_.find(std::string(request_id));
+  if (it == discovered_requests_.end()) return std::nullopt;
+  return it->second;
 }
 std::size_t AiResponseService::observe_block(const protowire::RpcBlock &block) {
   constexpr std::string_view response_subnetwork="0400000000000000000000000000000000000000";
@@ -474,8 +646,9 @@ std::size_t AiResponseService::observe_block(const protowire::RpcBlock &block) {
     const auto trace=stock_response_trace(*payload);
     const auto id=hex_encode(request_hash->data(),request_hash->size());
     const auto record=journal_.get(id);if(!record)continue;
-    if(record->state!=ResponseState::RpcAcknowledged&&record->state!=ResponseState::UnknownAfterTimeout&&
-       record->state!=ResponseState::ChainObserved&&record->state!=ResponseState::ResponseReorged)continue;
+    if(record->state!=ResponseState::RpcAcknowledged&&record->state!=ResponseState::Submitting&&
+       record->state!=ResponseState::UnknownAfterTimeout&&record->state!=ResponseState::ChainObserved&&
+       record->state!=ResponseState::ResponseReorged)continue;
     if(!stock_verify_response_signature(*payload,*request_hash,config_.escrow_pubkey))continue;
     if(trace)std::cout<<"AI_RESPONSE_TRACE_OBSERVED request="<<id<<" stage="<<unsigned(trace->stage)
                      <<" positions="<<trace->total_positions<<" correctness=OPENING_REQUIRED\n"<<std::flush;

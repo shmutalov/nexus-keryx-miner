@@ -18,6 +18,9 @@ struct ResidentWitnessTiles {
 // Borrows ONE stock llama model. Model must outlive this engine. No primary-context reset.
 class CudaResidentSearch final {
  public:
+#ifdef NEXUS_TEST_POM_ALLOCATOR
+  CudaResidentSearch(); // CPU driver-fixture constructor; absent from delivered worker.
+#endif
   CudaResidentSearch(const std::string &uuid, const model::ReadOnlyGguf &gguf,
                      const std::vector<opoi::ResidentTensor> &tensors);
   ~CudaResidentSearch();

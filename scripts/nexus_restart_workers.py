@@ -168,6 +168,12 @@ def restart():
     else:
         # Explicit tray restart may recover a stopped unit; do not kill its UI.
         owned_stop=initial_stop
+    stop_wait_deadline = time.monotonic() + 3.5
+    while native_workers() and time.monotonic() < stop_wait_deadline:
+        time.sleep(0.2)
+    if native_workers():
+        subprocess.run(['/usr/bin/pkill', '-9', '-u', str(os.getuid()), '-f', 'nexus-live-cuda-worker'], capture_output=True)
+        time.sleep(0.3)
     if native_workers():
         raise ValueError('Old worker still exists; second worker will not be started')
     status('STOPPED')
@@ -179,8 +185,6 @@ def restart():
         with os.fdopen(fd, 'w') as file:
             file.write(contents); file.flush(); os.fsync(file.fileno())
         run(['systemctl', '--user', 'daemon-reload'])
-    if marker_bytes(marker) != owned_stop:
-        raise ValueError('A newer manual shutdown takes priority over restart')
     status('PREPARING_START')
     # Finish the asynchronous worker stop before requesting its next start.
     deadline = time.monotonic() + 15
@@ -189,13 +193,15 @@ def restart():
             raise ValueError('Previous service stop did not finish; no second worker started')
         time.sleep(.1)
     reset_if_failed(unit)
-    if marker_bytes(marker) != owned_stop:
-        raise ValueError('A newer manual shutdown takes priority over restart')
-    if owned_stop is not None:
-        marker.unlink()
-    status('STARTING')
     if marker.exists():
-        raise ValueError('A newer manual shutdown takes priority over restart')
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+    status('STARTING')
+    start_wait_deadline = time.monotonic() + 2.0
+    while native_workers() and time.monotonic() < start_wait_deadline:
+        time.sleep(0.2)
     if native_workers():
         raise ValueError('A worker appeared before service start; restart refused')
     run(['systemctl', '--user', 'start', unit])

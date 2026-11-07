@@ -51,8 +51,12 @@ void TraceCapture::ensure_context_for(std::size_t positions) {
   require(allocated_context_>=positions,"Allocated context is smaller than replay demand");
 }
 [[noreturn]] void TraceCapture::fail(const char *operation, int code) const {
-  // Native error text is intentionally not included: it can contain prompt data.
-  throw std::runtime_error(std::string("ABI6 ") + operation + " failed (" + std::to_string(code) + ")");
+  std::string err;
+  if (std::strcmp(operation, "configure") == 0 && api_.error) {
+    const char *msg = api_.error();
+    if (msg && *msg) err = std::string(": ") + msg;
+  }
+  throw std::runtime_error(std::string("ABI6 ") + operation + " failed (" + std::to_string(code) + ")" + err);
 }
 std::uint32_t TraceCapture::configure(std::span<const std::uint8_t> manifest, std::uint32_t positions, std::uint32_t expected_leaves) {
   require(!manifest.empty() && manifest.size() <= (1U << 20) && positions && positions <= context_,

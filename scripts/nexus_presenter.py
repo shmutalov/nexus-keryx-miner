@@ -3,13 +3,34 @@ import re
 import time
 
 
-def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None, gpu_metrics=None):
+def format_efficiency(hashrate_hs, power_w):
+    """Format mining efficiency with two decimals, mirroring upstream keryx-miner v0.6.0."""
+    try:
+        h = float(hashrate_hs) if hashrate_hs is not None else 0.0
+        p = float(power_w) if power_w is not None else 0.0
+    except (ValueError, TypeError):
+        return "N/A"
+    if h <= 0.0 or p <= 0.0:
+        return "N/A"
+    eff = h / p
+    if eff >= 1e12:
+        return f"{eff / 1e12:.2f} TH/W"
+    elif eff >= 1e9:
+        return f"{eff / 1e9:.2f} GH/W"
+    elif eff >= 1e6:
+        return f"{eff / 1e6:.2f} MH/W"
+    elif eff >= 1e3:
+        return f"{eff / 1e3:.2f} kH/W"
+    else:
+        return f"{eff:.2f} H/W"
+
+
+def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None):
     """Expose device scopes; never relabel NVIDIA-only values as fleet totals."""
     from nexus_gpu_metrics import summary, finite
     import nexus_dashboard as dashboard
-    if tab not in (0, 1): return
-    data = summary(model, gpu) if gpu_metrics is None else gpu_metrics
-    if not data['dual'] and not force: return
+    data = summary(model, gpu)
+    if (not data['dual'] and not force) or tab not in (0, 1): return
     from nexus_gpu_identity import display_devices, secondary_device, display_name
     gpu1,gpu2=display_devices(model.gpu_devices)
     name1,name2=display_name(gpu1),display_name(gpu2)
@@ -53,31 +74,67 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None, gpu_m
                   ('GPU1 / FRESH', hz(rate('rtx', window)), gpu1['name']),
                   ('GPU2 / FRESH', hz(rate('rx', window)), gpu2['name']),
                   ('FRESH Mstep/s / TOTAL', number(rate('total', window) * 256 / 1e6, ' M') if rate('total', window) is not None else 'N/A', '256 steps per fresh nonce'),
-                  ('REPORTED POWER / TOTAL', number(data['board_power_total_w'], ' W'), 'NVIDIA draw + AMD reported sensor')]
+                  ('REPORTED POWER / TOTAL', number(data['board_power_total_w'], ' W'), f"Rig: {format_efficiency(rate('total', window), data['board_power_total_w'])} · NVIDIA + AMD")]
         cards = [p for p in frame.panels if p['y'] == 6]
         for panel, (title, value, note) in zip(cards, heroes):
             panel['title'] = title; panel['rows'] = []; panel['free'] = {0: [(0, value, 'hero')], 1: [(0, note, 'muted')]}
         for panel in frame.panels:
             if panel['title'].startswith('NETWORK'):
                 panel['title'] = 'NETWORK / SHARED STATE'
-                rows_panel(panel, [('Mining / node', model.status + ' / ' + model.synced.upper()),
-                    ('DAA / job', str(model.daa) + ' / ' + str(model.last_job)),
-                    ('Fresh nonces / total', count(data['fresh_completed_total'])),
-                    ('Fresh rates / 10s / 60s', hz(rate('total', 10)) + ' / ' + hz(rate('total', 60))),
-                    ('GPU1 stale completed work', number(native.get('rates', {}).get('stale_work_fraction') * 100 if fresh and native.get('rates', {}).get('valid_stale_work_fraction') else None, '%')),
-                    ('GPU2 discarded reservations', count(lane.get('discarded')) + ' / ' + count(lane.get('attempts')) if lane else 'N/A'),
-                    ('AI service / device', model.ai_service + ' / ' + ai_device),
-                    ('Escrow claimed / ACK', dashboard.krx(model.claimed.get('payout_sompi'), italian=True)),
-                    ('Mature escrow / gross', dashboard.krx(model.escrow_available.get('amount_sompi'), italian=True))])
+                st = getattr(model, 'stratum', {}) or {}
+                is_pool = st.get('mode') == 'pool'
+                mm = getattr(model, 'mining_mode_cfg', {}) or {}
+                active_pool_id = mm.get('active_pool_id', 'suprnova')
+                active_pool_name = "Suprnova"
+                for p in mm.get('pools', []):
+                    if p.get('id') == active_pool_id:
+                        active_pool_name = p.get('name', active_pool_id)
+                        break
+                pool_conn = (st.get('state', 'CONNECTED') + (f" ({st.get('ping_ms', 0):.1f} ms)" if st.get('connected') else "")) if is_pool else (model.status + ' / ' + model.synced.upper() + ' (SOLO gRPC)')
+                if is_pool:
+                    rows = [
+                        ('Mining mode', f"POOL ({active_pool_name})"),
+                        ('Connection / ping', pool_conn),
+                        ('Active pool', f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})"),
+                        ('Pool diff / shares', f"diff {st.get('difficulty', 0):.4f} · {st.get('accepted_shares', 0)} acc / {st.get('rejected_shares', 0)} rej / {st.get('stale_shares', 0)} stale"),
+                        ('Pool last error', st.get('last_error') or 'NONE'),
+                        ('DAA / job', str(model.daa) + ' / ' + str(model.last_job)),
+                        ('Fresh nonces / total', count(data['fresh_completed_total'])),
+                        ('Fresh rates / 10s / 60s', hz(rate('total', 10)) + ' / ' + hz(rate('total', 60))),
+                        ('GPU1 stale completed work', number(native.get('rates', {}).get('stale_work_fraction') * 100 if fresh and native.get('rates', {}).get('valid_stale_work_fraction') else None, '%')),
+                        ('GPU2 discarded reservations', count(lane.get('discarded')) + ' / ' + count(lane.get('attempts')) if lane else 'N/A'),
+                        ('AI service / device', model.ai_service + ' / ' + ai_device),
+                        ('Escrow claimed / ACK', dashboard.krx(model.claimed.get('payout_sompi'), italian=True)),
+                        ('Mature escrow / gross', dashboard.krx(model.escrow_available.get('amount_sompi'), italian=True))]
+                else:
+                    rows = [
+                        ('Mining / node', pool_conn),
+                        ('DAA / job', str(model.daa) + ' / ' + str(model.last_job)),
+                        ('Fresh nonces / total', count(data['fresh_completed_total'])),
+                        ('Fresh rates / 10s / 60s', hz(rate('total', 10)) + ' / ' + hz(rate('total', 60))),
+                        ('Pool diff · shares (acc/rej)', 'N/A · SOLO'),
+                        ('Pool last error', 'NONE'),
+                        ('GPU1 stale completed work', number(native.get('rates', {}).get('stale_work_fraction') * 100 if fresh and native.get('rates', {}).get('valid_stale_work_fraction') else None, '%')),
+                        ('GPU2 discarded reservations', count(lane.get('discarded')) + ' / ' + count(lane.get('attempts')) if lane else 'N/A'),
+                        ('AI service / device', model.ai_service + ' / ' + ai_device),
+                        ('Escrow claimed / ACK', dashboard.krx(model.claimed.get('payout_sompi'), italian=True)),
+                        ('Mature escrow / gross', dashboard.krx(model.escrow_available.get('amount_sompi'), italian=True))]
+                rows_panel(panel, rows)
             elif panel['title'].startswith('BLOCK'):
-                panel['title']='BLOCK PIPELINE / THIS SESSION'
+                st = getattr(model, 'stratum', {}) or {}
+                is_pool = st.get('mode') == 'pool'
+                panel['title']='BLOCK & SHARE PIPELINE' if is_pool else 'BLOCK PIPELINE / THIS SESSION'
                 table=[('Rust winners',model.gpu_winners['rtx'],model.gpu_winners['rx'],sum(model.gpu_winners.values()))]
                 table += [(name,model.gpu_block_stats['rtx'][key],model.gpu_block_stats['rx'][key],model.stats[key])
                           for name,key in [('Submitted','submit_sent'),('RPC acknowledged','rpc_ack'),
                           ('DAG observed','chain_observed'),('Chain confirmed','chain_confirmed'),('RPC rejected','rpc_rejected')]]
                 table.append(('Unattributed DAG','—','—',model.gpu_block_unknown['chain_observed']))
+                if is_pool:
+                    table.append(('Pool accepted / rejected', '—', '—', f"{st.get('accepted_shares', 0)} / {st.get('rejected_shares', 0)}"))
+                    table.append(('Pool stale / diff', '—', '—', f"{st.get('stale_shares', 0)} / {st.get('difficulty', 0):.4f}"))
+                    table.append(('Pool ping / error', '—', '—', f"{st.get('ping_ms', 0):.1f} ms / {st.get('last_error') or 'NONE'}"))
                 rows_panel(panel,[(row[0],' / '.join(str(x) for x in row[1:])) for row in table])
-                panel['table_columns']=[name1,name2,'Total']
+                panel['table_columns']=['PIPELINE', name1, name2, 'TOTAL']
                 panel['table_rows']=[[str(x) for x in row] for row in table]
             elif panel['title'] == 'GPU / AI SERVICE':
                 panel['title'] = 'GPU FLEET / AI'
@@ -100,6 +157,7 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None, gpu_m
             ('AI service device', ai_device),
             ('Load / clock', number(nvidia.get('util'), '%') + ' / ' + number(nvidia.get('clock'), ' MHz')),
             ('Temp / power', number(nvidia.get('temp'), ' C') + ' / ' + number(nvidia.get('power'), ' W')),
+            ('Efficiency (2-dec)', format_efficiency(rate('rtx', 10), nvidia.get('power'))),
             ('VRAM used / total', number(nvidia.get('used') / 1024 if nvidia else None, ' GiB') + ' / ' + number(nvidia.get('total') / 1024 if nvidia else None, ' GiB')),
             ('All rate · 10 / 60s', hz(dashboard.pom_hashrate(model, '10s')) + ' / ' + hz(dashboard.pom_hashrate(model, '60s'))),
             ('Fresh rate · 1 / 10 / 60s', series('rtx')), ('Mstep/s · 10 / 60s', steps('rtx')),
@@ -117,6 +175,7 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None, gpu_m
             ('Mining state', state),
             ('Load / clock', number(metrics.get('utilization_pct'), '%') + ' / ' + number(metrics.get('graphics_clock_mhz'), ' MHz')),
             ('Temp / power', number(metrics.get('temperature_c'), ' C') + ' / ' + number(metrics.get('power_w'), ' W')),
+            ('Efficiency (2-dec)', format_efficiency(rate('rx', 10), metrics.get('power_w'))),
             ('VRAM used / total', number(metrics.get('vram_used_bytes') / 2**30 if metrics.get('vram_used_bytes') is not None else None, ' GiB') + ' / ' + number(amd.get('vram_bytes') / 2**30 if amd.get('vram_bytes') is not None else None, ' GiB')),
             ('All rate incl. stale', 'N/A · not published'),
             ('Fresh rate · 1 / 10 / 60s', series('rx')), ('Mstep/s · 10 / 60s', steps('rx')),
@@ -138,16 +197,16 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None, gpu_m
         from nexus_gpu_registry import automatic_workload,WORKLOADS
         requested = (preferences or {}).get('workloads', {}).get(gpu1.get('id'), 'auto')
         observed = getattr(model,'pom_backend',{}).get('backend') if fresh else None
-        actual_workload = {'cuda-driver':'nvidia','vulkan-jit':'nexus','vulkan-bda':'nexus_bda'}.get(observed)
+        actual_workload = {'cuda-driver':'nvidia','vulkan-jit':'nexus','vulkan-bda':'nexus_bda','vulkan-rdna3':'nexus_rdna3'}.get(observed)
         rtx_rows.insert(1,('Workload',WORKLOADS.get(actual_workload,'N/A / awaiting native acknowledgement')))
-        rtx_rows.insert(2,('PoM execution backend',{'cuda-driver':'CUDA Driver API','vulkan-jit':'JIT / Vulkan','vulkan-bda':'Nexus Native (BDA Vulkan)'}.get(observed,'N/A / no live backend acknowledgement')))
-        if gpu1.get('vendor', '').lower() == 'nvidia' and requested in ('nexus', 'nexus_bda') and observed not in ('vulkan-jit', 'vulkan-bda'):
+        rtx_rows.insert(2,('PoM execution backend',{'cuda-driver':'CUDA Driver API','vulkan-jit':'JIT / Vulkan','vulkan-bda':'Nexus Native (BDA Vulkan)','vulkan-rdna3':'Nexus RDNA3 (Vulkan WMMA)'}.get(observed,'N/A / no live backend acknowledgement')))
+        if gpu1.get('vendor', '').lower() == 'nvidia' and requested in ('nexus', 'nexus_bda', 'nexus_rdna3') and observed not in ('vulkan-jit', 'vulkan-bda', 'vulkan-rdna3'):
             rtx_rows.insert(3, ('Vulkan admission', 'BLOCKED / awaiting attested worker restart; no CUDA fallback'))
-        if observed in ('vulkan-jit', 'vulkan-bda'):
+        if observed in ('vulkan-jit', 'vulkan-bda', 'vulkan-rdna3'):
             unsupported={'Kernel / H2D / D2H','Gather · wall / CPU','Merkle · wall / CPU','Proof build / Rust'}
             rtx_rows=[(name,'N/A / Vulkan phase timing not published') if name in unsupported else (name,value) for name,value in rtx_rows]
         secondary_backend = (model.amd_lane or {}).get('backend') if fresh else None
-        rx_rows.insert(1,('Workload',{'vulkan-jit':WORKLOADS['nexus'],'vulkan-bda':WORKLOADS['nexus_bda']}.get(secondary_backend,'N/A / awaiting native acknowledgement')))
+        rx_rows.insert(1,('Workload',{'vulkan-jit':WORKLOADS['nexus'],'vulkan-bda':WORKLOADS['nexus_bda'],'vulkan-rdna3':WORKLOADS['nexus_rdna3']}.get(secondary_backend,'N/A / awaiting native acknowledgement')))
         rx_rows.insert(2,('Requested workload',WORKLOADS.get((preferences or {}).get('workloads',{}).get(gpu2.get('id'),'auto'),'Automatic')))
 
         rtx_rows=metered(rtx_rows,nvidia.get('util'),nvidia.get('used'),nvidia.get('total'))
@@ -160,14 +219,30 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None, gpu_m
             rows_panel(p, rows); return p
         second=panel(name2+' / DEVICE VALUES',rx_rows);second['device_id']=gpu2.get('id');frame.panels.append(second)
         used, cap = data['vram_used_total_bytes'], data['vram_capacity_total_bytes']
-        frame.panels.append(panel('TOTALS / MATCHED UNITS AND WINDOWS', [
+        totals_rows = [
             ('Fresh hashes/s / 1 / 10 / 60s', series('total')),
             ('Fresh Mstep/s / 10 / 60s', steps('total')),
             ('Fresh completed nonces / sum', count(data['fresh_completed_total'])),
             ('Reported power sum / hottest', number(data['board_power_total_w'], ' W') + ' / ' + number(data['hottest_c'], ' C')),
+            ('Rig efficiency (2-dec)', format_efficiency(rate('total', 10), data['board_power_total_w'])),
             ('VRAM used / capacity sum', number(used / 2**30 if used is not None else None, ' GiB') + ' / ' + number(cap / 2**30 if cap is not None else None, ' GiB') + ' / not pooled'),
             ('Combined all-work / stale %', 'N/A / AMD completed-stale counters missing'),
-        ], y=30, x=1))
+        ]
+        st = getattr(model, 'stratum', {}) or {}
+        is_pool = st.get('mode') == 'pool'
+        if is_pool:
+            mm = getattr(model, 'mining_mode_cfg', {}) or {}
+            active_pool_id = mm.get('active_pool_id', 'suprnova')
+            active_pool_name = "Suprnova"
+            for p in mm.get('pools', []):
+                if p.get('id') == active_pool_id:
+                    active_pool_name = p.get('name', active_pool_id)
+                    break
+            totals_rows.insert(0, ('Mining mode / pool', f"POOL ({active_pool_name}) · {st.get('state', 'CONNECTED')} ({st.get('ping_ms', 0):.1f} ms)"))
+            totals_rows.insert(1, ('Active pool endpoint', f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})"))
+            totals_rows.insert(2, ('Pool diff / shares', f"diff {st.get('difficulty', 0):.4f} · {st.get('accepted_shares', 0)} acc / {st.get('rejected_shares', 0)} rej / {st.get('stale_shares', 0)} stale"))
+            totals_rows.insert(3, ('Pool last error', st.get('last_error') or 'NONE'))
+        frame.panels.append(panel('TOTALS / MATCHED UNITS AND WINDOWS', totals_rows, y=30, x=1))
 
     if not amd:
         for panel in frame.panels:
@@ -203,7 +278,8 @@ def rig_panels(frame, model, gpu, tab, preferences):
     backend = getattr(model, 'pom_backend', {}).get('backend') if fresh else None
     backend_names = {'cuda-driver': 'NVIDIA / CUDA Driver',
                      'vulkan-jit': 'Nexus / JIT + Vulkan',
-                     'vulkan-bda': 'Nexus Native / BDA Vulkan'}
+                     'vulkan-bda': 'Nexus Native / BDA Vulkan',
+                     'vulkan-rdna3': 'Nexus RDNA3 (Vulkan WMMA)'}
 
     def number(value, suffix='', decimals=1):
         if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
@@ -215,6 +291,7 @@ def rig_panels(frame, model, gpu, tab, preferences):
 
     cards = []
     capacities = []
+    powers = []
     measured = 0
     eligible = 0
     observed_rates = []
@@ -248,6 +325,9 @@ def rig_panels(frame, model, gpu, tab, preferences):
         vram_ratio = min(100, round(used / capacity * 100)) if (
             type(used) in (int, float) and math.isfinite(used) and
             type(capacity) in (int, float) and math.isfinite(capacity) and capacity > 0) else None
+        p_val = metrics.get('power_w') if metrics.get('power_w') is not None else metrics.get('power')
+        if type(p_val) in (int, float) and math.isfinite(p_val) and p_val > 0:
+            powers.append(p_val)
 
         rate_value = None
         if lane in ('rtx', 'rx'):
@@ -280,6 +360,7 @@ def rig_panels(frame, model, gpu, tab, preferences):
                 'value', vram_ratio),
             row('GPU load', number(util, '%'), 'value', util_ratio),
             row('Temperature / power', number(metrics.get('temperature_c'), ' °C') + ' / ' + number(metrics.get('power_w'), ' W')),
+            row('Efficiency (2-dec)', format_efficiency(rate_value, metrics.get('power_w'))),
             row('Fresh PoM rate', dashboard.format_hashrate(rate_value), 'value'),
         ]
         cards.append({'title': title, 'y': 0, 'x': 0, 'h': len(rows) + 2, 'w': 1,
@@ -288,15 +369,37 @@ def rig_panels(frame, model, gpu, tab, preferences):
     reported_rate = sum(observed_rates) if observed_rates else None
     capacity_sum = sum(capacities) if capacities else None
     mode = preferences.get('gpu_view', 'auto').upper()
+    st = getattr(model, 'stratum', {}) or {}
+    is_pool = st.get('mode') == 'pool'
+    mm = getattr(model, 'mining_mode_cfg', {}) or {}
+    active_pool_id = mm.get('active_pool_id', 'suprnova')
+    active_pool_name = "Suprnova"
+    for p in mm.get('pools', []):
+        if p.get('id') == active_pool_id:
+            active_pool_name = p.get('name', active_pool_id)
+            break
+    pool_conn = (st.get('state', 'CONNECTED') + (f" ({st.get('ping_ms', 0):.1f} ms)" if st.get('connected') else "")) if is_pool else "SOLO gRPC"
+
     summary_rows = [
         row('Display mode', 'MINER RIG · ' + mode),
+        row('Mining mode', f"POOL ({active_pool_name})" if is_pool else "SOLO (gRPC)"),
+    ]
+    if is_pool:
+        summary_rows.extend([
+            row('Active pool', f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})"),
+            row('Pool diff / shares', f"diff {st.get('difficulty', 0):.4f} · {st.get('accepted_shares', 0)} acc / {st.get('rejected_shares', 0)} rej / {st.get('stale_shares', 0)} stale"),
+            row('Connection / ping', pool_conn),
+            row('Pool last error', st.get('last_error') or 'NONE'),
+        ])
+    summary_rows.extend([
         row('Inventory entries', str(len(devices))),
         row('GPUs with at least 7 GiB', f'{eligible} · automatic rig threshold: 3'),
         row('Load telemetry', f'{measured} / {len(devices)} devices reported'),
         row('Fresh PoM · reported lanes', dashboard.format_hashrate(reported_rate) if reported_rate is not None else 'N/A · no fresh lane rates'),
+        row('Fleet power / efficiency', f"{number(sum(powers) if powers else None, ' W')} · {format_efficiency(reported_rate, sum(powers) if powers else None)}"),
         row('VRAM capacity sum', number(capacity_sum / 2**30 if capacity_sum is not None else None, ' GiB · not pooled')),
         row('GPU admission', 'Display only · no workload or GPU selection changed', 'muted'),
-    ]
+    ])
     summary = {'title': 'MINER RIG / FLEET SUMMARY', 'y': 0, 'x': 0,
                'h': len(summary_rows) + 2, 'w': 1, 'rows': summary_rows,
                'free': {}, 'kind': 'rig-summary'}
@@ -304,6 +407,10 @@ def rig_panels(frame, model, gpu, tab, preferences):
     if tab == 1:
         frame.panels = [summary, *cards]
         return
+
+    from nexus_gpu_identity import display_devices, display_name
+    gpu1, gpu2 = display_devices(model.gpu_devices)
+    name1, name2 = display_name(gpu1), display_name(gpu2)
 
     network = next((p for p in frame.panels if p['title'].startswith('NETWORK')), None)
     pipeline = next((p for p in frame.panels if p['title'].startswith('BLOCK')), None)
@@ -314,8 +421,25 @@ def rig_panels(frame, model, gpu, tab, preferences):
             continue
         clone = dict(panel)
         clone['kind'] = kind
-        if kind == 'rig-network': clone['title'] = 'NETWORK / SHARED MINER STATE'
-        if kind == 'rig-activity': clone['title'] = 'LATEST ACTIVITY'
+        if kind == 'rig-network':
+            clone['title'] = 'NETWORK / SHARED MINER STATE'
+        elif kind == 'rig-pipeline':
+            clone['title'] = 'BLOCK & SHARE PIPELINE' if is_pool else 'BLOCK PIPELINE / THIS SESSION'
+            table = [('Rust winners', model.gpu_winners['rtx'], model.gpu_winners['rx'], sum(model.gpu_winners.values()))]
+            table += [(name, model.gpu_block_stats['rtx'][key], model.gpu_block_stats['rx'][key], model.stats[key])
+                      for name, key in [('Submitted', 'submit_sent'), ('RPC acknowledged', 'rpc_ack'),
+                      ('DAG observed', 'chain_observed'), ('Chain confirmed', 'chain_confirmed'), ('RPC rejected', 'rpc_rejected')]]
+            table.append(('Unattributed DAG', '—', '—', model.gpu_block_unknown['chain_observed']))
+            if is_pool:
+                table.append(('Pool accepted / rejected', '—', '—', f"{st.get('accepted_shares', 0)} / {st.get('rejected_shares', 0)}"))
+                table.append(('Pool stale / diff', '—', '—', f"{st.get('stale_shares', 0)} / {st.get('difficulty', 0):.4f}"))
+                table.append(('Pool ping / error', '—', '—', f"{st.get('ping_ms', 0):.1f} ms / {st.get('last_error') or 'NONE'}"))
+            clone['rows'] = [(row[0], ' / '.join(str(x) for x in row[1:]), 'value', None) for row in table]
+            clone['free'] = {}
+            clone['table_columns'] = ['PIPELINE', name1, name2, 'TOTAL']
+            clone['table_rows'] = [[str(x) for x in row] for row in table]
+        elif kind == 'rig-activity':
+            clone['title'] = 'LATEST ACTIVITY'
         preserved.append(clone)
     frame.panels = [summary, *cards, *preserved]
 
@@ -358,7 +482,7 @@ class NativeFrame:
 
 
 
-def build_presenter_frame(height, width, model, gpu, tab, log_filter='ALL', preferences=None, gpu_metrics=None, log_before=None):
+def build_presenter_frame(height, width, model, gpu, tab, log_filter='ALL', preferences=None, log_before=None):
     import nexus_dashboard as dashboard
     from nexus_ui_preferences import load, resolved_view, large_gpu_count
     preferences = load() if preferences is None else preferences
@@ -405,7 +529,7 @@ def build_presenter_frame(height, width, model, gpu, tab, log_filter='ALL', pref
     if effective == 'rig' and tab in (0, 1):
         rig_panels(frame, model, gpu, tab, preferences)
     elif tab == 1 or (tab == 0 and effective == 'dual'):
-        dual_gpu_panels(frame, model, gpu, tab, force=tab == 0, preferences=preferences, gpu_metrics=gpu_metrics)
+        dual_gpu_panels(frame, model, gpu, tab, force=tab == 0, preferences=preferences)
     elif tab == 0 and model.gpu_devices.get('amd_devices'):
         cards=[p for p in frame.panels if p['y']==6]
         if cards:cards[0]['title']='PoM HASHRATE / PRIMARY GPU'

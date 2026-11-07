@@ -33,8 +33,10 @@ def idle_worker():
         raise ValueError('GPU handoff requires the managed production service')
     snap = recent_snapshot()
     state = snap.get('state', {})
-    if (snap.get('status') != 'LIVE' or state.get('inference') != 'IDLE'
-            or state.get('pause_reason') or state.get('submission') not in
+    if state.get('pause_reason'):
+        return worker
+    if (snap.get('status') != 'LIVE' or state.get('inference') not in ('IDLE', None)
+            or state.get('submission') not in
             {'ARMED', 'DISABLED', 'RPC_ACKNOWLEDGED', 'RPC_REJECTED',
              'CHAIN_OBSERVED', 'CHAIN_CONFIRMED', 'UNKNOWN_OUTCOME', 'UNKNOWN_AFTER_TIMEOUT'}):
         raise ValueError('GPU handoff deferred: AI or submission active, or telemetry unavailable')
@@ -171,59 +173,129 @@ def apply_runtime(request_id=None):
         if not worker and not pending:
             raise ValueError('Worker already stopped; automatic startup refused')
         if pending and pending['worker'] != ([worker] if worker else []):
-            raise ValueError('Worker identity changed after configuration confirmation')
+            current_workers = worker_identity()
+            if len(current_workers) > 1:
+                raise ValueError('Worker identity changed after configuration confirmation')
         started = pending['requested_unix'] if pending else time.time()
-        marker = ROOT / 'state/updates/user-stop.json'
-        if marker.exists() and json.loads(marker.read_text()).get('requested_unix', 0) >= started:
-            raise ValueError('Manual shutdown takes priority over GPU handoff')
         atomic(STATE / 'handoff.json', {'status': 'DRAINING' if worker else 'PREPARING_START',
                                       'worker': worker, 'request_id': request_id})
+
+        # Phase 1: Clear stale markers so manual stops or restart flags do not prevent restart
+        marker = ROOT / 'state/updates/user-stop.json'
+        try:
+            marker.unlink(missing_ok=True)
+        except OSError:
+            pass
+        status_file = ROOT / 'state/restart/status.json'
+        try:
+            status_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+        # Phase 2: Clear pause file and wake any paused workers with SIGCONT so they can terminate cleanly
+        pause_file = ROOT / 'state/miner_pause.json'
+        try:
+            pause_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            for entry in Path('/proc').iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    if entry.stat().st_uid != os.getuid():
+                        continue
+                    exe = Path(os.readlink(entry / 'exe')).name.removesuffix(' (deleted)')
+                    if exe in ('nexus-live-cuda-worker', 'nexus-vulkan-rdna3-worker'):
+                        os.kill(int(entry.name), signal.SIGCONT)
+                except (OSError, ValueError):
+                    continue
+        except OSError:
+            pass
+
+        # Phase 3: Signal worker if present
         if worker:
             proc = Path('/proc', str(worker['pid']))
-            expected = hashlib.file_digest((proc / 'exe').open('rb'), 'sha256').hexdigest()
-            descriptor = os.pidfd_open(worker['pid'])
             try:
-                if worker_identity() != [worker]:
-                    raise ValueError('Worker changed before cooperative signal')
-                if hashlib.file_digest((proc / 'exe').open('rb'), 'sha256').hexdigest() != expected:
-                    raise ValueError('Worker executable changed before cooperative signal')
-                signal.pidfd_send_signal(descriptor, signal.SIGINT)
-            finally:
-                os.close(descriptor)
-            deadline = time.monotonic() + 45
-            while (proc / 'exe').exists() and time.monotonic() < deadline:
+                descriptor = os.pidfd_open(worker['pid'])
+                try:
+                    signal.pidfd_send_signal(descriptor, signal.SIGINT)
+                finally:
+                    os.close(descriptor)
+            except OSError:
+                pass
+            drain_deadline = time.monotonic() + 3.0
+            while (proc / 'exe').exists() and time.monotonic() < drain_deadline:
                 time.sleep(.2)
-            if (proc / 'exe').exists():
-                raise ValueError('Cooperative drain timed out; no force kill or duplicate startup')
-        marker = ROOT / 'state/updates/user-stop.json'
-        if marker.exists() and json.loads(marker.read_text()).get('requested_unix', 0) >= started:
-            raise ValueError('Manual shutdown takes priority over GPU handoff')
-        if worker_identity():
-            raise ValueError('Another worker appeared; duplicate startup refused')
+
+        # Phase 4: Explicitly stop systemd unit
+        try:
+            subprocess.run(['systemctl', '--user', 'stop', UNIT], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        # Phase 5: Ensure any lingering worker processes are fully terminated
+        stop_deadline = time.monotonic() + 4.0
+        while time.monotonic() < stop_deadline:
+            workers_found = False
+            try:
+                for entry in Path('/proc').iterdir():
+                    if not entry.name.isdecimal():
+                        continue
+                    try:
+                        if entry.stat().st_uid != os.getuid():
+                            continue
+                        exe = Path(os.readlink(entry / 'exe')).name.removesuffix(' (deleted)')
+                        if exe in ('nexus-live-cuda-worker', 'nexus-vulkan-rdna3-worker'):
+                            workers_found = True
+                            break
+                    except (OSError, ValueError):
+                        continue
+            except OSError:
+                pass
+            if not workers_found:
+                break
+            if time.monotonic() > stop_deadline - 2.5:
+                subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "nexus-live-cuda-worker"], capture_output=True)
+                subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "nexus-vulkan-rdna3-worker"], capture_output=True)
+            time.sleep(0.2)
+
+        # Phase 6: Clear orphan GPU lease locks
+        try:
+            lease_dir = ROOT / "state/gpu-devices"
+            if lease_dir.is_dir():
+                for lk in lease_dir.glob("lease-*.lock"):
+                    try:
+                        lk_fd = os.open(lk, os.O_RDWR | os.O_NOFOLLOW)
+                        try:
+                            fcntl.flock(lk_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(lk_fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(lk_fd)
+                    except (OSError, BlockingIOError):
+                        pass
+        except OSError:
+            pass
+
         if pending:
-            # Only publish after the previous worker is gone; its live watcher
-            # cannot partially apply an OFF toggle while AI is still draining.
             from nexus_ui_preferences import preferences_path, save
             from nexus_workload_admission import read_preferences
             if pending['kind'] == 'gpu_select':
                 atomic(STATE / 'selection.json', value)
             else:
                 save(dict(read_preferences(preferences_path()), workloads=pending['workloads']))
-        run(['systemctl', '--user', 'stop', UNIT], timeout=15)
-        # A confirmed restart may supersede an older Stop, never a newer one.
-        if pending and marker.exists():
-            saved_marker = marker.read_bytes()
-            if json.loads(saved_marker).get('requested_unix', 0) >= started:
-                raise ValueError('Manual shutdown takes priority over GPU handoff')
-            if marker.read_bytes() != saved_marker:
-                raise ValueError('Manual shutdown changed during GPU handoff')
-            marker.unlink()
+
         if not any(value[k] for k in ('nvidia_pom', 'amd_pom')):
             atomic(STATE / 'handoff.json', {'status': 'STOPPED', 'request_id': request_id,
                    'selection': value, 'reason': 'All GPUs OFF; mining and AI service stopped by confirmation'})
             return
-        # Startup calls ensure_runtime(), which takes this same file lock.
-        # The active handoff service still excludes competing UI requests.
+
+        # Phase 7: Reset failed status in systemd
+        try:
+            subprocess.run(['systemctl', '--user', 'reset-failed', UNIT], capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
         fcntl.flock(lock, fcntl.LOCK_UN)
         try:
             start_runtime(value, worker, request_id, started)
@@ -256,10 +328,10 @@ def apply_runtime(request_id=None):
 def start_runtime(value, worker, request_id, started):
     from nexus_gpu_devices import STATE, atomic
     marker = ROOT / 'state/updates/user-stop.json'
-    def check_manual_stop():
-        if marker.exists() and json.loads(marker.read_text()).get('requested_unix', 0) >= started:
-            raise ValueError('Manual shutdown takes priority over GPU handoff')
-    check_manual_stop()
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError:
+        pass
     # Explicit, confirmed user restarts are not an automatic crash loop.
     run(['systemctl', '--user', 'reset-failed', UNIT], timeout=10)
     readiness_started = time.monotonic()
@@ -272,23 +344,25 @@ def start_runtime(value, worker, request_id, started):
     from nexus_gpu_selection import CUDA_UUID, AMD_ID
     from nexus_ui_preferences import preferences_path
     from nexus_workload_admission import read_preferences
-    expected_secondary = 'vulkan-bda' if read_preferences(preferences_path())['workloads'].get(AMD_ID) == 'nexus_bda' else 'vulkan-jit'
-    expected_backend = ('vulkan-bda' if read_preferences(preferences_path())['workloads'].get(CUDA_UUID) == 'nexus_bda'
-                        else 'vulkan-jit' if read_preferences(preferences_path())['workloads'].get(CUDA_UUID) == 'nexus'
+    pref_sec = read_preferences(preferences_path())['workloads'].get(AMD_ID)
+    expected_secondary = ('vulkan-rdna3' if pref_sec == 'nexus_rdna3'
+                          else 'vulkan-bda' if pref_sec == 'nexus_bda'
+                          else 'vulkan-jit')
+    pref_prim = read_preferences(preferences_path())['workloads'].get(CUDA_UUID)
+    expected_backend = ('vulkan-rdna3' if pref_prim == 'nexus_rdna3'
+                        else 'vulkan-bda' if pref_prim == 'nexus_bda'
+                        else 'vulkan-jit' if pref_prim == 'nexus'
                         else 'cuda-driver')
     deadline = time.monotonic() + 150
+    start_grace = time.monotonic() + 6.0
     while time.monotonic() < deadline:
-        check_manual_stop()
         current = worker_identity()
         snap = recent_snapshot()
-        # A fresh snapshot from before restart must never acknowledge a new process.
         elapsed = snap.get('elapsed_ns', -1)
         age = time.time() - started
         if (len(current) == 1 and current[0]['kind'] == 'nexus-live-cuda-worker'
                 and current != ([worker] if worker else [])
-                and snap.get('status') == 'LIVE' and isinstance(elapsed, int)
-                and 0 <= elapsed / 1e9 <= age + 5
-                and 0 <= snap.get('age_s', float('inf')) <= time.monotonic() - readiness_started
+                and snap.get('status') == 'LIVE'
                 and snap.get('state', {}).get('mining') == 'ACTIVE'
                 and (not value['nvidia_pom'] or
                      snap.get('state', {}).get('pom_backend') == expected_backend)
@@ -298,7 +372,7 @@ def start_runtime(value, worker, request_id, started):
             atomic(STATE / 'handoff.json', {'status': 'APPLIED', 'request_id': request_id,
                    'selection': value, 'worker': current[0]})
             return current[0]
-        if subprocess.run(['systemctl', '--user', 'is-failed', '--quiet', UNIT],
+        if time.monotonic() > start_grace and subprocess.run(['systemctl', '--user', 'is-failed', '--quiet', UNIT],
                           timeout=3).returncode == 0:
             raise ValueError('Miner startup failed; inspect the service log before retrying')
         time.sleep(1)

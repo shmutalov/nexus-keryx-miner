@@ -156,3 +156,4 @@ extern "C" __global__ void path_register_search(
         if (pom_le_leq(pv, t0, t1, t2, t3)) atomicMin(winner, nonce);
     }
 }
+

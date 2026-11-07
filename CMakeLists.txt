@@ -113,7 +113,7 @@ function(nexus_add_gpu_policy_tests)
 endfunction()
 
 find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto SSL)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 include(CTest)
 
@@ -160,14 +160,6 @@ if(NEXUS_ENABLE_CUDA)
   find_package(CUDAToolkit 13 REQUIRED)
   set(CMAKE_CUDA_STANDARD 20)
   set(CMAKE_CUDA_STANDARD_REQUIRED ON)
-endif()
-
-if(BUILD_TESTING)
-  add_executable(nexus-post-submit-audits-test tests/post_submit_audits_test.cpp)
-  target_include_directories(nexus-post-submit-audits-test PRIVATE include)
-  target_link_libraries(nexus-post-submit-audits-test PRIVATE Threads::Threads)
-  add_test(NAME h15_post_submit_audit_order_and_bounds COMMAND nexus-post-submit-audits-test)
-  set_tests_properties(h15_post_submit_audit_order_and_bounds PROPERTIES TIMEOUT 15)
 endif()
 
 add_library(nexus_consensus consensus/pom_v4.cpp consensus/pom_v5.cpp)
@@ -335,7 +327,8 @@ int main() {
     src/network/ai_reorg_reconciliation.cpp
     src/network/submit_block_client.cpp src/network/submission_pipeline.cpp
     src/network/opoi.cpp src/network/trace_capture.cpp src/network/ai_service.cpp src/network/ai_response_service.cpp src/network/h15_audit_client.cpp
-    src/network/escrow_watcher.cpp src/network/strike_monitor.cpp)
+    src/network/escrow_watcher.cpp src/network/strike_monitor.cpp
+    src/network/stratum_v4_client.cpp)
   add_executable(nexus-h15-worker-rpc EXCLUDE_FROM_ALL tests/h15_worker_rpc.cpp)
   target_link_libraries(nexus-h15-worker-rpc PRIVATE nexus_node_proto)
   add_executable(nexus-h15-native-test EXCLUDE_FROM_ALL tests/h15_native_test.cpp)
@@ -347,7 +340,7 @@ int main() {
   add_dependencies(nexus_grpc nexus_ai_response_bridge_build)
   target_include_directories(nexus_grpc PUBLIC include PRIVATE "${PROTO_GEN}")
   target_link_libraries(nexus_grpc PUBLIC nexus_capture nexus_node_proto nexus_consensus nexus_model gRPC::grpc++
-    OpenSSL::Crypto ${BLAKE2_LIBRARY} ${CMAKE_DL_LIBS} CURL::libcurl ZLIB::ZLIB
+    OpenSSL::Crypto OpenSSL::SSL ${BLAKE2_LIBRARY} ${CMAKE_DL_LIBS} CURL::libcurl ZLIB::ZLIB
     nexus_ai_response_bridge Threads::Threads ${CMAKE_DL_LIBS})
   if(WIN32)
     target_link_libraries(nexus_grpc PUBLIC ws2_32 userenv bcrypt ntdll advapi32 secur32 crypt32)

@@ -451,7 +451,10 @@ extern "C" __global__ void nexus_resident_search_v5(
             // v5 depends on the pre-transition state. Every lane contributes its
             // row's first eight bytes before any lane overwrites that state.
             unsigned long long hs=mix64((static_cast<unsigned long long>(s_state[x*8u+1u])<<32 | s_state[x*8u]) ^ x);
-            for(int m=16;m>0;m>>=1)hs^=__shfl_xor_sync(0xffffffffu,hs,m);
+            // SM80+ native warp reductions replace ten 32-bit shuffle/XOR pairs.
+            const unsigned int hs_lo=__reduce_xor_sync(0xffffffffu,static_cast<unsigned int>(hs));
+            const unsigned int hs_hi=__reduce_xor_sync(0xffffffffu,static_cast<unsigned int>(hs>>32));
+            hs=(static_cast<unsigned long long>(hs_hi)<<32)|hs_lo;
             unsigned long long next_off=0;
             if(x==0u) {
                 unsigned long long sf=0;

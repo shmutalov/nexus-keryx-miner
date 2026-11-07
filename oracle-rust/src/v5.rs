@@ -8,6 +8,9 @@ use keryx_consensus_core::{
 };
 use std::{fs, path::Path};
 
+pub const POM_V5_PAD_TILES_H16: [u64; 5] = [434_176, 3_008_512, 4_599_808, 6_266_880, 2_245_632];
+pub const H16_ACTIVATION_DAA: u64 = 147_000_000;
+
 pub fn verify(path: &Path, real: bool) {
     assert!(
         fs::metadata(path).expect("v5 artifact metadata").len() <= 2 * 1024 * 1024,
@@ -46,9 +49,14 @@ pub fn verify(path: &Path, real: bool) {
         assert_eq!(model, anchor.model_id, "v5 official model ID");
         assert_eq!(root, anchor.root, "v5 official model root");
         assert_eq!(chunks, anchor.chunks, "v5 official model chunk count");
+        let expected_pad = if daa >= H16_ACTIVATION_DAA {
+            POM_V5_PAD_TILES_H16[tier as usize]
+        } else {
+            params::POM_V5_PAD_TILES_H14[tier as usize]
+        };
         assert_eq!(
             pads,
-            params::POM_V5_PAD_TILES_H14[tier as usize],
+            expected_pad,
             "v5 official pad geometry"
         );
     }
@@ -281,7 +289,12 @@ mod tests {
             params::POM_V5_PAD_TILES_H14,
             [638976, 3213312, 4804608, 6471680, 2450432]
         );
+        assert_eq!(
+            POM_V5_PAD_TILES_H16,
+            [434176, 3008512, 4599808, 6266880, 2245632]
+        );
         assert_eq!(params::H15_ACTIVATION_DAA, 140115000);
+        assert_eq!(H16_ACTIVATION_DAA, 147000000);
         let seed = pom_v5::v5_pad_seed(1, &[7; 32], &[9; 32]);
         let entry = pom_v5::v5_pad_entry(&seed, 5);
         assert_eq!(

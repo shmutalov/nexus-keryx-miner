@@ -156,6 +156,88 @@ pub unsafe extern "C" fn nexus_h15_prefix(
     })
 }
 /// # Safety
+/// `window_seed` spans 32 readable bytes. `n` must initially contain the writable i32-element
+/// capacity of `out`; `n` and `out` must be writable and aligned.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_h15_block_task_tokens(
+    tier: u8,
+    window_seed: *const u8,
+    out: *mut i32,
+    n: *mut usize,
+) -> i32 {
+    guard(|| {
+        if n.is_null() || out.is_null() {
+            return Err("missing block task token buffer".into());
+        }
+        let seed: Hash = unsafe { view(window_seed, 32, 32) }?.try_into().unwrap();
+        let (_, pctx) = p::chain_ctx(tier).ok_or("unsupported tier")?;
+        let tokens: Vec<i32> =
+            keryx_verifiable_inference::block_task::task_tokens(&pctx.table, &seed)
+                .into_iter()
+                .map(|t| t as i32)
+                .collect();
+        if unsafe { *n } < tokens.len() {
+            return Err("block task token capacity".into());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(tokens.as_ptr(), out, tokens.len());
+            *n = tokens.len();
+        }
+        Ok(())
+    })
+}
+/// # Safety
+/// `raw` and its nested arrays must remain readable with their declared element counts.
+/// `window_seed` spans 32 readable bytes and `out_root` spans 32 writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_h15_block_task_root(
+    raw: *const NativeCapture,
+    tier: u8,
+    window_seed: *const u8,
+    out_root: *mut u8,
+) -> i32 {
+    guard(|| {
+        if raw.is_null() || window_seed.is_null() || out_root.is_null() {
+            return Err("invalid block task capture".into());
+        }
+        let raw = unsafe { &*raw };
+        let seed: Hash = unsafe { view(window_seed, 32, 32) }?.try_into().unwrap();
+        let m = p::TierManifest::for_chain(tier).ok_or("unsupported tier")?;
+        let (_, pctx) = p::chain_ctx(tier).ok_or("unsupported tier")?;
+        let expected: Vec<i32> =
+            keryx_verifiable_inference::block_task::task_tokens(&pctx.table, &seed)
+                .into_iter()
+                .map(|t| t as i32)
+                .collect();
+        let task_len = keryx_verifiable_inference::block_task::TASK_LEN;
+        if raw.positions != task_len as usize
+            || raw.prompt_positions != task_len
+            || raw.leaves_per_position != m.n_leaves()
+        {
+            return Err("block task capture dimensions".into());
+        }
+        let tokens = unsafe { view(raw.tokens, raw.positions, 256) }?.to_vec();
+        if tokens != expected {
+            return Err("block task token mismatch".into());
+        }
+        let ubatch = unsafe { view(raw.ubatch, raw.positions, 256) }?.to_vec();
+        let leaves = unsafe {
+            view(
+                raw.leaves.cast::<Hash>(),
+                raw.positions * m.n_leaves(),
+                CAPTURE_CAP / 32,
+            )
+        }?
+        .to_vec();
+        let rec = p::TraceRecord::new_chain(&m, task_len, ubatch, leaves, &tokens)
+            .ok_or("incomplete block task trace")?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(rec.trace_root.as_ptr(), out_root, 32);
+        }
+        Ok(())
+    })
+}
+/// # Safety
 /// Pointer validity, alignment, span lengths and non-aliasing must satisfy
 /// the contract in `docs/native-ffi.md`; bounds checks cannot validate allocations.
 /// `raw` and its nested arrays must remain readable with their declared element counts. `request`

@@ -59,6 +59,11 @@ def main():
     if len(request_id) == 32 and all(c in '0123456789abcdef' for c in request_id):
         stop_record['request_id'] = request_id
     atomic(STATE / 'user-stop.json', stop_record)
+    pause_file = ROOT / 'state/setup/miner_pause.json'
+    try:
+        pause_file.unlink(missing_ok=True)
+    except OSError:
+        pass
     targets = workers()
     units = {'nexus-tauri-preview.service', 'nexus-v002-production.service', 'nexus-update-activation.service', 'nexus-tray.service', 'nexus-matrix-dashboard.service', 'nexus-matrix-explorer-readonly.service', 'nexus-agent-api.service', 'nexus-mcp.service', 'nexus-first-block-alerts.service'}
     units.update(unit for _, _, owned in targets for unit in owned)
@@ -87,6 +92,12 @@ def main():
                 os.close(fd)
             return 1
     try:
+        for pid, fd, _ in targets:
+            if not exited(fd):
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGCONT)
+                except ProcessLookupError:
+                    pass
         for pid, fd, _ in targets:
             if not exited(fd):
                 try:
