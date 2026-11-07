@@ -20,7 +20,28 @@ import time
 
 ROOT = Path(os.environ.get("NEXUS_DATA_DIR", str(Path.home() / ".local/share/nexus-keryx-miner")))
 STATE = ROOT / 'state/gpu-devices'
-CUDA_UUID = os.environ.get("NEXUS_PRIMARY_GPU_UUID", 'GPU-00000000-0000-0000-0000-000000000000')
+def _detect_primary_gpu_uuid() -> str:
+    env_uuid = (
+        os.environ.get("NEXUS_PRIMARY_GPU_UUID")
+        or os.environ.get("NEXUS_CUDA_DEVICE_UUID")
+        or os.environ.get("CUDA_VISIBLE_DEVICES")
+    )
+    if env_uuid and env_uuid != "GPU-00000000-0000-0000-0000-000000000000":
+        return env_uuid
+    try:
+        res = subprocess.run(
+            ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
+            capture_output=True, text=True, check=True, timeout=2
+        )
+        lines = [line.strip() for line in res.stdout.strip().splitlines() if line.strip()]
+        if lines:
+            return lines[0]
+    except Exception:
+        pass
+    return "GPU-00000000-0000-0000-0000-000000000000"
+
+
+CUDA_UUID = _detect_primary_gpu_uuid()
 PROBE = ROOT / 'vulkan-jit/build/bin/nexus-vulkan-device-info'
 MODES = ('disabled', 'diagnostics')
 
