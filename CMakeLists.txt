@@ -403,6 +403,15 @@ int main() {
     target_include_directories(nexus-full-vram-probe PRIVATE include)
     target_link_libraries(nexus-full-vram-probe PRIVATE CUDA::cudart OpenSSL::Crypto)
   endif()
+  if(NEXUS_ENABLE_GRPC)
+    add_executable(nexus-live-vulkan-worker src/model/live_vulkan_worker.cpp)
+    target_compile_definitions(nexus-live-vulkan-worker PRIVATE
+      NEXUS_ENABLE_VULKAN_WORKER=1
+      NEXUS_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}"
+      NEXUS_RECOVERY_ROOT="${NEXUS_RECOVERY_ROOT}")
+    target_include_directories(nexus-live-vulkan-worker PRIVATE "${PROTO_GEN}")
+    target_link_libraries(nexus-live-vulkan-worker PRIVATE nexus_grpc nexus_model nexus_consensus)
+  endif()
   if(NEXUS_LIVE_CAPTURE_DIR AND EXISTS "${NEXUS_LIVE_CAPTURE_DIR}/live-mainnet.capture")
     add_test(NAME live_template_header_consensus COMMAND nexus-live-header-capture-check
       "${CMAKE_BINARY_DIR}/test-data/live-header-vectors.bin"
