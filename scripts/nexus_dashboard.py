@@ -199,7 +199,7 @@ class DashboardModel:
         snapshot = DashboardModel()
         excluded = {'_render_cache', '_setup_check_thread', '_claim_acks', '_claim_error',
                     '_block_seen', '_block_device', '_winner_seen', '_received_request_ids', '_assigned_request_ids',
-                    '_response_lifecycle_seen'}
+                    '_response_lifecycle_seen', '_amd_ingested_events', '_amd_log_offset', '_amd_log_inode'}
         for name, value in vars(self).items():
             if name not in excluded:
                 setattr(snapshot, name, copy.deepcopy(value))
@@ -389,14 +389,14 @@ class DashboardModel:
             if "network" in obj: self.network = str(obj["network"])
             self.last_job = str(obj.get("generation", "UNKNOWN"))
             self.daa = str(obj.get("daa", "UNKNOWN"))
-        if event == "LIVE_CUDA_NONCE=PASS" or obj.get("LIVE_CUDA_NONCE") == "PASS":
+        if event in ("LIVE_CUDA_NONCE=PASS", "LIVE_H15_CUDA_NONCE=PASS") or obj.get("LIVE_CUDA_NONCE") == "PASS":
             self.stats["nonce_verified"] += 1
             self.stats["rust_valid"] += 1
             self.stats["kernels"] += 1
-        if "LIVE_CUDA_STALE_DISCARD" in event or obj.get("event") == "LIVE_CUDA_STALE_DISCARD":
+        if "CUDA_STALE_DISCARD" in event or obj.get("event") in ("LIVE_CUDA_STALE_DISCARD", "LIVE_H15_CUDA_STALE_DISCARD"):
             self.stats["stale"] += 1
         if "RUST_VERIFY_FAIL" in stripped: self.stats["rust_failed"] += 1
-        winner_lane = ('rx' if event == 'AMD_CANDIDATE_VERIFIED' else
+        winner_lane = ('rx' if event in ('AMD_CANDIDATE_VERIFIED', 'LIVE_RESIDENT_TARGET=FOUND') else
                        'rtx' if event in ('LIVE_CUDA_NONCE=PASS','LIVE_H15_CUDA_NONCE=PASS','NVIDIA_VULKAN_CANDIDATE_VERIFIED') else None)
         if (winner_lane and obj.get('target_satisfied') in (True, 'true') and
                 obj.get('rust') == 'PASS' and str(obj.get('nonce', '')).isascii() and
@@ -452,8 +452,8 @@ class DashboardModel:
                     count_once("chain_confirmed")
             self.gpu_block_unknown = {key: self.stats[key] - sum(v[key] for v in self.gpu_block_stats.values())
                                       for key in self._block_seen}
-        if event == "LIVE_CUDA_WORKER=START": self.status = "MINING"
-        if event == "LIVE_CUDA_WORKER=STOP": self.status = "WAITING"
+        if event in ("LIVE_CUDA_WORKER=START", "LIVE_H15_CUDA_WORKER=START"): self.status = "MINING"
+        if event in ("LIVE_CUDA_WORKER=STOP", "LIVE_H15_CUDA_WORKER=STOP"): self.status = "WAITING"
         if event == "INFERENCE_SELF_TEST=PASS": self.inference = "READY"
         if event == "OPOI_RUNTIME=START":
             self.inference = "BUSY"
@@ -521,6 +521,9 @@ class DashboardModel:
                 payout = wallet.get('payout_address')
                 if payout is not None and (not isinstance(payout, str) or not re.fullmatch(r"keryx:[a-z0-9]{40,120}", payout)):
                     raise ValueError("invalid worker payout address")
+            if self.native and self.native.get("_source") == "amd":
+                self.native = None
+                self.gpu_samples.clear()
             if self.native and stamp <= self.native.get("monotonic_ns", 0):
                 raise ValueError("duplicate or out-of-order monotonic timestamp")
             if self.native:
@@ -543,6 +546,8 @@ class DashboardModel:
                 self.ai_metrics['service_source'] = 'NATIVE_SAMPLED'
                 self._native_inference_start = None
             self.native = obj
+            if state.get("mining") == "ACTIVE":
+                self.status = "MINING"
             stratum = obj.get("stratum")
             if isinstance(stratum, dict):
                 self.stratum = {
@@ -849,7 +854,7 @@ def _largest_reported_phase(latency, fresh):
 
 
 def important_event(event):
-    return any(key in event for key in ("TARGET", "NONCE=PASS", "SUBMIT_RESULT", "CHAIN_STATUS", "STALE_DISCARD", "STALE_WINNER", "AI_REQUEST_ASSIGNED", "AI_RESPONSE", "CONNECT_FAILED", "WORKER=STOP"))
+    return any(key in event for key in ("TARGET", "NONCE=PASS", "SUBMIT_RESULT", "CHAIN_STATUS", "STALE_DISCARD", "STALE_WINNER", "AI_REQUEST_ASSIGNED", "AI_RESPONSE", "CONNECT_FAILED", "WORKER=STOP", "AMD_CANDIDATE", "LIVE_VULKAN", "POM_V5"))
 
 
 def event_summary(obj):
@@ -865,8 +870,8 @@ def event_summary(obj):
             try: text = f"{float(value):.2f} ms"
             except (ValueError, TypeError): continue
         fields.append(f"{key.replace('_', ' ')} {text[:100]}")
-    if event == "LIVE_TEMPLATE_PROFILE":
-        fields = [f"RPC {obj.get('grpc_request_ms', 0):.2f} ms", f"validation {obj.get('validation_ms', 0):.2f} ms"]
+    if event in ("LIVE_TEMPLATE_PROFILE", "POM_V5_DISPATCH"):
+        fields = [f"RPC {obj.get('grpc_request_ms', 0):.2f} ms", f"validation {obj.get('validation_ms', 0):.2f} ms"] if event == "LIVE_TEMPLATE_PROFILE" else [f"pad {obj.get('pad_tiles', 0)} tiles", f"batch {obj.get('batch', 0)}"]
     if event == "STARTUP_STATE": fields = [str(obj.get("state", "STARTUP")), str(obj.get("result", "UNKNOWN"))]
     return " · ".join(fields) or event.replace("_", " ")
 
@@ -896,7 +901,7 @@ def event_matches(event, selected, obj=None):
         if any(value in ('FAILED', 'FAIL', 'ERROR', 'BLOCKED', 'RPC_REJECTED', 'EXPIRED',
                          'UNKNOWN_AFTER_TIMEOUT', 'UNKNOWN_OUTCOME') for value in outcomes): return True
     groups = {"AI": ("AI_", "OPOI", "INFERENCE"),
-              "JOB": ("JOB", "TEMPLATE", "STALE"), "ERROR": ("ERROR", "FAIL", "BLOCKED", "REJECTED")}
+              "JOB": ("JOB", "TEMPLATE", "STALE", "POM_V5_DISPATCH"), "ERROR": ("ERROR", "FAIL", "BLOCKED", "REJECTED")}
     return any(token in event.upper() for token in groups.get(selected, (selected,)))
 
 
@@ -1113,7 +1118,7 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
         for i, (stamp, event, detail) in enumerate(selected[-max(1, height - 2):]):
             row = y + 1 + i
             frame.text(row, 3, stamp, "muted", 8)
-            category = "BLOCK" if any(v in event for v in ("SUBMIT", "CHAIN")) else "STALE" if "STALE" in event else "AI" if "AI_" in event else "PoM"
+            category = "BLOCK" if any(v in event for v in ("SUBMIT", "CHAIN")) else "STALE" if "STALE" in event else "AI" if "AI_" in event else "VULKAN" if any(w in event for w in ("VULKAN", "AMD", "POM_V5")) else "PoM"
             frame.text(row, 13, category, "warning" if category == "STALE" else "label", 7)
             frame.text(row, 21, detail, "error" if any(v in event for v in ("REJECTED", "FAIL", "ERROR")) else "text", width - 25)
     if tab == 0 and width >= 100 and height >= 30:
@@ -1322,31 +1327,86 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
         frame.text(height - 3, 3, 'R CHECK UPDATES · U AUTO UPDATES · A AMD REFRESH · D AMD DIAGNOSTICS', 'title', width - 7)
     else:
         w = model.wallet; payout = model.mining_payout or 'Waiting for active worker payout'
-        frame.box(6, 1, height - 9, width - 3, "WALLET / AUTOMATIC MINING PAYOUT")
-        rows = [("Authorization · local", w.get('authorization', 'UNKNOWN')), ("Certificate verification", w.get('verification', 'UNKNOWN')),
-                ("Payout source", "ACTIVE WORKER · AUTOMATIC" if model.mining_payout and fresh else "Worker telemetry unavailable"), ("Certificate source", w.get('certificate_source') or 'N/A')]
-        for i, (key, value) in enumerate(rows): frame.kv(8 + i, 3, width - 7, key, value)
-        frame.text(13, 3, "MINING PAYOUT · WALLET API ADDRESS", "label", width - 7)
-        payout_room = max(16, width - 9)
-        for i in range(0, len(payout), payout_room): frame.text(14 + i // payout_room, 3, payout[i:i+payout_room], "value", payout_room)
-        base = 16 + (len(payout) - 1) // payout_room
-        balance, balance_status = explorer_view(model, "balance")
-        reward, reward_status = explorer_view(model, "reward")
-        income = reward.get("income") if isinstance(reward.get("income"), dict) else {}
-        bracket = reward.get('bracket_bps')
-        bracket_text = f"{bracket / 100:.2f}%" if type(bracket) is int and 0 <= bracket <= 10000 else "N/A"
-        paid_label = 'Mining paid · ~24h indexed' if income.get('income_window_daa') == 864000 else 'Mining paid · covered window'
-        public_rows = [("Wallet balance", krx(balance.get('balance_sompi'), italian=True)), ("Wallet API · refresh 30s", balance_status),
-                       ("Holder bracket", bracket_text), (paid_label, krx(income.get('paid_sompi'), italian=True)),
-                       ("Inference income · window", krx(income.get('inference_sompi'))),
-                       ("Selected blocks · income window", seen(income.get('chain_blocks'))),
-                       ("Income coverage · DAA", seen(income.get('income_window_daa'))),
-                       ("Reward snapshot · DAA", seen(reward.get('tip_daa'))),
-                       ("Income API · HTTP freshness", reward_status)]
-        for i, (key, value) in enumerate(public_rows):
-            if base + i < height - 5: frame.kv(base + i, 3, width - 7, key, value)
-        message = w.get('ui_error') or w.get('notice') or w.get('error')
-        if message: frame.text(height - 5, 3, message, "error" if w.get('ui_error') or w.get('error') else "value", width - 7)
+        mm = getattr(model, 'mining_mode_cfg', {}) or {}
+        stratum = model.stratum if isinstance(model.stratum, dict) else {}
+        is_pool = (mm.get('mode') == 'pool') or (stratum.get('mode') == 'pool')
+
+        if is_pool:
+            frame.box(6, 1, height - 9, width - 3, "POOL WALLET & STRATUM v4 PAYOUT")
+            frame.text(8, 3, "PAYOUT REWARD ADDRESS (ON-CHAIN TARGET)", "label", width - 7)
+            payout_room = max(16, width - 9)
+            for i in range(0, len(payout), payout_room):
+                frame.text(9 + i // payout_room, 3, payout[i:i+payout_room], "hero" if fresh else "value", payout_room)
+            base = 11 + (len(payout) - 1) // payout_room
+
+            active_pool_id = mm.get('active_pool_id', 'keryxpool')
+            pools = mm.get('pools', [])
+            active_pool_obj = next((p for p in pools if p.get('id') == active_pool_id), None)
+            pool_name = active_pool_obj.get('name', 'KeryxPool') if active_pool_obj else 'KeryxPool'
+            endpoint = stratum.get('endpoint') or (active_pool_obj.get('url') if active_pool_obj else 'stratum+tcp://s1.keryxpool.com:4401')
+            state_str = stratum.get('state', 'CONNECTED' if stratum.get('connected') else 'CONNECTING')
+            diff = stratum.get('difficulty')
+            diff_text = f"{diff:.4f}" if isinstance(diff, (int, float)) else "Auto Vardiff"
+            ping = stratum.get('ping_ms')
+            ping_text = f"{ping:.1f} ms" if isinstance(ping, (int, float)) and ping > 0 else "Low latency"
+            acc = stratum.get('accepted_shares', 0)
+            rej = stratum.get('rejected_shares', 0)
+            ratio = f" ({acc * 100 // (acc + rej)}% valid)" if (acc + rej) > 0 else ""
+            shares_text = f"{acc} accepted / {rej} rejected{ratio}"
+
+            balance, balance_status = explorer_view(model, "balance")
+            sompi = balance.get('balance_sompi') if isinstance(balance, dict) else None
+            if sompi is not None:
+                bal_val = krx(sompi, italian=True)
+                bal_source = "ON-CHAIN (Network indexed)"
+            else:
+                bal_val = "0,00000000 KRX · Pending first payout"
+                bal_source = "Pool rewards accrue on pool dashboard"
+
+            pool_rows = [
+                ("Mining mode", "POOL (Stratum v4 Sovereign Worker)"),
+                ("Selected pool", f"{pool_name} · {endpoint}"),
+                ("Connection status", f"{state_str} · Ping {ping_text}"),
+                ("Current difficulty", diff_text),
+                ("Submitted shares", shares_text),
+                ("Worker identifier", stratum.get('worker') or payout),
+                ("Local node status", "STANDALONE / SOVEREIGN (No local node required)"),
+                ("On-chain confirmed balance", bal_val),
+                ("Balance state", bal_source),
+                ("Accounting & payout", "Automatic settlement upon reaching pool payout threshold"),
+                ("Live statistics", f"Track real-time shares & hash rate on {pool_name} web portal"),
+            ]
+            for i, (key, value) in enumerate(pool_rows):
+                if base + i < height - 5:
+                    frame.kv(base + i, 3, width - 7, key, value)
+            notice = f"Pool Mode Active · stratum+tcp://{endpoint.split('://')[-1]} · Auto payout to {payout[:16]}...{payout[-6:]}"
+            frame.text(height - 5, 3, notice, "muted", width - 7)
+        else:
+            frame.box(6, 1, height - 9, width - 3, "WALLET / AUTOMATIC MINING PAYOUT")
+            rows = [("Authorization · local", w.get('authorization', 'UNKNOWN')), ("Certificate verification", w.get('verification', 'UNKNOWN')),
+                    ("Payout source", "ACTIVE WORKER · AUTOMATIC" if model.mining_payout and fresh else "Worker telemetry unavailable"), ("Certificate source", w.get('certificate_source') or 'N/A')]
+            for i, (key, value) in enumerate(rows): frame.kv(8 + i, 3, width - 7, key, value)
+            frame.text(13, 3, "MINING PAYOUT · WALLET API ADDRESS", "label", width - 7)
+            payout_room = max(16, width - 9)
+            for i in range(0, len(payout), payout_room): frame.text(14 + i // payout_room, 3, payout[i:i+payout_room], "value", payout_room)
+            base = 16 + (len(payout) - 1) // payout_room
+            balance, balance_status = explorer_view(model, "balance")
+            reward, reward_status = explorer_view(model, "reward")
+            income = reward.get("income") if isinstance(reward.get("income"), dict) else {}
+            bracket = reward.get('bracket_bps')
+            bracket_text = f"{bracket / 100:.2f}%" if type(bracket) is int and 0 <= bracket <= 10000 else "N/A"
+            paid_label = 'Mining paid · ~24h indexed' if income.get('income_window_daa') == 864000 else 'Mining paid · covered window'
+            public_rows = [("Wallet balance", krx(balance.get('balance_sompi'), italian=True)), ("Wallet API · refresh 30s", balance_status),
+                           ("Holder bracket", bracket_text), (paid_label, krx(income.get('paid_sompi'), italian=True)),
+                           ("Inference income · window", krx(income.get('inference_sompi'))),
+                           ("Selected blocks · income window", seen(income.get('chain_blocks'))),
+                           ("Income coverage · DAA", seen(income.get('income_window_daa'))),
+                           ("Reward snapshot · DAA", seen(reward.get('tip_daa'))),
+                           ("Income API · HTTP freshness", reward_status)]
+            for i, (key, value) in enumerate(public_rows):
+                if base + i < height - 5: frame.kv(base + i, 3, width - 7, key, value)
+            message = w.get('ui_error') or w.get('notice') or w.get('error')
+            if message: frame.text(height - 5, 3, message, "error" if w.get('ui_error') or w.get('error') else "value", width - 7)
     controls = "1–8 / Tab / ← → pages · 0 all  A ai  S submit  J job  E errors" if width >= 80 else "1–8 / Tab pages · 0/A/S/J/E filters"
     frame.text(height - 2, 2, controls, "nav", width - 5)
     tail = "Q closes dashboard · miner stays active" if child_status == "READ ONLY" else "Q hides dashboard · worker continues"
@@ -1751,7 +1811,8 @@ def refresh_development_status(model, root):
         model._setup_poll = now + 30
         try:
             from nexus_gpu_devices import status as device_status
-            if not model.fixture_mode: model.gpu_devices = device_status()
+            from nexus_gpu_identity import enrich_inventory
+            if not model.fixture_mode: model.gpu_devices = enrich_inventory(device_status())
         except (OSError, ValueError, RuntimeError):
             model.gpu_devices = {'error': 'GPU inventory unavailable; current worker unchanged'}
         try:
