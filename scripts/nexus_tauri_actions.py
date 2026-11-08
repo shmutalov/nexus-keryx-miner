@@ -49,25 +49,42 @@ def action(name, value, confirmed=False):
             raise ValueError('Invalid presentation settings')
         save(dict(load(), **value))
         return {'message': 'Presentation preference saved; mining workload is unchanged'}
-    if name in ('gpu_select', 'workload'):
-        fields = {'device', 'enabled'} if name == 'gpu_select' else {'device', 'workload'}
-        if (not isinstance(value, dict) or set(value) != fields or
-                not isinstance(value.get('device'), str) or
-                (name == 'gpu_select' and type(value['enabled']) is not bool) or
-                (name == 'workload' and not isinstance(value['workload'], str))):
+    if name == 'gpu_select':
+        if not isinstance(value, dict) or set(value) != {'device', 'enabled'} or not isinstance(value.get('device'), str) or type(value.get('enabled')) is not bool:
             raise ValueError('Invalid GPU configuration')
-        source = production_source()
-        environment = dict(os.environ, PYTHONPATH=str(source / 'scripts'))
-        code = ('import json,sys\nfrom nexus_gpu_switch import request_change\n'
-                'v=json.load(sys.stdin)\n'
-                'try: print(request_change(v["action"],v["value"]))\n'
-                'except ValueError as e: sys.exit(str(e))')
-        result = subprocess.run(['/usr/bin/python3', '-B', '-c', code],
-            input=json.dumps({'action': name, 'value': value}), cwd=source,
-            env=environment, capture_output=True, text=True, timeout=45)
-        if result.returncode:
-            raise ValueError(result.stderr.strip()[:400] or 'GPU handoff refused; configuration unchanged')
-        return {'message': result.stdout.strip()}
+        from nexus_gpu_selection import CUDA_UUID, AMD_ID, configuration
+        from nexus_gpu_devices import STATE, atomic, prepare_state
+        dev = value['device']
+        if dev not in (CUDA_UUID, AMD_ID):
+            raise ValueError(f'Select an authorized GPU: {dev}')
+        prepare_state()
+        sel = configuration()
+        sel['nvidia_pom' if dev == CUDA_UUID else 'amd_pom'] = value['enabled']
+        atomic(STATE / 'selection.json', sel)
+        import nexus_mining_mode
+        restart_res = nexus_mining_mode.restart_miner(force=True, target_device=dev)
+        dev_label = 'NVIDIA RTX 3070 Ti' if dev == CUDA_UUID else 'AMD Radeon RX 570'
+        state_label = 'ON' if value['enabled'] else 'OFF'
+        return {'message': f'{dev_label} set to {state_label} (miner applied)', 'selection': sel, 'restart': restart_res}
+    if name == 'workload':
+        if not isinstance(value, dict) or set(value) != {'device', 'workload'} or not isinstance(value.get('device'), str) or not isinstance(value.get('workload'), str):
+            raise ValueError('Invalid workload configuration')
+        from nexus_gpu_selection import CUDA_UUID, AMD_ID
+        from nexus_gpu_registry import resolve_workload, WORKLOADS
+        from nexus_ui_preferences import load, save
+        dev = value['device']
+        if dev not in (CUDA_UUID, AMD_ID):
+            raise ValueError(f'Select an authorized GPU: {dev}')
+        vendor = 'nvidia' if dev == CUDA_UUID else 'amd'
+        resolve_workload({'vendor': vendor}, value['workload'])
+        prefs = load()
+        prefs.setdefault('workloads', {})[dev] = value['workload']
+        save(prefs)
+        import nexus_mining_mode
+        restart_res = nexus_mining_mode.restart_miner(force=True, target_device=dev)
+        dev_label = 'NVIDIA RTX 3070 Ti' if dev == CUDA_UUID else 'AMD Radeon RX 570'
+        wl_label = WORKLOADS.get(value['workload'], value['workload'])
+        return {'message': f'Workload for {dev_label} set to {wl_label} (miner applied)', 'workload': value['workload'], 'restart': restart_res}
     if name in ('payout', 'key', 'new_key', 'certificate', 'verify'):
         from nexus_setup import configure
         if not isinstance(value, str) or len(value) > 1024:

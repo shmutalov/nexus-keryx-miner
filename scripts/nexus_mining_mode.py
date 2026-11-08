@@ -639,7 +639,7 @@ def reorder_pools(ordered_ids: list[str], auto_restart: bool = False) -> dict:
     return res
 
 
-def restart_miner(force: bool = True) -> dict:
+def restart_miner(force: bool = True, target_device: str | None = None) -> dict:
     """Forcibly and automatically restart the production miner service and native worker."""
     if os.environ.get("NEXUS_SKIP_AUTO_RESTART") == "1":
         return {"restarted": False, "skipped": True, "reason": "NEXUS_SKIP_AUTO_RESTART is set"}
@@ -689,6 +689,171 @@ def restart_miner(force: bool = True) -> dict:
         nvidia_enabled = True
         amd_enabled = False
 
+    try:
+        from nexus_gpu_selection import CUDA_UUID, AMD_ID
+    except Exception:
+        CUDA_UUID = "nvidia"
+        AMD_ID = "amd"
+
+    is_amd_target = bool(target_device and (
+        target_device in (AMD_ID, "amd", "rx570", "rx") or "amd" in str(target_device).lower() or (AMD_ID and target_device == AMD_ID)
+    ))
+    is_nvidia_target = bool(target_device and not is_amd_target and (
+        target_device in (CUDA_UUID, "nvidia", "rtx") or "nvidia" in str(target_device).lower() or (CUDA_UUID and target_device == CUDA_UUID)
+    ))
+
+    # --- Targeted Restart: AMD Only ---
+    if is_amd_target:
+        try:
+            subprocess.run([systemctl, "--user", "stop", amd_unit], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        stop_deadline = time.monotonic() + 3.0
+        while time.monotonic() < stop_deadline:
+            vulk_found = False
+            for entry in Path('/proc').iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    if entry.stat().st_uid != os.getuid():
+                        continue
+                    if Path(os.readlink(entry / 'exe')).name.removesuffix(' (deleted)') == 'nexus-live-vulkan-worker':
+                        vulk_found = True
+                        break
+                except (OSError, ValueError):
+                    continue
+            if not vulk_found:
+                break
+            time.sleep(0.2)
+        if force:
+            subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "nexus-live-vulkan-worker"], capture_output=True)
+        try:
+            subprocess.run([systemctl, "--user", "reset-failed", amd_unit], capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        amd_started = False
+        if amd_enabled:
+            try:
+                res = subprocess.run([systemctl, "--user", "start", amd_unit], capture_output=True, text=True, timeout=15)
+                if res.returncode == 0:
+                    amd_started = True
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            handoff_file = ROOT / "state/gpu-devices/handoff.json"
+            with open(handoff_file, "w") as f:
+                json.dump({
+                    "status": "APPLIED",
+                    "selection": {"nvidia_pom": nvidia_enabled, "amd_pom": amd_enabled},
+                    "target_device": "amd",
+                    "updated_unix": time.time()
+                }, f)
+        except Exception:
+            pass
+        is_active = False
+        poll_deadline = time.monotonic() + 5.0
+        while time.monotonic() < poll_deadline:
+            try:
+                chk = subprocess.run([systemctl, "--user", "is-active", amd_unit], capture_output=True, text=True, timeout=3)
+                if chk.stdout.strip() == "active":
+                    is_active = True
+                    break
+            except (OSError, subprocess.SubprocessError):
+                pass
+            time.sleep(0.3)
+        return {
+            "restarted": amd_started if amd_enabled else True,
+            "is_active": is_active if amd_enabled else not is_active,
+            "unit": amd_unit,
+            "target": "amd",
+            "amd_active": is_active,
+            "forced": force,
+        }
+
+    # --- Targeted Restart: NVIDIA Only ---
+    if is_nvidia_target:
+        try:
+            subprocess.run([systemctl, "--user", "stop", unit], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        stop_deadline = time.monotonic() + 3.0
+        while time.monotonic() < stop_deadline:
+            cuda_found = False
+            for entry in Path('/proc').iterdir():
+                if not entry.name.isdecimal():
+                    continue
+                try:
+                    if entry.stat().st_uid != os.getuid():
+                        continue
+                    if Path(os.readlink(entry / 'exe')).name.removesuffix(' (deleted)') == 'nexus-live-cuda-worker':
+                        cuda_found = True
+                        break
+                except (OSError, ValueError):
+                    continue
+            if not cuda_found:
+                break
+            time.sleep(0.2)
+        if force:
+            subprocess.run(["/usr/bin/pkill", "-9", "-u", str(os.getuid()), "-f", "nexus-live-cuda-worker"], capture_output=True)
+        try:
+            lease_dir = ROOT / "state/gpu-devices"
+            if lease_dir.is_dir():
+                for lk in lease_dir.glob("lease-*.lock"):
+                    try:
+                        lk_fd = os.open(lk, os.O_RDWR | os.O_NOFOLLOW)
+                        try:
+                            fcntl.flock(lk_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            fcntl.flock(lk_fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(lk_fd)
+                    except (OSError, BlockingIOError):
+                        pass
+        except OSError:
+            pass
+        try:
+            subprocess.run([systemctl, "--user", "reset-failed", unit], capture_output=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        nvidia_started = False
+        if nvidia_enabled:
+            try:
+                res = subprocess.run([systemctl, "--user", "start", unit], capture_output=True, text=True, timeout=15)
+                if res.returncode == 0:
+                    nvidia_started = True
+            except (OSError, subprocess.SubprocessError):
+                pass
+        try:
+            handoff_file = ROOT / "state/gpu-devices/handoff.json"
+            with open(handoff_file, "w") as f:
+                json.dump({
+                    "status": "APPLIED",
+                    "selection": {"nvidia_pom": nvidia_enabled, "amd_pom": amd_enabled},
+                    "target_device": "nvidia",
+                    "updated_unix": time.time()
+                }, f)
+        except Exception:
+            pass
+        is_active = False
+        poll_deadline = time.monotonic() + 5.0
+        while time.monotonic() < poll_deadline:
+            try:
+                chk = subprocess.run([systemctl, "--user", "is-active", unit], capture_output=True, text=True, timeout=3)
+                if chk.stdout.strip() == "active":
+                    is_active = True
+                    break
+            except (OSError, subprocess.SubprocessError):
+                pass
+            time.sleep(0.3)
+        return {
+            "restarted": nvidia_started if nvidia_enabled else True,
+            "is_active": is_active if nvidia_enabled else not is_active,
+            "unit": unit,
+            "target": "nvidia",
+            "nvidia_active": is_active,
+            "forced": force,
+        }
+
+    # --- Full System Restart (Both GPUs) ---
     # Step 1: Explicitly stop services that should be stopped or restarted
     for u in (unit, amd_unit):
         try:
@@ -751,6 +916,7 @@ def restart_miner(force: bool = True) -> dict:
     nvidia_started = False
     if nvidia_enabled:
         try:
+            subprocess.run([systemctl, "--user", "reset-failed", unit], capture_output=True, timeout=5)
             res = subprocess.run([systemctl, "--user", "start", unit], capture_output=True, text=True, timeout=15)
             if res.returncode == 0:
                 nvidia_started = True
@@ -760,6 +926,7 @@ def restart_miner(force: bool = True) -> dict:
     amd_started = False
     if amd_enabled:
         try:
+            subprocess.run([systemctl, "--user", "reset-failed", amd_unit], capture_output=True, timeout=5)
             res = subprocess.run([systemctl, "--user", "start", amd_unit], capture_output=True, text=True, timeout=15)
             if res.returncode == 0:
                 amd_started = True
