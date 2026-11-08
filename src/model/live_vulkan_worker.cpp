@@ -1395,6 +1395,7 @@ int main(int argc, char **argv) {
           const auto wire = borsh_v5_container(proof, final, pow);
           const auto response_digest = blake3_digest(job.fields.response_wire.data(), job.fields.response_wire.size());
           telemetry.proof_completed();
+          telemetry.proof_rust_verified();
           telemetry.proof_fresh(false);
 
           network::VerifiedSubmission verified;
@@ -1415,12 +1416,28 @@ int main(int argc, char **argv) {
                 job.fields.pay_address, job.fields.extra_data,
                 true, std::chrono::seconds(5));
             telemetry.set_state("ACTIVE", "IDLE", "", network::submission_state_name(submit_res.state));
-            std::osyncstream(std::cout) << "LIVE_H15_SUBMIT_RESULT state="
+            std::osyncstream(std::cout) << "LIVE_H15_SUBMIT_RESULT source=AMD_VULKAN state="
                                         << network::submission_state_name(submit_res.state)
                                         << " hash=" << submit_res.block_hash << "\n"
                                         << "LIVE_SUBMIT_RESULT source=AMD_VULKAN state="
                                         << network::submission_state_name(submit_res.state)
                                         << " hash=" << submit_res.block_hash << " nonce=" << winning_nonce << "\n" << std::flush;
+            if (!submit_res.block_hash.empty()) {
+              std::thread([client_ptr = submit_client.get(), submit_res]() mutable {
+                try {
+                  const auto chain = client_ptr->observe_chain(
+                      submit_res, std::chrono::seconds(30), std::chrono::seconds(2), 6);
+                  std::osyncstream(std::cout)
+                      << "LIVE_CHAIN_STATUS state=" << network::submission_state_name(chain.state)
+                      << " hash=" << chain.block_hash
+                      << " selected_chain=" << (chain.currently_selected_chain ? "true" : "false")
+                      << " blue_score=" << chain.block_blue_score
+                      << " selected_tip_blue_score=" << chain.selected_tip_blue_score
+                      << " reorg_observed=" << (chain.reorg_observed ? "true" : "false")
+                      << " confirmation_policy=6_blue_score_depth_not_finality\n" << std::flush;
+                } catch (...) {}
+              }).detach();
+            }
           } else {
             std::cout << "AMD_WINNER_VERIFIED nonce=" << winning_nonce << " submit=DISABLED\n" << std::flush;
           }

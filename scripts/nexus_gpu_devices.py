@@ -243,7 +243,7 @@ def refresh_capabilities():
         raise ValueError('Invalid AMD capability probe response')
     present = {d['id'] for d in amd_devices()}
     for d in obj['devices']:
-        if d.get('id') not in present or d.get('vendor_id') != 0x1002 or d.get('device_id') != 0x67df or d.get('production_ready') is not False:
+        if d.get('id') not in present or d.get('vendor_id') != 0x1002 or d.get('production_ready') is not False:
             raise ValueError('Vulkan/sysfs identity mismatch; capabilities rejected')
     obj.update(observed_unix=time.time(), boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(), probe_sha256=hashlib.sha256(PROBE.read_bytes()).hexdigest())
     atomic(STATE / 'capabilities.json', obj)

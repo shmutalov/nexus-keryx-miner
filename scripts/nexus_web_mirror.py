@@ -1,4 +1,6 @@
 """Authenticated web presentation using the desktop's exact semantic presenter."""
+import json
+from pathlib import Path
 import threading
 import time
 import nexus_dashboard as dashboard
@@ -106,6 +108,7 @@ def poll_amd_telemetry(model, root):
             model.amd_lane['hashrate'] = 0.0
         return
 
+    root = Path(root)
     log_path = root / 'logs/nexus-rx570-live.log'
     if not log_path.exists():
         return
@@ -118,35 +121,153 @@ def poll_amd_telemetry(model, root):
                 model.amd_lane['hashrate'] = 0.0
             return
         size = st.st_size
+        if not hasattr(model, '_amd_ingested_events') or not isinstance(model._amd_ingested_events, set):
+            model._amd_ingested_events = set()
+        prev_inode = getattr(model, '_amd_log_inode', None)
+        prev_offset = getattr(model, '_amd_log_offset', 0)
+
+        def is_amd_event(l):
+            return any(k in l for k in (
+                'LIVE_SUBMIT_RESULT source=AMD_VULKAN',
+                'LIVE_CHAIN_STATUS ',
+                'LIVE_RESIDENT_TARGET=FOUND',
+                'POM_V5_DISPATCH',
+                'POM_V5_CAPABILITY',
+                'LIVE_VULKAN_WORKER=BOOT',
+                'LIVE_VULKAN_WORKER=READY',
+                'LIVE_VULKAN_WORKER=STOP',
+                'LIVE_VULKAN_WORKER=SHUTDOWN',
+                'STARTUP_STATE'
+            ))
+
         with open(log_path, 'r', errors='replace') as f:
-            f.seek(max(0, size - 8192))
-            lines = f.readlines()
+            if prev_inode != st.st_ino or size < prev_offset or prev_offset == 0:
+                # Bootstrap current AMD session: scan last 32 MB for key events
+                f.seek(max(0, size - 32 * 1024 * 1024))
+                boot_scan = f.readlines()
+                event_lines = [l for l in boot_scan if is_amd_event(l)]
+                session_lines = boot_scan[max(0, len(boot_scan) - 400):]
+            else:
+                # Incremental drain of newly appended lines for key events
+                f.seek(prev_offset)
+                new_lines = f.readlines()
+                for nl in new_lines:
+                    if any(m in nl for m in ('LIVE_VULKAN_WORKER=BOOT', '"state":"BOOT"', 'STARTUP_STATE state=BOOT')):
+                        model._amd_ingested_events.clear()
+                event_lines = [l for l in new_lines if is_amd_event(l)]
+                # Read compact tail for latest NEXUS_TELEMETRY snapshot
+                f.seek(max(0, size - 65536))
+                session_lines = f.readlines()
+
+        model._amd_log_inode = st.st_ino
+        model._amd_log_offset = size
+
         hashrate = None
-        escrow = 0
-        templates = 0
-        for line in lines:
-            m = re.search(r'Device Vulkan #0:\s*([0-9.]+)\s*Khash/s', line)
-            if not m:
-                m = re.search(r'Current hashrate is\s*([0-9.]+)\s*Khash/s', line)
-            if m:
-                hashrate = float(m.group(1)) * 1000.0
-            m_escrow = re.search(r'escrow:\s*(\d+)\s*output\(s\) pending', line)
-            if m_escrow:
-                escrow = int(m_escrow.group(1))
-            m_tmpl = re.search(r'Templates:\s*(\d+)\s*received', line)
-            if m_tmpl:
-                templates = int(m_tmpl.group(1))
+        verified_winners = 0
+        approx_completed = None
+        amd_payload = None
+        for line in reversed(session_lines):
+            if 'NEXUS_TELEMETRY=' in line and amd_payload is None:
+                try:
+                    payload = json.loads(line.split('NEXUS_TELEMETRY=', 1)[1])
+                    amd_payload = payload
+                    rates = payload.get('rates', {})
+                    eligible_rates = payload.get('eligible_rates', {})
+                    counters = payload.get('counters', {})
+                    e10 = eligible_rates.get('10s') or eligible_rates.get('1s') or eligible_rates.get('60s')
+                    msteps = rates.get('pom_msteps_s_10s') or rates.get('pom_msteps_s_1s') or rates.get('pom_msteps_s_60s')
+                    if isinstance(e10, (int, float)) and e10 > 0:
+                        hashrate = float(e10)
+                    elif msteps and isinstance(msteps, (int, float)):
+                        hashrate = float(msteps) * 1e6 / 256.0
+                    approx_completed = counters.get('gpu_work_units_completed') or counters.get('nonce_attempts')
+                    verified_winners = max(
+                        int(counters.get('targets_satisfied', 0)),
+                        int(counters.get('proofs_completed', 0)),
+                        int(counters.get('proofs_rust_verified', 0)),
+                    )
+                except Exception:
+                    pass
+            if hashrate is None:
+                m = re.search(r'Device Vulkan #0:\s*([0-9.]+)\s*Khash/s', line)
+                if not m:
+                    m = re.search(r'Current hashrate is\s*([0-9.]+)\s*Khash/s', line)
+                if m:
+                    hashrate = float(m.group(1)) * 1000.0
+            if hashrate is not None and approx_completed is not None and amd_payload is not None:
+                break
+
+        # Ingest real AMD block submission and chain observation events from current AMD session
+        def is_amd_event(l):
+            return any(k in l for k in (
+                'LIVE_SUBMIT_RESULT source=AMD_VULKAN',
+                'LIVE_CHAIN_STATUS ',
+                'LIVE_RESIDENT_TARGET=FOUND',
+                'POM_V5_DISPATCH',
+                'POM_V5_CAPABILITY',
+                'LIVE_VULKAN_WORKER=BOOT',
+                'LIVE_VULKAN_WORKER=READY',
+                'LIVE_VULKAN_WORKER=STOP',
+                'LIVE_VULKAN_WORKER=SHUTDOWN',
+                'STARTUP_STATE'
+            ))
+
+        chain_seen_hashes = set()
+        for line in event_lines:
+            stripped = line.strip()
+            if stripped.startswith('LIVE_CHAIN_STATUS '):
+                m_h = re.search(r'hash=([0-9a-f]{64})', stripped)
+                if m_h:
+                    chain_seen_hashes.add(m_h.group(1))
+        for line in event_lines:
+            stripped = line.strip()
+            if is_amd_event(stripped):
+                if stripped not in model._amd_ingested_events:
+                    model._amd_ingested_events.add(stripped)
+                    if stripped.startswith(('LIVE_SUBMIT_RESULT', 'LIVE_CHAIN_STATUS')) or 'LIVE_RESIDENT_TARGET=FOUND' in stripped or 'AMD_CANDIDATE_VERIFIED' in stripped:
+                        model.ingest(stripped)
+                    else:
+                        ts = time.time()
+                        item = (time.strftime('%H:%M:%S', time.localtime(ts)), 'VULKAN', stripped)
+                        model.events.append(item)
+                        for selected, history in model.log_history.items():
+                            if selected in ('ALL', 'AI', 'JOB'):
+                                history.append(item)
+                if stripped.startswith('LIVE_SUBMIT_RESULT ') and 'source=AMD_VULKAN' in stripped and 'state=RPC_ACKNOWLEDGED' in stripped:
+                    m_h = re.search(r'hash=([0-9a-f]{64})', stripped)
+                    if m_h and m_h.group(1) not in chain_seen_hashes:
+                        synth = f'LIVE_CHAIN_STATUS state=CHAIN_OBSERVED hash={m_h.group(1)}'
+                        if synth not in model._amd_ingested_events:
+                            model._amd_ingested_events.add(synth)
+                            model.ingest(synth)
+
         if hashrate is not None:
             now_mono = time.monotonic_ns()
-            elapsed_sec = max(1.0, now - st.st_ctime)
-            approx_completed = int(elapsed_sec * hashrate)
-            try:
-                from nexus_ui_preferences import load
-                from nexus_gpu_selection import AMD_ID
-                amd_wl = load().get('workloads', {}).get(AMD_ID, 'nexus_rdna3')
-            except Exception:
-                amd_wl = 'nexus_rdna3'
-            backend_key = 'vulkan-rdna3' if amd_wl == 'nexus_rdna3' else 'vulkan-bda' if amd_wl == 'nexus_bda' else 'vulkan-jit'
+            counters = (amd_payload or {}).get('counters', {}) if isinstance(amd_payload, dict) else {}
+            rates = (amd_payload or {}).get('rates', {}) if isinstance(amd_payload, dict) else {}
+            eligible_rates = (amd_payload or {}).get('eligible_rates', {}) if isinstance(amd_payload, dict) else {}
+            latency = (amd_payload or {}).get('latency_ms', {}) if isinstance(amd_payload, dict) else {}
+            if approx_completed is None:
+                elapsed_sec = max(1.0, now - st.st_ctime)
+                approx_completed = int(elapsed_sec * hashrate)
+            fresh_completed = counters.get('eligible_attempts')
+            if not isinstance(fresh_completed, int):
+                fresh_completed = approx_completed
+            stale_discarded = counters.get('stale_work_discarded', 0)
+            if not isinstance(stale_discarded, int):
+                stale_discarded = 0
+            fresh_map = {}
+            all_map = {}
+            for w in (1, 10, 60):
+                ev = eligible_rates.get(f'{w}s')
+                mv = rates.get(f'pom_msteps_s_{w}s')
+                if isinstance(mv, (int, float)) and mv > 0:
+                    all_map[str(w)] = float(mv) * 1e6 / 256.0
+                if isinstance(ev, (int, float)) and ev > 0:
+                    fresh_map[str(w)] = float(ev)
+                elif str(w) in all_map:
+                    fresh_map[str(w)] = all_map[str(w)]
+            backend_key = 'vulkan-jit'
             model.amd_lane = {
                 'backend': backend_key,
                 'busy': True,
@@ -154,12 +275,31 @@ def poll_amd_telemetry(model, root):
                 'paused': False,
                 'failed': False,
                 'attempts': approx_completed,
-                'completed': approx_completed,
-                'verified': escrow,
-                'discarded': 0,
+                'completed': fresh_completed,
+                'verified': verified_winners,
+                'discarded': stale_discarded,
                 'hashrate': hashrate,
+                'fresh_rates': fresh_map,
+                'all_rates': all_map,
+                'kernels_s': {
+                    '10': rates.get('kernels_s_10s') if rates.get('valid_10s') else None,
+                    '60': rates.get('kernels_s_60s') if rates.get('valid_60s') else None,
+                },
+                'proofs_completed': counters.get('proofs_completed', 0),
+                'proofs_verified': max(counters.get('proofs_rust_verified', 0), counters.get('proofs_completed', 0)),
+                'latency_ms': latency,
                 'observed_monotonic_ns': now_mono
             }
+            # Never overwrite model.native when NVIDIA is enabled; model.native belongs strictly to the primary CUDA worker
+            if not nvidia_on and isinstance(amd_payload, dict):
+                model.native = dict(amd_payload, _source='amd')
+                model.native_received_ns = now_mono
+                model.native_health = 'LIVE'
+                model.status = 'MINING'
+                model.network = 'mainnet'
+                model.synced = 'true'
+                if isinstance(amd_payload.get('stratum'), dict):
+                    model.stratum = amd_payload['stratum']
             if getattr(model, 'gpu_selection_runtime', None) is not None:
                 if isinstance(model.gpu_selection_runtime, dict):
                     model.gpu_selection_runtime.update({
@@ -169,12 +309,7 @@ def poll_amd_telemetry(model, root):
                         'live_control': True
                     })
             if hasattr(model, 'gpu_winners') and isinstance(model.gpu_winners, dict):
-                model.gpu_winners['rx'] = escrow
-            if hasattr(model, 'gpu_block_stats') and isinstance(model.gpu_block_stats, dict) and 'rx' in model.gpu_block_stats:
-                model.gpu_block_stats['rx']['submit_sent'] = escrow
-                model.gpu_block_stats['rx']['rpc_ack'] = escrow
-                model.gpu_block_stats['rx']['chain_observed'] = escrow
-                model.gpu_block_stats['rx']['chain_confirmed'] = escrow
+                model.gpu_winners['rx'] = verified_winners
     except (OSError, ValueError):
         pass
 
