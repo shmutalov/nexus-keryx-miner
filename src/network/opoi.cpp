@@ -264,11 +264,13 @@ struct StockLlamaRuntime::Impl {
                                        std::uint64_t, std::uint64_t, std::uint32_t,
                                        const std::uint64_t[4], std::uint64_t);
   using PomReleasePadFn = void (*)(void *);
+  using PomV5BatchFn = std::uint32_t (*)(void *);
   PomReadyFn pom_ready{};
   PomChunksFn pom_n_chunks{};
   PomMineFn pom_mine{};
   PomMineV5Fn pom_mine_v5{};
   PomReleasePadFn pom_release_pad{};
+  PomV5BatchFn pom_v5_batch{};
   void (*q8c_release)(int){};
   void (*q8s_release)(int){};
   bool scratch_active{true};
@@ -301,6 +303,8 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
   static std::once_flag canonical_environment;
   std::call_once(canonical_environment, [] {
 #ifdef _WIN32
+    SetEnvironmentVariableA("GGML_CUDA_DISABLE_GRAPHS", "1");
+    SetEnvironmentVariableA("LLAMA_ATTN_ROT_DISABLE", "1");
     if (_putenv_s("GGML_CUDA_DISABLE_GRAPHS","1") || _putenv_s("LLAMA_ATTN_ROT_DISABLE","1"))
 #else
     if (setenv("GGML_CUDA_DISABLE_GRAPHS","1",1) || setenv("LLAMA_ATTN_ROT_DISABLE","1",1))
@@ -319,6 +323,7 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
   impl_->pom_n_chunks = symbol_optional<Impl::PomChunksFn>(impl_->library, "keryx_llama_pom_n_chunks");
   impl_->pom_mine = symbol_optional<Impl::PomMineFn>(impl_->library, "keryx_llama_pom_mine");
   impl_->pom_mine_v5 = symbol_optional<Impl::PomMineV5Fn>(impl_->library, "keryx_llama_pom_mine_v5");
+  impl_->pom_v5_batch = symbol_optional<Impl::PomV5BatchFn>(impl_->library, "keryx_llama_pom_v5_batch");
   impl_->pom_release_pad = symbol_optional<Impl::PomReleasePadFn>(impl_->library, "keryx_llama_pom_release_pad");
   impl_->abi = (is_vulkan && vk_abi) ? vk_abi() : abi();
   if (impl_->abi != 3 && impl_->abi != 6 && impl_->abi != 8 && impl_->abi != 9)
@@ -550,6 +555,12 @@ std::int64_t StockLlamaRuntime::pom_mine(const std::uint64_t p[4], const std::ui
 bool StockLlamaRuntime::pom_v5_ready() const {
   if (!impl_ || !impl_->model) return false;
   return impl_->pom_mine_v5 != nullptr;
+}
+
+std::uint32_t StockLlamaRuntime::pom_v5_batch() const {
+  if (!impl_ || !impl_->model || !impl_->pom_v5_batch) return 1024;
+  const std::lock_guard lock(impl_->mutex);
+  return impl_->pom_v5_batch(impl_->model);
 }
 
 std::int64_t StockLlamaRuntime::pom_mine_v5(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],

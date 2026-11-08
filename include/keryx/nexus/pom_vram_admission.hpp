@@ -10,7 +10,7 @@ namespace keryx::nexus {
 // Host resource policy only: does not change consensus pad size or proof bytes.
 struct PomVramBudget {
   std::uint64_t pad_bytes{}, metadata_bytes{}, free_bytes{};
-  static constexpr std::uint64_t reserve_bytes=64ULL*1024*1024;
+  static constexpr std::uint64_t reserve_bytes=128ULL*1024*1024;
   bool fits() const noexcept {
     return free_bytes>=reserve_bytes && metadata_bytes<=free_bytes-reserve_bytes &&
       pad_bytes<=free_bytes-reserve_bytes-metadata_bytes;

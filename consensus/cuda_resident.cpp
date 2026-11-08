@@ -261,7 +261,7 @@ bool CudaResidentSearch::prepare_v5(const V5PadSpec&spec,const std::function<boo
   if(cancelled&&cancelled())return false;
   const auto bytes=static_cast<std::size_t>(spec.tiles)*tile_bytes;
   std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"v5 VRAM admission");
-  constexpr std::size_t reserve=64ULL*1024*1024;
+  constexpr std::size_t reserve=PomVramBudget::reserve_bytes;
   const auto chunks=(p.tiles+spec.tiles)*32;
   const auto lut_entries=static_cast<std::size_t>(((chunks-1)>>p.shift)+1);
   const auto metadata_bytes=(p.canonical_bases.size()+2)*16+lut_entries*2;
@@ -380,7 +380,7 @@ ResidentSearchResult CudaResidentSearch::run_impl(const Hash &pph,std::uint64_t 
     launch_params[28]=&p.path_metadata.ptr;
     launch_params[29]=&p.path_addresses.ptr;
   }
-  check(cuLaunchKernel(p.v5?p.v5_kernel:p.path_kernel,static_cast<unsigned>((count+3)/4),1,1,128,1,1,p.v5?12416:8320,p.resources.stream,launch_params.data(),nullptr),"launch resident PoM");
+  check(cuLaunchKernel(p.v5?p.v5_kernel:p.path_kernel,static_cast<unsigned>((count+3)/4),1,1,128,1,1,p.v5?8192:8320,p.resources.stream,launch_params.data(),nullptr),"launch resident PoM");
   *pinned_winner=none;
   check(cuMemcpyDtoHAsync(pinned_winner,p.winner.ptr,8,p.resources.stream),"read winning nonce");
   check(cuEventRecord(p.resources.end,p.resources.stream),"record resident completion");if(after_enqueue){const auto status=cuEventQuery(p.resources.end);if(status!=CUDA_SUCCESS&&status!=CUDA_ERROR_NOT_READY)check(status,"resident completion query");after_enqueue(status==CUDA_ERROR_NOT_READY);}

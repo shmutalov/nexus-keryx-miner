@@ -218,6 +218,13 @@ public:
   std::size_t active_endpoint_index() const noexcept { return active_endpoint_index_; }
   void force_failover_for_test();
 
+  void set_ai_inference_busy(bool busy) noexcept {
+    ai_inference_busy_.store(busy, std::memory_order_release);
+  }
+  bool is_ai_inference_busy() const noexcept {
+    return ai_inference_busy_.load(std::memory_order_acquire);
+  }
+
   // Test hook to inspect outbound wire lines when running without a live socket
   std::vector<std::string> take_outbound_wire_log();
   void enable_loopback_test_mode(bool enabled);
@@ -259,6 +266,7 @@ private:
   std::uint64_t nonce_mask_{0xffffffffffffffffULL};
   std::size_t extranonce2_hex_digits_{16};
   bool pool_supports_b64_proof_{false};
+  std::atomic<bool> ai_inference_busy_{false};
 
   std::optional<StratumPoolJob> active_job_;
   std::unordered_map<std::string, std::uint64_t> job_ids_seen_;

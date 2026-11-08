@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -28,6 +29,11 @@ class GpuPreemptionCoordinator final {
       opoi_pending_.store(true, std::memory_order_release);
   }
 
+  void set_busy_callback(std::function<void(bool)> cb) {
+    std::unique_lock lock(mutex_);
+    on_busy_ = std::move(cb);
+  }
+
   template <class Release, class Inference, class Restore>
   auto run_opoi(Release &&release, Inference &&inference, Restore &&restore)
       -> decltype(std::forward<Inference>(inference)()) {
@@ -40,6 +46,13 @@ class GpuPreemptionCoordinator final {
       opoi_pending_.store(false, std::memory_order_release);
       throw std::runtime_error("GPU preemption cancelled by cooperative stop");
     }
+    if (on_busy_) on_busy_(true);
+    struct BusyGuard {
+      std::function<void(bool)> &cb;
+      ~BusyGuard() {
+        if (cb) cb(false);
+      }
+    } busy_guard{on_busy_};
     try {
       std::forward<Release>(release)();
     } catch (...) {
@@ -94,6 +107,7 @@ class GpuPreemptionCoordinator final {
   std::mutex mutex_;
   std::atomic_bool opoi_pending_{false};
   std::atomic_bool stopping_{false};
+  std::function<void(bool)> on_busy_;
 };
 
 }  // namespace keryx::nexus

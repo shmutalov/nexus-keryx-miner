@@ -1276,6 +1276,27 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       return true;
     }
 
+    if (method == "mining.ai_request") {
+      const auto id_it = fields.find("id");
+      std::optional<std::uint64_t> req_id;
+      if (id_it != fields.end() && id_it->second.kind_case() != google::protobuf::Value::kNullValue) {
+        req_id = value_to_u64(id_it->second);
+      }
+      if (ai_inference_busy_.load(std::memory_order_acquire)) {
+        if (req_id.has_value()) {
+          std::lock_guard lock(mutex_);
+          send_line_locked("{\"id\":" + std::to_string(*req_id) +
+                           ",\"result\":null,\"error\":[46,\"busy: all eligible GPUs are running inference\",null]}");
+          std::cout << "{\"event\":\"STRATUM_AI_REQUEST_BUSY\",\"id\":" << *req_id
+                    << ",\"action\":\"REPLIED_BUSY_46\"}\n"
+                    << std::flush;
+        }
+      } else {
+        std::cout << "{\"event\":\"STRATUM_AI_REQUEST_RECEIVED\"}\n" << std::flush;
+      }
+      return true;
+    }
+
     return true;
   }
 
