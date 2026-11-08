@@ -38,10 +38,10 @@ class IdentityTests(unittest.TestCase):
             self.assertEqual(identity.nvidia_name(CUDA_UUID,True),'')
 
     def test_vendor_workload_options(self):
-        for vendor in ('AMD','Intel'):
-            self.assertEqual([key for _,key in workload_options({'vendor':vendor})],['auto','nexus','nexus_bda'])
+        self.assertEqual([key for _,key in workload_options({'vendor':'AMD'})],['auto','nexus_rdna3'])
+        self.assertEqual([key for _,key in workload_options({'vendor':'Intel'})],['auto','nexus','nexus_bda','nexus_rdna3'])
         self.assertEqual(workload_options({'vendor':'unknown'}),[('Automatic','auto')])
-        self.assertEqual(automatic_workload({'vendor':'AMD'}),'nexus')
+        self.assertEqual(automatic_workload({'vendor':'AMD'}),'nexus_rdna3')
         self.assertEqual(automatic_workload({'vendor':'Intel'}),'nexus')
         self.assertEqual([key for _,key in workload_options({'vendor':'NVIDIA'})],['auto','nvidia','nexus','nexus_bda'])
 

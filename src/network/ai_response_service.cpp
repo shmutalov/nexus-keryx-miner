@@ -474,7 +474,9 @@ bool AiResponseService::discover(const protowire::RpcTransaction &transaction,
     return false;
   }
 
-  (void)journal_.begin(id);
+  const bool is_new = journal_.begin(id);
+  const auto old = journal_.get(id);
+  if (!is_new && old && terminal(old->state)) return false;
   const auto deadline = service_response_deadline(
       containing_daa, config_.tier, request->max_tokens,
       containing_daa >= mainnet_signed_response_activation_daa)
@@ -814,6 +816,10 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
   if (open_rc != 0 || is_private != parsed->is_private) { (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed; }
   std::string prompt;
   try { prompt = is_private ? prompt_from_private(prompt_bytes) : std::string(prompt_bytes.begin(), prompt_bytes.end()); }
+  catch (const std::exception &e) {
+    if (effects.submission_diagnostic) effects.submission_diagnostic("", 0, std::string("prompt_exception: ") + e.what(), "");
+    (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed;
+  }
   catch (...) { (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed; }
   (void)journal_.transition(id, ResponseState::Inferencing);
   std::string answer;std::optional<AiTracedAnswer> traced;
@@ -821,7 +827,20 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
     if(is_private&&now_daa()>=h15_at){traced=effects.infer_traced(prompt,parsed->max_tokens,parsed->request_hash);return traced->answer;}
     return effects.infer(prompt, parsed->max_tokens);
   }); }
-  catch (...) { (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed; }
+  catch (const std::exception &e) {
+    if (effects.submission_diagnostic) {
+      effects.submission_diagnostic("", 0, std::string("inference_exception: ") + e.what(), "");
+    }
+    (void)journal_.transition(id, ResponseState::Failed);
+    return ServeResult::Failed;
+  }
+  catch (...) {
+    if (effects.submission_diagnostic) {
+      effects.submission_diagnostic("", 0, "inference_exception: unknown", "");
+    }
+    (void)journal_.transition(id, ResponseState::Failed);
+    return ServeResult::Failed;
+  }
   // Official miner 4ebf4bc: cap AiRequest answer bytes on a UTF-8 boundary.
   // Apply before publishing/signing so CID, word count and signed body remain consistent.
   const auto cap = nexus_ai_max_answer_len(parsed->max_tokens);

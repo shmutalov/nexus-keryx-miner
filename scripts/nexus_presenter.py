@@ -482,7 +482,7 @@ class NativeFrame:
 
 
 
-def build_presenter_frame(height, width, model, gpu, tab, log_filter='ALL', preferences=None, log_before=None):
+def build_presenter_frame(height, width, model, gpu, tab, log_filter='ALL', preferences=None, log_before=None, gpu_metrics=None):
     import nexus_dashboard as dashboard
     from nexus_ui_preferences import load, resolved_view, large_gpu_count
     preferences = load() if preferences is None else preferences

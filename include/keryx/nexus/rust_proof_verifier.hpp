@@ -37,29 +37,43 @@ class RustProofVerifier {
   explicit RustProofVerifier(std::string executable):executable_(std::move(executable)){}
   RustProofVerifier(const RustProofVerifier&)=delete;
   ~RustProofVerifier() {
-#ifndef _WIN32
-    if(write_>=0)close(write_);
-    if(read_>=0)close(read_);
+    reset();
+  }
+  void reset() noexcept {
+#ifdef _WIN32
+    process_.reset();
+#else
+    if(write_>=0){close(write_);write_=-1;}
+    if(read_>=0){close(read_);read_=-1;}
     if(pid_>0) {
       int status{};
-      for(int i=0;i<100;++i) {
+      bool reaped=false;
+      for(int i=0;i<50;++i) {
         auto n=waitpid(pid_,&status,WNOHANG);
-        if(n==pid_ || (n<0 && errno==ECHILD))return;
+        if(n==pid_ || (n<0 && errno==ECHILD)){reaped=true;break;}
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
       }
-      // Only our unreaped child, never a process group or a node process.
-      kill(pid_,SIGTERM);
-      for(int i=0;i<100;++i) {
-        auto n=waitpid(pid_,&status,WNOHANG);
-        if(n==pid_ || (n<0 && errno==ECHILD))return;
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      if(!reaped) {
+        // Only our unreaped child, never a process group or a node process.
+        kill(pid_,SIGTERM);
+        for(int i=0;i<50;++i) {
+          auto n=waitpid(pid_,&status,WNOHANG);
+          if(n==pid_ || (n<0 && errno==ECHILD)){reaped=true;break;}
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
       }
+      if(!reaped) {
+        kill(pid_,SIGKILL);
+        (void)waitpid(pid_,&status,0);
+      }
+      pid_=0;
     }
 #endif
+    failed_=false;
   }
   Result verify(std::span<const std::uint8_t> context,std::span<const std::uint8_t> trace,
                 std::span<const std::uint8_t> proof) {
-    if(failed_)throw std::runtime_error("official verifier is failed; no retry permitted");
+    if(failed_)reset();
     try {
       if(context.size()!=225 || trace.size()!=28+257*1024+256*8 || proof.empty() || proof.size()>2*1024*1024)
         throw std::runtime_error("invalid bounded verifier input dimensions");
@@ -91,7 +105,7 @@ class RustProofVerifier {
       if(!summary.starts_with("OFFICIAL_RUST_REAL_MODEL=PASS "))
         throw std::runtime_error("official verifier did not report full proof validation");
       return {cpu/1.0e6,std::move(summary)};
-    } catch(...) {failed_=true;throw;}
+    } catch(...) {reset();failed_=true;throw;}
   }
  private:
   template<class T>static void le(T &v,std::size_t p,std::uint64_t x,unsigned n){for(unsigned i=0;i<n;++i)v[p+i]=x>>(8*i);}

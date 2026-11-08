@@ -40,7 +40,7 @@ int main(int argc, char** argv) {
     bool first = true;
     for (auto gpu : devices) {
       VkPhysicalDeviceProperties properties{}; vkGetPhysicalDeviceProperties(gpu, &properties);
-      if (properties.vendorID != 0x1002 || properties.deviceID != 0x67df) continue;
+      if (properties.vendorID != 0x1002) continue;
       uint32_t extension_count{};
       check(vkEnumerateDeviceExtensionProperties(gpu, nullptr, &extension_count, nullptr));
       std::vector<VkExtensionProperties> extensions(extension_count);
@@ -61,7 +61,8 @@ int main(int argc, char** argv) {
       const auto bdf = hex(pci.pciDomain, 4) + ":" + hex(pci.pciBus, 2) + ":" + hex(pci.pciDevice, 2) + "." + hex(pci.pciFunction, 1);
       if (!first) result << ',';
       first = false;
-      result << "{\"id\":\"pci:" << bdf << "\",\"vendor_id\":4098,\"device_id\":26591,\"name\":\"" << escaped(properties.deviceName)
+      result << "{\"id\":\"pci:" << bdf << "\",\"vendor_id\":" << properties.vendorID
+        << ",\"device_id\":" << properties.deviceID << ",\"name\":\"" << escaped(properties.deviceName)
         << "\",\"api_version\":" << properties.apiVersion << ",\"vram_bytes\":" << local_bytes
         << ",\"shaderInt64\":" << (features.features.shaderInt64 ? "true" : "false")
         << ",\"shaderInt8\":" << (f12.shaderInt8 ? "true" : "false")

@@ -162,6 +162,7 @@ pub fn verify_native(
     proof: &PomProof,
     states: &[u8],
     offsets: &[u8],
+    daa: u64,
 ) -> u64 {
     assert!(tier < 5, "invalid v5 tier");
     let anchor = params::POM_TIERS_H14[tier as usize];
@@ -173,7 +174,11 @@ pub fn verify_native(
     assert_eq!(witness.tier, tier);
     assert_eq!(witness.tiles.len(), 256);
     assert_eq!(witness.merkle.len(), 256);
-    let pads = params::POM_V5_PAD_TILES_H14[tier as usize];
+    let pads = if daa >= H16_ACTIVATION_DAA {
+        POM_V5_PAD_TILES_H16[tier as usize]
+    } else {
+        params::POM_V5_PAD_TILES_H14[tier as usize]
+    };
     let pad_seed = pom_v5::v5_pad_seed(tier, &anchor.model_id, root);
     verify_walk(seed, chunks, pads, &pad_seed, witness, states, offsets);
     let derived = pom_v5::verify_pom_proof_v5(seed, witness, root, chunks, &pad_seed, pads)

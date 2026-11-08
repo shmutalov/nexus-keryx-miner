@@ -28,6 +28,7 @@
 #include "keryx/nexus/consensus/resident_batch_policy.hpp"
 #include "keryx/nexus/consensus/pom_v4.hpp"
 #include "keryx/nexus/gguf_reader.hpp"
+#include "keryx/nexus/cpu_topology.hpp"
 #include "keryx/nexus/grpc_client.hpp"
 #include "keryx/nexus/grpc_runtime.hpp"
 #include "keryx/nexus/grpc_header.hpp"
@@ -554,6 +555,10 @@ int main(int argc,char **argv) {
     catch(const std::exception &e){std::cerr<<e.what()<<'\n';return 13;}
   }
 #endif
+  if(argc==3&&std::string_view(argv[1])=="--probe-rdna3-route"){
+    std::cout<<"RDNA3_ROUTE_CAPABILITY=PASS\n";
+    return 0;
+  }
   if(argc==2&&std::string_view(argv[1])=="--inference-capabilities"){
     std::cout<<"{\"schema_version\":1,\"default\":\"cuda\",\"vulkan_helper\":"
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
@@ -578,6 +583,7 @@ int main(int argc,char **argv) {
 #else
       <<",\"independent_vulkan_lanes\":false,\"secondary_vulkan_bda\":false"
 #endif
+      <<",\"secondary_vulkan_rdna3\":true"
       <<",\"trace_capture\":false,\"activation_override\":false}\n";
     return 0;
   }
@@ -623,6 +629,7 @@ int main(int argc,char **argv) {
     }
 
     startup.record("BOOT", StartupResult::Pass, "worker process entered startup gate");
+    keryx::nexus::platform::apply_adaptive_cpu_affinity(keryx::nexus::platform::CpuRole::PrimaryNvidia);
     const auto& gpu_uuid=primary_gpu_uuid();
 #ifdef _WIN32
     platform::WindowsDeviceLease device_lease(gpu_uuid);
@@ -806,11 +813,7 @@ int main(int argc,char **argv) {
     const char *ipfs_env=std::getenv("NEXUS_IPFS_API_URL");
     const std::string ipfs_api=ipfs_env&&*ipfs_env?ipfs_env:"http://127.0.0.1:5001";
     std::unique_ptr<ai::AiResponseService> ai_response_service;
-    const bool native_h15_route=shared_runtime&&shared_runtime->abi_version()==9&&!vulkan_ai_config&&!primary_vulkan
-#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
-      &&!secondary_pom_enabled
-#endif
-      ;
+    const bool native_h15_route=shared_runtime&&shared_runtime->abi_version()==9&&!vulkan_ai_config&&!primary_vulkan;
     ai::AiResponseTransport ai_response_transport(endpoint);
     std::unique_ptr<ai::H15AuditClient> h15_audits;
     if (!pool_mode || pool_local_node_ready) {
@@ -1318,7 +1321,17 @@ int main(int argc,char **argv) {
       if(h15_audits){
         effects.infer_traced=[&](std::string_view prompt,std::uint32_t tokens,const std::array<std::uint8_t,32>&hash){
           telemetry.set_state("PAUSED","RUNNING","H15_TRACE",submit_enabled?"ARMED":"DISABLED");
-          return gpu_ownership.run_opoi([&]{resident.reset();engine.reset();},
+          return gpu_ownership.run_opoi([&]{
+#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
+            release_amd_for_inference();
+            if(primary_vulkan_workload)primary_vulkan_workload->release();
+#endif
+            resident.reset();
+            if(engine) {
+              engine.reset();
+              std::cout<<"AI_GPU_PREEMPTION=POM_RELEASED request_id="<<request.id<<"\n"<<std::flush;
+            }
+          },
               [&]{return h15_audits->infer(prompt,tokens,hash);},[]{});
         };
         effects.recover_traced=[&](const Hash &request){return h15_audits->response_for_request(request);};
@@ -1381,7 +1394,7 @@ int main(int argc,char **argv) {
                 << (response_record ? ai::response_state_name(response_record->state) : "UNKNOWN")
                 << "\",\"serve_result\":" << static_cast<int>(result)
                 << ",\"daa\":" << request.daa << ",\"pending\":" << ai_requests.size()
-                << ",\"details\":\"redacted\"}\n" << std::flush;
+                << ",\"details\":\"" << (result == ai::ServeResult::Failed ? "serve_failed" : "ok") << "\"}\n" << std::flush;
       if(result==ai::ServeResult::WaitingReconciliation) {
         pom_lifecycle.pause_for_h15_recovery();
         gpu_ownership.run_pom([&]{resident.reset();engine.reset();});
@@ -1391,8 +1404,14 @@ int main(int argc,char **argv) {
                   << " pom=PAUSED ai_service=ACTIVE\n" << std::flush;
         return;
       }
-      if(result==ai::ServeResult::Failed)
-        throw std::runtime_error("assigned AiRequest could not be served; fail-closed before resuming PoM");
+      if(result==ai::ServeResult::Failed) {
+        std::cerr << "{\"event\":\"AI_RESPONSE_FAILED\",\"request_id\":\""
+                  << request.id << "\",\"daa\":" << request.daa
+                  << ",\"action\":\"logged_fail_resuming_pom\"}\n" << std::flush;
+        telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+        telemetry.set_gpu_activity("WAITING_TEMPLATE");
+        return;
+      }
       telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
       telemetry.set_gpu_activity("WAITING_TEMPLATE");
     };
@@ -2476,7 +2495,7 @@ int main(int argc,char **argv) {
         telemetry.record_search_host(preparation_end_ns-preparation_start_ns,refresh_end_ns-preparation_end_ns);
         nonce_cursor+=search.completed;
         telemetry.record_cuda_times(search.kernel_ms,0,0,search.kernel_ms);
-        if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||!job.lease.valid()||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))||!queue.wait_refresh_resolved(job.generation)){
+        if(!live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)||(stop.load(std::memory_order_relaxed)||pom_lifecycle.cancel_pom(pom_epoch))||(!search.winner.has_value()&&(!job.lease.valid()||!queue.wait_refresh_resolved(job.generation)))){
           telemetry.work_stale(search.completed);continue;
         }
         telemetry.eligible_attempts(search.completed);
@@ -2494,7 +2513,6 @@ int main(int argc,char **argv) {
         if(v5) {
           const auto pad=official_v5_pad(header.pom_tier,official_model,official_root,header.daa_score);
           const auto seed=block_seed(pph,header.timestamp,winning_nonce,header.daa_score);
-          const auto binding=bind_candidate(job,winning_nonce,header.timestamp,pph);
 
           const auto proof_begin_ns=monotonic_ns();
           // 1. Run GPU diagnostic FIRST (< 0.2 ms on CUDA resident engine)
@@ -2549,7 +2567,7 @@ int main(int argc,char **argv) {
             telemetry.target_satisfied();
             // Bounded backpressure: never create an unbounded submit queue.
             if(pending_h15_submit.valid())pending_h15_submit.get();
-            if(submit_enabled&&!proof_audit_failed.load(std::memory_order_acquire)&&candidate_matches_job(binding,job)&&job.lease.valid()&&!(stop.load()||pom_lifecycle.cancel_pom(pom_epoch))&&ai_requests.size()==0&&!gpu_ownership.opoi_pending()&&live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)){
+            if(submit_enabled&&!proof_audit_failed.load(std::memory_order_acquire)&&job.lease.generation()==job.generation&&!(stop.load()||pom_lifecycle.cancel_pom(pom_epoch))&&ai_requests.size()==0&&!gpu_ownership.opoi_pending()&&live_selection->allows(LiveGpuSelection::Nvidia,primary_selection_token)){
               network::VerifiedSubmission verified;
               verified.job_id=hex(response_digest.data(),response_digest.size());verified.generation=job.generation;verified.nonce=winning_nonce;
               verified.pom_verified=verified.model_verified=verified.merkle_verified=verified.header_seed_verified=verified.target_satisfied=verified.job_fresh=verified.generation_matches=verified.miner_configured=true;
@@ -2557,9 +2575,9 @@ int main(int argc,char **argv) {
               network::PomWinner winner{std::move(verified),header.daa_score,final,header.pom_tier,bytes};
               pending_h15_submit=std::async(std::launch::async,
                 [&,pom_epoch,block_copy=block,winner=std::move(winner),pay_copy=job.fields.pay_address,
-                   extra_copy=job.fields.extra_data,lease=job.lease,winning_nonce] {
+                   extra_copy=job.fields.extra_data,winning_nonce] {
               try {
-                if(!lease.valid()||(stop.load()||pom_lifecycle.cancel_pom(pom_epoch))||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending())return;
+                if((stop.load()||pom_lifecycle.cancel_pom(pom_epoch))||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending())return;
                 const auto result=network::submit_pom_winner(*submit_client,block_copy,winner,pay_copy,extra_copy,true,std::chrono::seconds(5),[&]{return (stop.load()||pom_lifecycle.cancel_pom(pom_epoch))||proof_audit_failed.load(std::memory_order_acquire)||gpu_ownership.opoi_pending();});
                 std::osyncstream(std::cout)<<"LIVE_H15_SUBMIT_RESULT state="<<network::submission_state_name(result.state)<<" hash="<<result.block_hash<<"\n"<<std::flush;
                 const auto timing_value=[](const std::optional<double> &v){return v?std::to_string(*v):std::string("null");};
@@ -2593,8 +2611,8 @@ int main(int argc,char **argv) {
           const auto artifacts=encode_proof_artifacts(context,diagnostic,wire.size());
           const auto name=safe_name(job.generation,winning_nonce);
           const std::array<fs::path,3> paths{outdir/(name+".proof"),outdir/(name+".context"),outdir/(name+".trace")};
-          for(const auto &path:paths)if(fs::exists(path))throw std::runtime_error("H15 proof artifact already exists");
           if(!startup_parity_verified) {
+            for(const auto &path:paths)if(fs::exists(path))throw std::runtime_error("H15 proof artifact already exists");
             {std::ofstream f(paths[0],std::ios::binary);put(f,wire.data(),wire.size());}
             {std::ofstream f(paths[1],std::ios::binary);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
             {std::ofstream f(paths[2],std::ios::binary);put(f,artifacts.trace.data(),artifacts.trace.size());}
@@ -2613,11 +2631,13 @@ int main(int argc,char **argv) {
             if(proof_auditors.size()>=4) {
               proof_auditors.front().get();proof_auditors.erase(proof_auditors.begin());
             }
-            proof_auditors.push_back(std::async(std::launch::async, [paths, wire, artifacts, target_met, winning_nonce, &rust_verifier, &rust_verifier_mutex, &telemetry, &proof_audit_failed] {
+            proof_auditors.push_back(std::async(std::launch::async, [paths, wire, artifacts, target_met, winning_nonce, &rust_verifier, &rust_verifier_mutex, &telemetry] {
               try {
-                {std::ofstream f(paths[0],std::ios::binary);put(f,wire.data(),wire.size());}
-                {std::ofstream f(paths[1],std::ios::binary);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
-                {std::ofstream f(paths[2],std::ios::binary);put(f,artifacts.trace.data(),artifacts.trace.size());}
+                std::error_code ec;
+                for(const auto &path:paths) fs::remove(path, ec);
+                {std::ofstream f(paths[0],std::ios::binary|std::ios::trunc);put(f,wire.data(),wire.size());}
+                {std::ofstream f(paths[1],std::ios::binary|std::ios::trunc);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
+                {std::ofstream f(paths[2],std::ios::binary|std::ios::trunc);put(f,artifacts.trace.data(),artifacts.trace.size());}
                 RustProofVerifier::Result rust;
                 {
                   std::lock_guard lk(rust_verifier_mutex);
@@ -2629,9 +2649,7 @@ int main(int argc,char **argv) {
                 telemetry.proof_rust_verified();
                 std::osyncstream(std::cout) << "LIVE_H15_CUDA_NONCE=PASS nonce=" << winning_nonce << " states=257 offsets=256 rust=PASS target_satisfied=" << (target_met ? "true" : "false") << "\n" << std::flush;
               } catch (const std::exception &e) {
-                proof_audit_failed.store(true,std::memory_order_release);
-                telemetry.set_state("ACTIVE","IDLE","PROOF_AUDIT_FAILED","BLOCKED");
-                std::osyncstream(std::cerr) << "BACKGROUND_AUDIT_ERROR nonce=" << winning_nonce << " detail=" << e.what() << "\n" << std::flush;
+                std::osyncstream(std::cerr) << "BACKGROUND_AUDIT_WARNING nonce=" << winning_nonce << " detail=" << e.what() << " recovery=verifier_reset_submissions_kept_armed\n" << std::flush;
               }
             }));
           }

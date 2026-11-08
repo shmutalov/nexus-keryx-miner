@@ -1,0 +1,75 @@
+name: Linux Native Build
+
+on:
+  push:
+    branches: [main, master, 'feature/*']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    name: Ubuntu 22.04 x64 (Universal Linux Baseline)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config libssl-dev zlib1g-dev \
+            libcurl4-openssl-dev libvulkan-dev vulkan-tools \
+            protobuf-compiler protobuf-compiler-grpc libgrpc++-dev libprotobuf-dev
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@b8bf9c6c28f8a92fbb04dcfcaee872e60c57462d
+        with:
+          cuda: '12.4.1'
+          sub-packages: '["nvcc", "crt", "cudart", "cudart-dev", "nvrtc", "nvrtc-dev"]'
+          use-github-cache: 'true'
+
+      - name: Configure CMake
+        run: |
+          cmake -S . -B build/linux \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNEXUS_ENABLE_GRPC=ON \
+            -DNEXUS_ENABLE_CUDA=ON \
+            -DNEXUS_ENABLE_VULKAN_JIT=ON \
+            -DBUILD_TESTING=OFF
+
+      - name: Build Native Workers (CUDA + Vulkan)
+        run: |
+          cmake --build build/linux --config Release --target nexus-live-cuda-worker nexus-live-vulkan-worker -j$(nproc)
+
+      - name: Build Independent Oracle (Rust)
+        run: |
+          cargo build --release --locked --manifest-path oracle-rust/Cargo.toml
+
+      - name: Create Portable Linux Bundle
+        run: |
+          mkdir -p dist/bin dist/scripts
+          cp build/linux/bin/nexus-live-cuda-worker dist/bin/
+          cp build/linux/bin/nexus-live-vulkan-worker dist/bin/
+          cp oracle-rust/target/release/nexus-m21-oracle dist/bin/
+          cp -r scripts/* dist/scripts/
+          cp README.md LICENSE dist/
+          tar -czvf nexus-miner-linux-x86_64.tar.gz -C dist .
+
+      - name: Upload Linux Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-miner-linux-x86_64
+          path: nexus-miner-linux-x86_64.tar.gz
+          if-no-files-found: error

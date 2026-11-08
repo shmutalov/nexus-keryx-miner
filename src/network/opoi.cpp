@@ -51,6 +51,10 @@ template <typename T> T symbol(void *library, const char *name) {
   if (!value) throw std::runtime_error(std::string("stock llama missing ") + name);
   return reinterpret_cast<T>(value);
 }
+template <typename T> T symbol_optional(void *library, const char *name) {
+  auto *value = platform::library_symbol(library, name);
+  return reinterpret_cast<T>(value);
+}
 std::string native_error(ErrorFn fn) {
   if (!fn) return "native model load failed";
   const char *message = fn();
@@ -185,6 +189,19 @@ struct StockLlamaRuntime::Impl {
   ErrorFn last_error{};
   GenerateFn generate{};
   FreeFn free_model{};
+  using PomReadyFn = bool (*)(void *);
+  using PomChunksFn = std::uint64_t (*)(void *);
+  using PomMineFn = std::int64_t (*)(void *, const std::uint64_t[4], const std::uint64_t[4], const std::uint64_t[4],
+                                     std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t);
+  using PomMineV5Fn = std::int64_t (*)(void *, const std::uint64_t[4], const std::uint64_t[4], const std::uint64_t[4],
+                                       std::uint64_t, std::uint64_t, std::uint32_t,
+                                       const std::uint64_t[4], std::uint64_t);
+  using PomReleasePadFn = void (*)(void *);
+  PomReadyFn pom_ready{};
+  PomChunksFn pom_n_chunks{};
+  PomMineFn pom_mine{};
+  PomMineV5Fn pom_mine_v5{};
+  PomReleasePadFn pom_release_pad{};
   void (*q8c_release)(int){};
   void (*q8s_release)(int){};
   bool scratch_active{true};
@@ -202,9 +219,15 @@ struct StockLlamaRuntime::Impl {
 
 StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_path)
     : impl_(std::make_unique<Impl>()) {
-  const char *visible = std::getenv("CUDA_VISIBLE_DEVICES");
-  if (!visible || std::string(visible) != primary_gpu_uuid())
-    throw std::runtime_error("OPoI CUDA runtime requires CUDA_VISIBLE_DEVICES set only to authorized primary NVIDIA GPU UUID");
+  const char *ai_backend = std::getenv("NEXUS_AI_BACKEND");
+  const bool is_vulkan = (ai_backend && std::string_view(ai_backend) == "vulkan") ||
+                         library_path.find("-vk") != std::string::npos ||
+                         library_path.find("vulkan") != std::string::npos;
+  if (!is_vulkan) {
+    const char *visible = std::getenv("CUDA_VISIBLE_DEVICES");
+    if (!visible || std::string(visible) != primary_gpu_uuid())
+      throw std::runtime_error("OPoI CUDA runtime requires CUDA_VISIBLE_DEVICES set only to authorized primary NVIDIA GPU UUID");
+  }
   if (sha256_file(gguf_path) != official_model_sha256)
     throw std::runtime_error("OPoI GGUF SHA-256 does not match the configured official model");
   impl_->gguf = std::move(gguf_path);
@@ -220,11 +243,17 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
   impl_->library = platform::open_library(std::filesystem::u8path(library_path));
   if (!impl_->library) throw std::runtime_error(std::string("cannot load stock libkeryx-llama: ") + "native loader error");
   const auto abi = symbol<AbiFn>(impl_->library, "keryx_llama_abi");
+  const auto vk_abi = symbol_optional<AbiFn>(impl_->library, "keryx_llama_vk_abi");
   const auto load = symbol<LoadFn>(impl_->library, "keryx_llama_load");
   impl_->generate = symbol<GenerateFn>(impl_->library, "keryx_llama_generate");
   impl_->free_model = symbol<FreeFn>(impl_->library, "keryx_llama_free");
   impl_->last_error = symbol<ErrorFn>(impl_->library, "keryx_llama_last_error");
-  impl_->abi = abi();
+  impl_->pom_ready = symbol_optional<Impl::PomReadyFn>(impl_->library, "keryx_llama_pom_ready");
+  impl_->pom_n_chunks = symbol_optional<Impl::PomChunksFn>(impl_->library, "keryx_llama_pom_n_chunks");
+  impl_->pom_mine = symbol_optional<Impl::PomMineFn>(impl_->library, "keryx_llama_pom_mine");
+  impl_->pom_mine_v5 = symbol_optional<Impl::PomMineV5Fn>(impl_->library, "keryx_llama_pom_mine_v5");
+  impl_->pom_release_pad = symbol_optional<Impl::PomReleasePadFn>(impl_->library, "keryx_llama_pom_release_pad");
+  impl_->abi = (is_vulkan && vk_abi) ? vk_abi() : abi();
   if (impl_->abi != 3 && impl_->abi != 6 && impl_->abi != 8 && impl_->abi != 9)
     throw std::runtime_error("stock libkeryx-llama ABI mismatch (expected 3, 6, 8 or 9)");
   if (impl_->abi == 6 || impl_->abi == 8 || impl_->abi == 9) {
@@ -233,13 +262,18 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
     api.leaf_count = symbol<decltype(api.leaf_count)>(impl_->library, "keryx_llama_trace_leaf_count");
     api.generate = symbol<decltype(api.generate)>(impl_->library, "keryx_llama_generate_traced");
     api.read = symbol<decltype(api.read)>(impl_->library, "keryx_llama_trace_read");
-    api.replay = symbol<decltype(api.replay)>(impl_->library, "keryx_llama_replay");
+    api.replay = symbol_optional<decltype(api.replay)>(impl_->library, "keryx_llama_replay");
+    api.replay_multi = symbol_optional<decltype(api.replay_multi)>(impl_->library, "keryx_llama_replay_multi");
     api.error = impl_->last_error;
     api.abi = impl_->abi;
-    if (impl_->abi == 9) {
-      api.seq_configure = symbol<decltype(api.seq_configure)>(impl_->library,"keryx_llama_seq_configure");
-      api.seq_roots = symbol<decltype(api.seq_roots)>(impl_->library,"keryx_llama_seq_roots");
-      api.seq_replay = symbol<decltype(api.seq_replay)>(impl_->library,"keryx_llama_seq_replay");
+    if (impl_->abi == 9 || is_vulkan) {
+      api.seq_configure = symbol_optional<decltype(api.seq_configure)>(impl_->library,"keryx_llama_seq_configure");
+      api.seq_roots = symbol_optional<decltype(api.seq_roots)>(impl_->library,"keryx_llama_seq_roots");
+      api.seq_replay = symbol_optional<decltype(api.seq_replay)>(impl_->library,"keryx_llama_seq_replay");
+      if (api.seq_configure && api.seq_roots && api.seq_replay) {
+        api.abi = 9;
+        impl_->abi = 9;
+      }
     }
     if (impl_->abi == 8 || impl_->abi == 9) {
       api.trace_tokens = symbol<decltype(api.trace_tokens)>(impl_->library,"keryx_llama_trace_tokens");
@@ -409,6 +443,46 @@ std::vector<std::vector<std::uint8_t>> StockLlamaRuntime::replay_trace_multi(con
 
 namespace keryx::nexus::opoi {
 std::uint32_t StockLlamaRuntime::trace_context_capacity() const noexcept{return impl_?impl_->context_capacity:0;}
+
+bool StockLlamaRuntime::pom_ready() const {
+  if (!impl_ || !impl_->model || !impl_->pom_ready) return false;
+  const std::lock_guard lock(impl_->mutex);
+  return impl_->pom_ready(impl_->model);
+}
+
+std::uint64_t StockLlamaRuntime::pom_n_chunks() const {
+  if (!impl_ || !impl_->model || !impl_->pom_n_chunks) return 0;
+  const std::lock_guard lock(impl_->mutex);
+  return impl_->pom_n_chunks(impl_->model);
+}
+
+std::int64_t StockLlamaRuntime::pom_mine(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
+                                         std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
+                                         std::uint32_t k, std::uint32_t h10) {
+  if (!impl_ || !impl_->model || !impl_->pom_mine) return -2;
+  const std::lock_guard lock(impl_->mutex);
+  return impl_->pom_mine(impl_->model, p, s, t, timestamp, start_nonce, batch, k, h10);
+}
+
+bool StockLlamaRuntime::pom_v5_ready() const {
+  if (!impl_ || !impl_->model) return false;
+  return impl_->pom_mine_v5 != nullptr;
+}
+
+std::int64_t StockLlamaRuntime::pom_mine_v5(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
+                                            std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
+                                            const std::uint64_t pad_seed[4], std::uint64_t pad_tiles) {
+  if (!impl_ || !impl_->model || !impl_->pom_mine_v5) return -2;
+  const std::lock_guard lock(impl_->mutex);
+  return impl_->pom_mine_v5(impl_->model, p, s, t, timestamp, start_nonce, batch, pad_seed, pad_tiles);
+}
+
+void StockLlamaRuntime::pom_release_pad() {
+  if (!impl_ || !impl_->model || !impl_->pom_release_pad) return;
+  const std::lock_guard lock(impl_->mutex);
+  impl_->pom_release_pad(impl_->model);
+}
+
 std::pair<std::string,std::string> official_qwen35_trace_prompt(std::string_view user){
  if(user.empty()||user.find('\0')!=user.npos)throw std::invalid_argument("Invalid trace prompt");
  return {"<|im_start|>system\nRequest id:","\n"+std::string(stock_system_prompt)+"<|im_end|>\n<|im_start|>user\n"+std::string(user)+"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"};

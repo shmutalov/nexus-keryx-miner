@@ -88,7 +88,7 @@ jobs:
             -DNEXUS_ENABLE_GRPC=ON -DNEXUS_ENABLE_CUDA=ON -DNEXUS_ENABLE_VULKAN_JIT=OFF -DBUILD_TESTING=OFF
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Build Windows worker
-        run: cmake --build build/windows-worker --config Release --target nexus-live-cuda-worker nexus-native-header-parity-test nexus-ai-service-test nexus-ai-journal-archive-test --parallel 2
+        run: cmake --build build/windows-worker --config Release --target nexus-live-cuda-worker nexus-live-vulkan-worker nexus-native-header-parity-test nexus-ai-service-test nexus-ai-journal-archive-test --parallel 2
       - name: Worker capability smoke check (no GPU)
         run: build/windows-worker/bin/Release/nexus-live-cuda-worker.exe --inference-capabilities
       - name: Fetch unmodified pinned oracle dependency
