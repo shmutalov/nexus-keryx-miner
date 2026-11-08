@@ -28,6 +28,7 @@
 #include "keryx/nexus/consensus/resident_batch_policy.hpp"
 #include "keryx/nexus/consensus/pom_v4.hpp"
 #include "keryx/nexus/gguf_reader.hpp"
+#include "keryx/nexus/cpu_topology.hpp"
 #include "keryx/nexus/grpc_client.hpp"
 #include "keryx/nexus/grpc_runtime.hpp"
 #include "keryx/nexus/grpc_header.hpp"
@@ -628,6 +629,7 @@ int main(int argc,char **argv) {
     }
 
     startup.record("BOOT", StartupResult::Pass, "worker process entered startup gate");
+    keryx::nexus::platform::apply_adaptive_cpu_affinity(keryx::nexus::platform::CpuRole::PrimaryNvidia);
     const auto& gpu_uuid=primary_gpu_uuid();
 #ifdef _WIN32
     platform::WindowsDeviceLease device_lease(gpu_uuid);

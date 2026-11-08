@@ -80,6 +80,11 @@ public:
   std::int64_t pom_mine(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
                         std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
                         std::uint32_t k = 256, std::uint32_t h10 = 1);
+  bool pom_v5_ready() const;
+  std::int64_t pom_mine_v5(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
+                           std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
+                           const std::uint64_t pad_seed[4], std::uint64_t pad_tiles);
+  void pom_release_pad();
 
 private:
   struct Impl;

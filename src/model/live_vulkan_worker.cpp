@@ -18,6 +18,7 @@
 #include "keryx/nexus/network/submission_pipeline.hpp"
 #include "keryx/nexus/capture.hpp"
 #include "keryx/nexus/platform/io.hpp"
+#include "keryx/nexus/cpu_topology.hpp"
 #include "messages.pb.h"
 #include "rpc.pb.h"
 
@@ -281,9 +282,13 @@ int main(int argc, char **argv) {
   });
 
   startup.record("BOOT", StartupResult::Pass, "nexus-live-vulkan-worker entered startup gate");
+  platform::apply_adaptive_cpu_affinity(platform::CpuRole::SecondaryAmd);
+  const auto cpu_part = platform::get_adaptive_partition(platform::CpuRole::SecondaryAmd);
+  const unsigned int proof_threads = cpu_part.recommended_proof_threads;
   std::cout << "LIVE_VULKAN_WORKER=BOOT device=" << device_id << " endpoint=" << endpoint
             << " submit=" << (submit_enabled ? "ENABLED" : "DISABLED")
-            << " ai_response=" << (ai_responses_enabled ? "ENABLED" : "DISABLED") << "\n" << std::flush;
+            << " ai_response=" << (ai_responses_enabled ? "ENABLED" : "DISABLED")
+            << " proof_threads=" << proof_threads << "\n" << std::flush;
 
   startup.record("CONFIG_VALIDATION", StartupResult::Pass, "Device, model, and network parameters validated");
 
@@ -590,7 +595,7 @@ int main(int argc, char **argv) {
           ai::AiResponseEffects effects;
           effects.infer = [&](std::string_view prompt, std::uint32_t max_tokens) {
             return gpu_ownership.run_opoi(
-                [] {},
+                [&] { shared_runtime->pom_release_pad(); },
                 [&] {
                   return shared_runtime->infer(opoi::official_qwen35_ai_prompt(prompt), max_tokens);
                 },
@@ -600,7 +605,7 @@ int main(int argc, char **argv) {
             effects.infer_traced = [&](std::string_view prompt, std::uint32_t tokens, const std::array<std::uint8_t, 32> &hash) {
               telemetry.set_state("PAUSED", "RUNNING", "H15_TRACE", submit_enabled ? "ARMED" : "DISABLED");
               return gpu_ownership.run_opoi(
-                  [] {},
+                  [&] { shared_runtime->pom_release_pad(); },
                   [&] { return h15_audits->infer(prompt, tokens, hash); },
                   [] {});
             };
@@ -684,9 +689,19 @@ int main(int argc, char **argv) {
     telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
     telemetry.work_launched(batch_size);
 
+    const bool v5 = (header.daa_score >= consensus::pom_v5_activation_daa);
+    const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
+                        : consensus::V5PadSpec{};
+    const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
+
     std::int64_t winner = -1;
     const bool ran = gpu_ownership.run_pom([&] {
-      winner = shared_runtime->pom_mine(p, s, t, header.timestamp, nonce_cursor, batch_size, 256, h10);
+      if (v5 && shared_runtime->pom_v5_ready()) {
+        winner = shared_runtime->pom_mine_v5(p, s, t, header.timestamp, nonce_cursor, batch_size,
+                                             pad_words.data(), pad.tiles);
+      } else {
+        winner = shared_runtime->pom_mine(p, s, t, header.timestamp, nonce_cursor, batch_size, 256, h10);
+      }
     });
 
     if (!ran) {
@@ -720,7 +735,7 @@ int main(int argc, char **argv) {
               return bytes;
             },
             [&](std::uint64_t tile) { return merkle.tile_path(tile); },
-            4);
+            proof_threads);
 
         const auto final = final_state(walk);
         const auto pow = pom_pow_value_h3(final, pph);

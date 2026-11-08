@@ -193,9 +193,15 @@ struct StockLlamaRuntime::Impl {
   using PomChunksFn = std::uint64_t (*)(void *);
   using PomMineFn = std::int64_t (*)(void *, const std::uint64_t[4], const std::uint64_t[4], const std::uint64_t[4],
                                      std::uint64_t, std::uint64_t, std::uint32_t, std::uint32_t, std::uint32_t);
+  using PomMineV5Fn = std::int64_t (*)(void *, const std::uint64_t[4], const std::uint64_t[4], const std::uint64_t[4],
+                                       std::uint64_t, std::uint64_t, std::uint32_t,
+                                       const std::uint64_t[4], std::uint64_t);
+  using PomReleasePadFn = void (*)(void *);
   PomReadyFn pom_ready{};
   PomChunksFn pom_n_chunks{};
   PomMineFn pom_mine{};
+  PomMineV5Fn pom_mine_v5{};
+  PomReleasePadFn pom_release_pad{};
   void (*q8c_release)(int){};
   void (*q8s_release)(int){};
   bool scratch_active{true};
@@ -245,6 +251,8 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
   impl_->pom_ready = symbol_optional<Impl::PomReadyFn>(impl_->library, "keryx_llama_pom_ready");
   impl_->pom_n_chunks = symbol_optional<Impl::PomChunksFn>(impl_->library, "keryx_llama_pom_n_chunks");
   impl_->pom_mine = symbol_optional<Impl::PomMineFn>(impl_->library, "keryx_llama_pom_mine");
+  impl_->pom_mine_v5 = symbol_optional<Impl::PomMineV5Fn>(impl_->library, "keryx_llama_pom_mine_v5");
+  impl_->pom_release_pad = symbol_optional<Impl::PomReleasePadFn>(impl_->library, "keryx_llama_pom_release_pad");
   impl_->abi = (is_vulkan && vk_abi) ? vk_abi() : abi();
   if (impl_->abi != 3 && impl_->abi != 6 && impl_->abi != 8 && impl_->abi != 9)
     throw std::runtime_error("stock libkeryx-llama ABI mismatch (expected 3, 6, 8 or 9)");
@@ -258,10 +266,14 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
     api.replay_multi = symbol_optional<decltype(api.replay_multi)>(impl_->library, "keryx_llama_replay_multi");
     api.error = impl_->last_error;
     api.abi = impl_->abi;
-    if (impl_->abi == 9) {
-      api.seq_configure = symbol<decltype(api.seq_configure)>(impl_->library,"keryx_llama_seq_configure");
-      api.seq_roots = symbol<decltype(api.seq_roots)>(impl_->library,"keryx_llama_seq_roots");
-      api.seq_replay = symbol<decltype(api.seq_replay)>(impl_->library,"keryx_llama_seq_replay");
+    if (impl_->abi == 9 || is_vulkan) {
+      api.seq_configure = symbol_optional<decltype(api.seq_configure)>(impl_->library,"keryx_llama_seq_configure");
+      api.seq_roots = symbol_optional<decltype(api.seq_roots)>(impl_->library,"keryx_llama_seq_roots");
+      api.seq_replay = symbol_optional<decltype(api.seq_replay)>(impl_->library,"keryx_llama_seq_replay");
+      if (api.seq_configure && api.seq_roots && api.seq_replay) {
+        api.abi = 9;
+        impl_->abi = 9;
+      }
     }
     if (impl_->abi == 8 || impl_->abi == 9) {
       api.trace_tokens = symbol<decltype(api.trace_tokens)>(impl_->library,"keryx_llama_trace_tokens");
@@ -450,6 +462,25 @@ std::int64_t StockLlamaRuntime::pom_mine(const std::uint64_t p[4], const std::ui
   if (!impl_ || !impl_->model || !impl_->pom_mine) return -2;
   const std::lock_guard lock(impl_->mutex);
   return impl_->pom_mine(impl_->model, p, s, t, timestamp, start_nonce, batch, k, h10);
+}
+
+bool StockLlamaRuntime::pom_v5_ready() const {
+  if (!impl_ || !impl_->model) return false;
+  return impl_->pom_mine_v5 != nullptr;
+}
+
+std::int64_t StockLlamaRuntime::pom_mine_v5(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
+                                            std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
+                                            const std::uint64_t pad_seed[4], std::uint64_t pad_tiles) {
+  if (!impl_ || !impl_->model || !impl_->pom_mine_v5) return -2;
+  const std::lock_guard lock(impl_->mutex);
+  return impl_->pom_mine_v5(impl_->model, p, s, t, timestamp, start_nonce, batch, pad_seed, pad_tiles);
+}
+
+void StockLlamaRuntime::pom_release_pad() {
+  if (!impl_ || !impl_->model || !impl_->pom_release_pad) return;
+  const std::lock_guard lock(impl_->mutex);
+  impl_->pom_release_pad(impl_->model);
 }
 
 std::pair<std::string,std::string> official_qwen35_trace_prompt(std::string_view user){
