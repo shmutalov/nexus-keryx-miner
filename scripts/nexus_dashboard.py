@@ -384,11 +384,13 @@ class DashboardModel:
                     self.ai_metrics[group] = int(self.ai_metrics[group] or 0) + 1
             if state in ("FAILED", "EXPIRED", "RPC_REJECTED"):
                 self.ai_metrics["last_error"] = state
-        if event == "LIVE_TEMPLATE":
+        if event in ("LIVE_TEMPLATE", "STRATUM_JOB_NOTIFY"):
             if "synced" in obj: self.synced = str(obj["synced"]).lower()
+            elif event == "STRATUM_JOB_NOTIFY": self.synced = "true"
             if "network" in obj: self.network = str(obj["network"])
-            self.last_job = str(obj.get("generation", "UNKNOWN"))
-            self.daa = str(obj.get("daa", "UNKNOWN"))
+            elif event == "STRATUM_JOB_NOTIFY": self.network = "mainnet"
+            if "generation" in obj: self.last_job = str(obj.get("generation", "UNKNOWN"))
+            if "daa" in obj and obj.get("daa"): self.daa = str(obj.get("daa"))
         if event in ("LIVE_CUDA_NONCE=PASS", "LIVE_H15_CUDA_NONCE=PASS") or obj.get("LIVE_CUDA_NONCE") == "PASS":
             self.stats["nonce_verified"] += 1
             self.stats["rust_valid"] += 1

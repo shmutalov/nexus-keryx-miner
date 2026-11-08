@@ -98,14 +98,15 @@ void SecondaryWorkLane::run() noexcept {
           ++counters_.commits;++counters_.verified;return true;
         };
         verified=execute_(std::move(*ticket),cancelled,commit);
-      }catch(...){owner_.stop();owner_.finish(reserved);throw;}
+      }catch(...){owner_.finish(reserved);throw;}
       owner_.finish(reserved);
       lock.lock();busy_=false;
       if(verified)counters_.completed+=reserved.count();else counters_.discarded+=reserved.count();
       changed_.notify_all();
     }
   }catch(...) {
-    owner_.stop();std::lock_guard lock(mutex_);
+    // Abandon only the faulted secondary lane; the primary GPU keeps mining.
+    std::lock_guard lock(mutex_);
     failure_=std::current_exception();stop_=true;busy_=false;latest_.reset();changed_.notify_all();
   }
 }

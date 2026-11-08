@@ -10,6 +10,7 @@
 #include <cstring>
 #include <google/protobuf/struct.pb.h>
 #include <google/protobuf/util/json_util.h>
+#include <curl/curl.h>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -18,6 +19,7 @@
 #include <openssl/ssl.h>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -239,6 +241,48 @@ value_to_u64(const google::protobuf::Value &v) noexcept {
     }
   }
   return std::nullopt;
+}
+
+bool upload_stratum_trace_record(std::string_view base_url, std::string_view task_id, std::span<const std::uint8_t> blob) {
+  if (base_url.empty() || task_id.empty() || blob.empty()) return false;
+  std::string target(base_url);
+  while (!target.empty() && target.back() == '/') target.pop_back();
+  std::string hex_id(task_id);
+  for (char &c : hex_id) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  target += "/" + hex_id;
+
+  CURL *curl = curl_easy_init();
+  if (!curl) return false;
+
+  struct curl_slist *headers = nullptr;
+  headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+
+  curl_easy_setopt(curl, CURLOPT_URL, target.c_str());
+  curl_easy_setopt(curl, CURLOPT_POST, 1L);
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reinterpret_cast<const char*>(blob.data()));
+  curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(blob.size()));
+  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 15000L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 300000L);
+  curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+  const auto rc = curl_easy_perform(curl);
+  long status = 0;
+  curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+
+  curl_slist_free_all(headers);
+  curl_easy_cleanup(curl);
+
+  if (rc == CURLE_OK && status >= 200 && status < 300) {
+    std::cout << "{\"event\":\"STRATUM_TRACE_UPLOAD_SUCCESS\",\"task_id\":\""
+              << json_escape(task_id) << "\",\"bytes\":" << blob.size()
+              << ",\"http_status\":" << status << "}\n" << std::flush;
+    return true;
+  }
+  std::cout << "{\"event\":\"STRATUM_TRACE_UPLOAD_ERROR\",\"task_id\":\""
+            << json_escape(task_id) << "\",\"http_status\":" << status
+            << ",\"curl_code\":" << rc << "}\n" << std::flush;
+  return false;
 }
 
 } // namespace
@@ -1282,6 +1326,22 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       if (id_it != fields.end() && id_it->second.kind_case() != google::protobuf::Value::kNullValue) {
         req_id = value_to_u64(id_it->second);
       }
+      std::string task_id;
+      std::string upload_url;
+      if (params.size() >= 1 && params[0].kind_case() == google::protobuf::Value::kStringValue) {
+        task_id = params[0].string_value();
+      }
+      if (params.size() >= 5 && params[4].kind_case() == google::protobuf::Value::kStructValue) {
+        const auto &ext = params[4].struct_value().fields();
+        const auto trace_it = ext.find("trace");
+        if (trace_it != ext.end() && trace_it->second.kind_case() == google::protobuf::Value::kStructValue) {
+          const auto &tr = trace_it->second.struct_value().fields();
+          const auto up_it = tr.find("upload");
+          if (up_it != tr.end() && up_it->second.kind_case() == google::protobuf::Value::kStringValue) {
+            upload_url = up_it->second.string_value();
+          }
+        }
+      }
       if (ai_inference_busy_.load(std::memory_order_acquire)) {
         if (req_id.has_value()) {
           std::lock_guard lock(mutex_);
@@ -1292,7 +1352,13 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
                     << std::flush;
         }
       } else {
-        std::cout << "{\"event\":\"STRATUM_AI_REQUEST_RECEIVED\"}\n" << std::flush;
+        if (!upload_url.empty() && !task_id.empty()) {
+          std::lock_guard lock(mutex_);
+          trace_upload_urls_[task_id] = upload_url;
+        }
+        std::cout << "{\"event\":\"STRATUM_AI_REQUEST_RECEIVED\",\"task_id\":\""
+                  << json_escape(task_id) << "\",\"has_upload\":"
+                  << (!upload_url.empty() ? "true" : "false") << "}\n" << std::flush;
       }
       return true;
     }
@@ -1771,6 +1837,30 @@ StratumTelemetrySnapshot StratumV4Client::telemetry_snapshot() const {
   snap.last_error = last_error_;
   snap.last_share_status = last_share_status_;
   return snap;
+}
+
+void StratumV4Client::register_trace_upload_url(std::string_view task_id, std::string_view upload_url) {
+  if (task_id.empty() || upload_url.empty()) return;
+  std::lock_guard lock(mutex_);
+  trace_upload_urls_[std::string(task_id)] = std::string(upload_url);
+}
+
+bool StratumV4Client::upload_trace_record(std::string_view task_id, std::span<const std::uint8_t> blob) {
+  std::string upload_url;
+  {
+    std::lock_guard lock(mutex_);
+    auto it = trace_upload_urls_.find(std::string(task_id));
+    if (it != trace_upload_urls_.end()) {
+      upload_url = it->second;
+      trace_upload_urls_.erase(it);
+    }
+  }
+  if (upload_url.empty()) return false;
+  std::vector<std::uint8_t> copy(blob.begin(), blob.end());
+  std::thread([url = std::move(upload_url), id = std::string(task_id), b = std::move(copy)]() {
+    upload_stratum_trace_record(url, id, b);
+  }).detach();
+  return true;
 }
 
 } // namespace keryx::nexus::stratum

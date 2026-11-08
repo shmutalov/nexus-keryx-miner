@@ -58,8 +58,10 @@ struct CudaResidentSearch::Impl {
   ResidentWitnessTiles host_witness; // One bounded staging buffer; released with PoM on AI preemption.
   std::unique_ptr<V5Resources> v5;
   Resources resources;
-  CUfunction v5_kernel{},pad_fill_kernel{};
+  CUfunction v5_kernel{},pad_fill_kernel{},v5_lockstep2_kernel{},v5_lockstep_kernel{};
   CUfunction kernel{},seed_kernel{},fold_kernel{},witness_offsets_kernel{},witness_pairs_kernel{};
+  bool contiguous_weights{false};
+  std::uint64_t contiguous_wbase{0};
   std::uint32_t tensor_count{},shift{12};
   std::uint64_t tiles{},reciprocal{};
   std::vector<std::uint64_t> canonical_bases,canonical_prefix;
@@ -128,8 +130,27 @@ struct CudaResidentSearch::Impl {
     this->host_lut=host_lut;
     bases.allocate(host_bases.size()*8);prefix.allocate(host_prefix.size()*8);lut.allocate(host_lut.size()*2);winner.allocate(8);sponge.allocate(25*8);h10_seeds.allocate(18432*8);
     check(cuMemcpyHtoD(bases.ptr,host_bases.data(),host_bases.size()*8),"copy tensor descriptors");check(cuMemcpyHtoD(prefix.ptr,host_prefix.data(),host_prefix.size()*8),"copy canonical prefix");check(cuMemcpyHtoD(lut.ptr,host_lut.data(),host_lut.size()*2),"copy chunk LUT");
+    {
+      bool is_contig = !host_bases.empty();
+      const auto b0 = host_bases.empty() ? 0 : host_bases[0];
+      for (std::size_t j = 0; j < host_bases.size(); ++j) {
+        if (host_bases[j] != b0 + host_prefix[j] * 32ULL) {
+          is_contig = false;
+          break;
+        }
+      }
+      if (b0 % 16 != 0) is_contig = false;
+      contiguous_weights = is_contig;
+      contiguous_wbase = b0;
+    }
     check(cuModuleLoadData(&resources.module,_binary_nexus_resident_cubin_start),"load resident multi-architecture image");check(cuModuleGetFunction(&kernel,resources.module,"nexus_resident_search_preseeded"),"resident kernel entry point");
     check(cuModuleGetFunction(&v5_kernel,resources.module,"nexus_resident_search_v5"),"v5 resident kernel entry point");
+    (void)cuModuleGetFunction(&v5_lockstep2_kernel,resources.module,"pom_mine_v5_lockstep2_seeded");
+    (void)cuModuleGetFunction(&v5_lockstep_kernel,resources.module,"pom_mine_v5_lockstep_seeded");
+    if (contiguous_weights && v5_lockstep2_kernel) {
+      std::cout << "PoM v5[CUDA]: lock-step walk available (6 KiB smem, contiguous weights at 0x"
+                << std::hex << contiguous_wbase << std::dec << ")\n" << std::flush;
+    }
     check(cuModuleGetFunction(&pad_fill_kernel,resources.module,"nexus_v5_pad_fill"),"v5 pad fill entry point");
     check(cuModuleGetFunction(&seed_kernel,resources.module,"nexus_h10_seeds"),"H10 seed entry point");
     check(cuModuleGetFunction(&fold_kernel,resources.module,"nexus_tile_folds"),"immutable tile fold entry point");
@@ -380,7 +401,23 @@ ResidentSearchResult CudaResidentSearch::run_impl(const Hash &pph,std::uint64_t 
     launch_params[28]=&p.path_metadata.ptr;
     launch_params[29]=&p.path_addresses.ptr;
   }
-  check(cuLaunchKernel(p.v5?p.v5_kernel:p.path_kernel,static_cast<unsigned>((count+3)/4),1,1,128,1,1,p.v5?12416:8320,p.resources.stream,launch_params.data(),nullptr),"launch resident PoM");
+  if(p.v5 && p.contiguous_weights && p.v5_lockstep2_kernel && !trace) {
+    void *ls_params[] = {
+      &p.contiguous_wbase, &p.tiles,
+      &p.v5->pad.ptr, &p.v5->spec.tiles,
+      &k,
+      &words[0], &words[1], &words[2], &words[3],
+      &targets[0], &targets[1], &targets[2], &targets[3],
+      &start, &count,
+      &p.reciprocal, &p.v5->reciprocal,
+      &p.v5->pad_steps,
+      &p.h10_seeds.ptr,
+      &p.winner.ptr
+    };
+    check(cuLaunchKernel(p.v5_lockstep2_kernel, static_cast<unsigned>((count + 1) / 2), 1, 1, 32, 1, 1, 6144, p.resources.stream, ls_params, nullptr), "launch resident lockstep2 PoM");
+  } else {
+    check(cuLaunchKernel(p.v5?p.v5_kernel:p.path_kernel,static_cast<unsigned>((count+3)/4),1,1,128,1,1,p.v5?12416:8320,p.resources.stream,launch_params.data(),nullptr),"launch resident PoM");
+  }
   *pinned_winner=none;
   check(cuMemcpyDtoHAsync(pinned_winner,p.winner.ptr,8,p.resources.stream),"read winning nonce");
   check(cuEventRecord(p.resources.end,p.resources.stream),"record resident completion");if(after_enqueue){const auto status=cuEventQuery(p.resources.end);if(status!=CUDA_SUCCESS&&status!=CUDA_ERROR_NOT_READY)check(status,"resident completion query");after_enqueue(status==CUDA_ERROR_NOT_READY);}

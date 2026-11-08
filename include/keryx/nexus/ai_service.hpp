@@ -27,7 +27,13 @@ inline constexpr std::uint64_t mainnet_signed_response_activation_daa = 76'316'6
 inline constexpr std::uint64_t testnet_private_inference_gate_daa = 6'000;
 inline constexpr std::uint64_t service_window_v1_base_daa = 300;
 inline constexpr std::uint64_t service_window_v2_base_daa = 3'000;
+inline constexpr std::uint64_t window_safety_daa = 600;
+inline constexpr std::uint64_t sibling_slack_works = 2;
 inline constexpr std::size_t max_pending_requests = 64;
+
+inline bool is_sibling_takeover_due(std::uint64_t current_daa, std::uint64_t window_end, std::uint64_t work_daa) noexcept {
+  return window_end > 0 && current_daa + sibling_slack_works * work_daa + window_safety_daa >= window_end;
+}
 
 struct Request {
   std::array<std::uint8_t, 32> txid{};

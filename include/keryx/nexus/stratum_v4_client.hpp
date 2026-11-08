@@ -229,6 +229,9 @@ public:
   std::vector<std::string> take_outbound_wire_log();
   void enable_loopback_test_mode(bool enabled);
 
+  bool upload_trace_record(std::string_view task_id, std::span<const std::uint8_t> blob);
+  void register_trace_upload_url(std::string_view task_id, std::string_view upload_url);
+
 private:
   struct SocketHandle;
 
@@ -267,6 +270,7 @@ private:
   std::size_t extranonce2_hex_digits_{16};
   bool pool_supports_b64_proof_{false};
   std::atomic<bool> ai_inference_busy_{false};
+  std::unordered_map<std::string, std::string> trace_upload_urls_;
 
   std::optional<StratumPoolJob> active_job_;
   std::unordered_map<std::string, std::uint64_t> job_ids_seen_;
