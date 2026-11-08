@@ -22,6 +22,7 @@
 #include "keryx/nexus/network/submission_pipeline.hpp"
 #include "keryx/nexus/capture.hpp"
 #include "keryx/nexus/platform/io.hpp"
+#include "keryx/nexus/scoped_file_cache_guard.hpp"
 #include "keryx/nexus/cpu_topology.hpp"
 #include "keryx/nexus/stratum_v4_client.hpp"
 #include "keryx/nexus/h15_bridge.h"
@@ -407,6 +408,12 @@ int main(int argc, char **argv) {
   NativePomTelemetry telemetry(monotonic_ns());
   telemetry.set_pom_backend("vulkan-jit");
   telemetry.set_state("STARTUP", "STARTUP", "INITIALIZING", submit_enabled ? "ARMED" : "DISABLED");
+  std::optional<ScopedFileCacheGuard> file_cache_guard;
+  try {
+    file_cache_guard.emplace();
+  } catch (const std::exception &e) {
+    std::cout << "MINER_FILE_CACHE_GUARD=SKIPPED detail=\"" << e.what() << "\"\n" << std::flush;
+  }
 
   if (!pool_mode) {
     NativePomTelemetry::StratumFields solo_stratum;
@@ -1338,7 +1345,7 @@ int main(int argc, char **argv) {
     }
 
     telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
-    if (!job.lease.valid() || !job_queue.wait_refresh_resolved(job.generation)) {
+    if (winner < 0 && (!job.lease.valid() || !job_queue.wait_refresh_resolved(job.generation))) {
       telemetry.work_stale(dispatch_batch);
       nonce_cursor += dispatch_batch;
       continue;
@@ -1356,14 +1363,24 @@ int main(int argc, char **argv) {
         const auto seed = block_seed(pph, header.timestamp, winning_nonce, header.daa_score);
         const auto pad = official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score);
 
+        std::unordered_map<std::uint64_t, std::array<std::uint8_t, tile_bytes>> tile_cache;
+        tile_cache.reserve(512);
+
         auto walk = walk_v5_from_model(seed, tile_count, pad, [&](std::uint64_t tile) {
           std::array<std::uint8_t, tile_bytes> bytes;
           gguf.read_tile_into(tile, bytes);
+          tile_cache.emplace(tile, bytes);
           return bytes;
         });
 
+        for (const auto off : walk.offsets) {
+          if (off < tile_count) merkle.prefetch_tile_path(off);
+        }
+
         const auto proof = prove_v5_from_walk_parallel(walk, header.pom_tier, tile_count,
             [&](std::uint64_t tile) {
+              const auto it = tile_cache.find(tile);
+              if (it != tile_cache.end()) return it->second;
               std::array<std::uint8_t, tile_bytes> bytes;
               gguf.read_tile_into(tile, bytes);
               return bytes;
@@ -1391,15 +1408,17 @@ int main(int argc, char **argv) {
           const std::string proof_bytes(reinterpret_cast<const char*>(wire.data()), wire.size());
           network::PomWinner pom_winner{std::move(verified), header.daa_score, final, header.pom_tier, proof_bytes};
 
-          if (submit_enabled && submit_client && job.lease.valid() &&
-              job_queue.wait_refresh_resolved(job.generation)) {
+          if (submit_enabled && submit_client) {
             telemetry.set_state("ACTIVE", "IDLE", "", "SUBMIT_SENT");
             auto submit_res = network::submit_pom_winner(
                 *submit_client, block, pom_winner,
                 job.fields.pay_address, job.fields.extra_data,
                 true, std::chrono::seconds(5));
             telemetry.set_state("ACTIVE", "IDLE", "", network::submission_state_name(submit_res.state));
-            std::osyncstream(std::cout) << "LIVE_SUBMIT_RESULT source=AMD_VULKAN state="
+            std::osyncstream(std::cout) << "LIVE_H15_SUBMIT_RESULT state="
+                                        << network::submission_state_name(submit_res.state)
+                                        << " hash=" << submit_res.block_hash << "\n"
+                                        << "LIVE_SUBMIT_RESULT source=AMD_VULKAN state="
                                         << network::submission_state_name(submit_res.state)
                                         << " hash=" << submit_res.block_hash << " nonce=" << winning_nonce << "\n" << std::flush;
           } else {
