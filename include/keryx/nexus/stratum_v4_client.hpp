@@ -142,6 +142,7 @@ struct PendingShareRecord {
   bool has_task_root{false};
   Hash task_root{};
   bool satisfies_network_target{false};
+  bool was_b64{false};
   std::chrono::steady_clock::time_point sent_at{};
 };
 
@@ -257,6 +258,7 @@ private:
   std::uint64_t nonce_fixed_{0};
   std::uint64_t nonce_mask_{0xffffffffffffffffULL};
   std::size_t extranonce2_hex_digits_{16};
+  bool pool_supports_b64_proof_{false};
 
   std::optional<StratumPoolJob> active_job_;
   std::unordered_map<std::string, std::uint64_t> job_ids_seen_;

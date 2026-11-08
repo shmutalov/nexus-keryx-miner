@@ -166,6 +166,39 @@ std::string json_escape(std::string_view input) {
   return out;
 }
 
+std::string base64_encode(std::span<const std::uint8_t> in) {
+  static constexpr char tbl[] =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((in.size() + 2) / 3) * 4);
+  std::size_t i = 0;
+  while (i + 3 <= in.size()) {
+    const std::uint32_t v = (static_cast<std::uint32_t>(in[i]) << 16) |
+                            (static_cast<std::uint32_t>(in[i + 1]) << 8) |
+                            static_cast<std::uint32_t>(in[i + 2]);
+    out.push_back(tbl[(v >> 18) & 0x3f]);
+    out.push_back(tbl[(v >> 12) & 0x3f]);
+    out.push_back(tbl[(v >> 6) & 0x3f]);
+    out.push_back(tbl[v & 0x3f]);
+    i += 3;
+  }
+  if (i + 1 == in.size()) {
+    const std::uint32_t v = static_cast<std::uint32_t>(in[i]) << 16;
+    out.push_back(tbl[(v >> 18) & 0x3f]);
+    out.push_back(tbl[(v >> 12) & 0x3f]);
+    out.push_back('=');
+    out.push_back('=');
+  } else if (i + 2 == in.size()) {
+    const std::uint32_t v = (static_cast<std::uint32_t>(in[i]) << 16) |
+                            (static_cast<std::uint32_t>(in[i + 1]) << 8);
+    out.push_back(tbl[(v >> 18) & 0x3f]);
+    out.push_back(tbl[(v >> 12) & 0x3f]);
+    out.push_back(tbl[(v >> 6) & 0x3f]);
+    out.push_back('=');
+  }
+  return out;
+}
+
 std::string u64_hex_padded(std::uint64_t val, std::size_t digits) {
   std::ostringstream oss;
   oss << std::hex << std::nouppercase << std::setfill('0');
@@ -1276,6 +1309,24 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
     if (res_it != fields.end() &&
         res_it->second.kind_case() == google::protobuf::Value::kListValue) {
       const auto &arr = res_it->second.list_value().values();
+      if (arr.size() >= 1 &&
+          arr[0].kind_case() == google::protobuf::Value::kListValue) {
+        for (const auto &sub : arr[0].list_value().values()) {
+          if (sub.kind_case() == google::protobuf::Value::kListValue) {
+            const auto &pair = sub.list_value().values();
+            if (pair.size() >= 2 &&
+                pair[0].kind_case() == google::protobuf::Value::kStringValue &&
+                pair[1].kind_case() == google::protobuf::Value::kStringValue) {
+              if (pair[0].string_value() == "keryx.proof_encoding" &&
+                  pair[1].string_value() == "b64") {
+                pool_supports_b64_proof_ = true;
+                std::cout << "{\"event\":\"STRATUM_CAPABILITY\",\"capability\":\"keryx.proof_encoding\",\"value\":\"b64\"}\n"
+                          << std::flush;
+              }
+            }
+          }
+        }
+      }
       if (arr.size() >= 2 &&
           arr[1].kind_case() == google::protobuf::Value::kStringValue &&
           !arr[1].string_value().empty()) {
@@ -1398,6 +1449,11 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
     }
 
     ++rejected_shares_;
+    if (rec.was_b64 && pool_supports_b64_proof_) {
+      pool_supports_b64_proof_ = false;
+      std::cout << "{\"event\":\"STRATUM_CAPABILITY_FALLBACK\",\"capability\":\"keryx.proof_encoding\",\"fallback\":\"hex\"}\n"
+                << std::flush;
+    }
     std::string lower_msg = err_msg;
     for (char &c : lower_msg)
       c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -1586,7 +1642,14 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
        "Share OPoI tag verification failed");
 
   const std::string nonce_hex = u64_hex_padded(share.nonce, 16);
-  const std::string proof_hex = hex_encode_bytes(share.pom_proof_borsh);
+  std::string proof_field;
+  bool was_b64 = false;
+  if (pool_supports_b64_proof_) {
+    proof_field = "b64:" + base64_encode(share.pom_proof_borsh);
+    was_b64 = true;
+  } else {
+    proof_field = hex_encode_bytes(share.pom_proof_borsh);
+  }
 
   const bool send_task_root =
       (share.protocol_version == 4 &&
@@ -1608,7 +1671,7 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
   oss << "{\"id\":" << rpc_id << ",\"method\":\"mining.submit\",\"params\":[\""
       << json_escape(config_.worker) << "\",\"" << json_escape(share.job_id)
       << "\",\"" << nonce_hex << "\",\"" << opoi_tag << "\",\""
-      << json_escape(share.ipfs_cid) << "\",\"" << proof_hex << "\"";
+      << json_escape(share.ipfs_cid) << "\",\"" << proof_field << "\"";
   if (send_task_root) {
     oss << ",\"" << task_root_hex << "\"";
   }
@@ -1633,6 +1696,7 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
   rec.has_task_root = send_task_root;
   rec.task_root = committed_task_root;
   rec.satisfies_network_target = satisfies_net;
+  rec.was_b64 = was_b64;
   rec.sent_at = std::chrono::steady_clock::now();
   pending_shares_[rpc_id] = rec;
 
