@@ -28,7 +28,13 @@ public:
   }
   std::string infer(std::string_view prompt,std::uint32_t tokens,
       const std::function<bool()> &cancelled={},std::chrono::seconds budget=std::chrono::seconds(120)) const {
-    if(prompt.empty()||prompt.size()>60*1024||prompt.find('\0')!=std::string_view::npos||!tokens||tokens>4096||budget.count()<=0)
+    std::string clean_prompt;
+    if (prompt.find('\0') != std::string_view::npos) {
+      clean_prompt.reserve(prompt.size());
+      for (char c : prompt) if (c != '\0') clean_prompt.push_back(c);
+      prompt = clean_prompt;
+    }
+    if(prompt.empty()||prompt.size()>60*1024||!tokens||tokens>4096||budget.count()<=0)
       throw std::invalid_argument("Invalid bounded child inference request");
     struct Resources {
       int input[2]{-1,-1},output[2]{-1,-1},lease{-1};pid_t pid{-1};

@@ -110,17 +110,84 @@ Challenge parse_challenge(const std::string &wire) {
   return out;
 }
 
+std::string sanitize_nul_bytes(std::string_view text) {
+  if (text.find('\0') == std::string_view::npos) {
+    return std::string(text);
+  }
+  std::string clean;
+  clean.reserve(text.size());
+  for (char c : text) {
+    if (c != '\0') clean.push_back(c);
+  }
+  return clean;
+}
+
+std::size_t prompt_budget(std::size_t ctx_floor, std::size_t max_tokens) noexcept {
+  if (ctx_floor <= max_tokens + 512) return 0;
+  return ctx_floor - max_tokens - 512;
+}
+
+std::optional<std::string> head_tail_cut(std::string_view prompt, std::size_t cap) {
+  constexpr std::string_view sep = "\n…\n";
+  if (prompt.size() <= cap) return std::nullopt;
+  if (cap <= sep.size()) return std::string{};
+  const std::size_t body = cap - sep.size();
+  const std::size_t head_target = body / 2;
+  const std::size_t tail_target = body - head_target;
+
+  // Find valid UTF-8 boundaries for head
+  std::size_t head_end = 0;
+  for (std::size_t i = 0; i <= head_target && i < prompt.size(); ) {
+    unsigned char c = static_cast<unsigned char>(prompt[i]);
+    std::size_t len = 1;
+    if ((c & 0x80) == 0x00) len = 1;
+    else if ((c & 0xE0) == 0xC0) len = 2;
+    else if ((c & 0xF0) == 0xE0) len = 3;
+    else if ((c & 0xF8) == 0xF0) len = 4;
+    if (i + len <= head_target) {
+      i += len;
+      head_end = i;
+    } else {
+      break;
+    }
+  }
+
+  // Tail: reverse find UTF-8 boundary
+  std::size_t tail_start = prompt.size();
+  for (std::size_t i = prompt.size(); i > 0; ) {
+    std::size_t prev = i - 1;
+    while (prev > 0 && (static_cast<unsigned char>(prompt[prev]) & 0xC0) == 0x80) {
+      --prev;
+    }
+    if (prompt.size() - prev <= tail_target) {
+      tail_start = prev;
+      i = prev;
+    } else {
+      break;
+    }
+  }
+
+  std::string out;
+  out.reserve(head_end + sep.size() + (prompt.size() - tail_start));
+  out.append(prompt.data(), head_end);
+  out.append(sep);
+  out.append(prompt.data() + tail_start, prompt.size() - tail_start);
+  return out;
+}
+
 std::string official_qwen35_prompt(const std::string &nonce_hex) {
   if (nonce_hex.empty()) throw std::invalid_argument("OPoI nonce is empty");
-  const std::string prompt = "Keryx inference challenge " + nonce_hex + ": briefly describe what you are.";
+  const std::string clean_nonce = sanitize_nul_bytes(nonce_hex);
+  const std::string prompt = "Keryx inference challenge " + clean_nonce + ": briefly describe what you are.";
   return official_qwen35_ai_prompt(prompt);
 }
 
 std::string official_qwen35_ai_prompt(std::string_view user_prompt) {
-  if (user_prompt.empty() || user_prompt.find('\0') != std::string_view::npos)
-    throw std::invalid_argument("AiRequest prompt is empty or contains NUL");
+  const std::string clean = sanitize_nul_bytes(user_prompt);
+  if (clean.empty())
+    throw std::invalid_argument("AiRequest prompt is empty");
   return std::string("<|im_start|>system\n") + std::string(stock_system_prompt) + "<|im_end|>\n" +
-      "<|im_start|>user\n" + std::string(user_prompt) + "<|im_end|>\n" +
+      "<|im_start|>user\n" + clean + "<|im_end|>\n" +
       "<|im_start|>assistant\n<think>\n\n</think>\n\n";
 }
 
@@ -350,16 +417,32 @@ std::string StockLlamaRuntime::answer(const Challenge &challenge) {
 std::string StockLlamaRuntime::infer(std::string_view prompt, std::uint32_t max_tokens) {
   if (!impl_ || !impl_->model || !impl_->generate) throw std::logic_error("inference runtime is not loaded");
   const std::lock_guard lock(impl_->mutex);
-  if (prompt.empty() || prompt.size() > 60U * 1024U || max_tokens == 0 || max_tokens > 4096)
+  std::string sanitized = sanitize_nul_bytes(prompt);
+  if (sanitized.empty() || max_tokens == 0 || max_tokens > 4096)
     throw std::invalid_argument("AiRequest prompt or max_tokens outside stock protocol bounds");
-  if (prompt.find('\0') != std::string_view::npos)
-    throw std::invalid_argument("AiRequest prompt contains an embedded NUL byte");
-  const std::string owned_prompt(prompt);
+
+  // Context budget check and head_tail_cut fallback
+  const std::size_t floor = impl_->context_capacity ? impl_->context_capacity : 8192;
+  const std::size_t budget = prompt_budget(floor, max_tokens);
+  if (sanitized.size() > budget && budget > 0) {
+    if (auto cut = head_tail_cut(sanitized, budget)) {
+      sanitized = std::move(*cut);
+    }
+  }
+
   impl_->scratch_active = true;
   if (impl_->trace) impl_->trace->ensure_full_context();
   std::vector<char> output(64 * 1024, '\0');
-  const int length = impl_->generate(impl_->model, owned_prompt.c_str(), static_cast<int>(max_tokens), output.data(),
-                                     static_cast<int>(output.size()));
+  int length = impl_->generate(impl_->model, sanitized.c_str(), static_cast<int>(max_tokens), output.data(),
+                               static_cast<int>(output.size()));
+  if (length <= 0) {
+    // Retry once with aggressive head_tail_cut if length indicates prompt too long
+    if (auto cut = head_tail_cut(sanitized, budget > 256 ? budget / 2 : 256)) {
+      sanitized = std::move(*cut);
+      length = impl_->generate(impl_->model, sanitized.c_str(), static_cast<int>(max_tokens), output.data(),
+                               static_cast<int>(output.size()));
+    }
+  }
   if (length <= 0 || static_cast<std::size_t>(length) > output.size())
     throw std::runtime_error("stock llama AiRequest inference failed or returned invalid length");
   return std::string(output.data(), static_cast<std::size_t>(length));
@@ -484,7 +567,8 @@ void StockLlamaRuntime::pom_release_pad() {
 }
 
 std::pair<std::string,std::string> official_qwen35_trace_prompt(std::string_view user){
- if(user.empty()||user.find('\0')!=user.npos)throw std::invalid_argument("Invalid trace prompt");
- return {"<|im_start|>system\nRequest id:","\n"+std::string(stock_system_prompt)+"<|im_end|>\n<|im_start|>user\n"+std::string(user)+"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"};
+  const std::string clean = sanitize_nul_bytes(user);
+  if(clean.empty()) throw std::invalid_argument("Invalid trace prompt");
+  return {"<|im_start|>system\nRequest id:","\n"+std::string(stock_system_prompt)+"<|im_end|>\n<|im_start|>user\n"+clean+"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"};
 }
 }

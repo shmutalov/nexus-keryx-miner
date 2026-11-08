@@ -323,7 +323,7 @@ int main(int argc, char **argv) {
     else if (arg == "-a" || arg == "--address") { if (i + 1 < argc) pay_address = argv[++i]; }
     else if (arg == "--extra-data") { if (i + 1 < argc) extra_data = argv[++i]; }
     else if (arg == "--worker") { if (i + 1 < argc) pool_worker = argv[++i]; }
-    else if (arg == "--password") { if (i + 1 < argc) pool_password = argv[++i]; }
+    else if (arg == "--password" || arg == "--pool-password") { if (i + 1 < argc) pool_password = argv[++i]; }
     else if (arg == "--backup-urls") {
       if (i + 1 < argc) {
         std::string urls = argv[++i];

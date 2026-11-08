@@ -527,12 +527,37 @@ AiTracedAnswer H15AuditClient::infer(std::string_view prompt,
   std::uint32_t head = 0;
   need(nexus_h15_prefix(0, request.data(), tokens.data(), &n, &head) == 0,
        "H15 request prefix failed");
-  auto [first, rest] = opoi::official_qwen35_trace_prompt(prompt);
+
+  std::string working_prompt(prompt);
+  const std::size_t budget = opoi::prompt_budget(8192, max_tokens);
+  if (working_prompt.size() > budget && budget > 0) {
+    if (auto cut = opoi::head_tail_cut(working_prompt, budget)) {
+      working_prompt = std::move(*cut);
+    }
+  }
+
+  auto [first, rest] = opoi::official_qwen35_trace_prompt(working_prompt);
   opoi::TracePrefix prefix{std::span(tokens.data(), n), head, rest};
   const auto start = std::chrono::steady_clock::now();
-  auto g = p.runtime.infer_traced(
-      first, &prefix, max_tokens,
-      static_cast<std::uint32_t>(prompt.size() / 16), 10);
+  opoi::TracedGeneration g;
+  try {
+    g = p.runtime.infer_traced(
+        first, &prefix, max_tokens,
+        static_cast<std::uint32_t>(working_prompt.size() / 16), 10);
+  } catch (...) {
+    if (auto cut = opoi::head_tail_cut(working_prompt, budget > 256 ? budget / 2 : 256)) {
+      working_prompt = std::move(*cut);
+      auto [f, r] = opoi::official_qwen35_trace_prompt(working_prompt);
+      first = std::move(f);
+      rest = std::move(r);
+      prefix.rest = rest;
+      g = p.runtime.infer_traced(
+          first, &prefix, max_tokens,
+          static_cast<std::uint32_t>(working_prompt.size() / 16), 10);
+    } else {
+      throw;
+    }
+  }
   need(g.sequence_roots.has_value(), "H15 sequence roots missing");
   NexusH15Capture raw{
       g.tokens.data(),
@@ -551,7 +576,7 @@ AiTracedAnswer H15AuditClient::infer(std::string_view prompt,
           .count());
   need(nexus_h15_capture(
            &raw, 0, request.data(), max_tokens,
-           static_cast<std::uint32_t>(prompt.size()),
+           static_cast<std::uint32_t>(working_prompt.size()),
            reinterpret_cast<const std::uint8_t *>(result.answer.data()),
            result.answer.size(), secs, &p.capture,
            result.commitment.data()) == 0,

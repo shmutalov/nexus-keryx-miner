@@ -50,7 +50,13 @@ public:
     if(!i.model)throw std::runtime_error(std::string("Vulkan inference load failed: ")+i.error());
   }
   std::string infer(std::string_view prompt,std::uint32_t tokens) {
-    if(prompt.empty()||prompt.size()>60*1024||prompt.find('\0')!=std::string_view::npos||!tokens||tokens>4096)
+    std::string clean_prompt;
+    if (prompt.find('\0') != std::string_view::npos) {
+      clean_prompt.reserve(prompt.size());
+      for (char c : prompt) if (c != '\0') clean_prompt.push_back(c);
+      prompt = clean_prompt;
+    }
+    if(prompt.empty()||prompt.size()>60*1024||!tokens||tokens>4096)
       throw std::invalid_argument("Invalid bounded Vulkan inference request");
     const std::string owned(prompt);std::vector<char> answer(65536);
     const int n=impl_->generate(impl_->model,owned.c_str(),tokens,answer.data(),answer.size());
