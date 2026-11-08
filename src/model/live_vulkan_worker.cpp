@@ -14,6 +14,10 @@
 #include "keryx/nexus/consensus/pom_v4.hpp"
 #include "keryx/nexus/consensus/pom_v5.hpp"
 #include "keryx/nexus/prepared_rpc_template.hpp"
+#include "keryx/nexus/active_template_job.hpp"
+#include "keryx/nexus/protocol_rules.hpp"
+#include "keryx/nexus/escrow_claim_policy.hpp"
+#include "keryx/nexus/strike_monitor.hpp"
 #include "keryx/nexus/network/submit_block_client.hpp"
 #include "keryx/nexus/network/submission_pipeline.hpp"
 #include "keryx/nexus/capture.hpp"
@@ -168,11 +172,34 @@ std::string canonical_grpc_endpoint(std::string endpoint) {
   return endpoint;
 }
 
+std::string read_nexus_release_version(const fs::path &data_root) {
+  const std::array<fs::path, 3> candidates{
+      data_root / "work" / "nexus-stream-rtx-multipool-runtime" / "VERSION",
+      data_root / "source" / "VERSION",
+      data_root / "VERSION"};
+  for (const auto &p : candidates) {
+    if (fs::exists(p)) {
+      std::ifstream in(p);
+      std::string ver;
+      if (in >> ver && !ver.empty()) {
+        return ver;
+      }
+    }
+  }
+  return "0.0.5";
+}
+
+void maybe_use_task_context(opoi::StockLlamaRuntime &runtime) {
+  if (runtime.abi_version() >= 8) {
+    runtime.use_task_context();
+  }
+}
+
 Hash trace_stratum_window_task_root(opoi::StockLlamaRuntime &runtime,
                                     std::uint8_t tier, const Hash &window_seed) {
-  if (runtime.abi_version() != 8 && runtime.abi_version() != 9)
-    throw std::runtime_error("Stratum v4 H15 block-task tracing requires stock llama ABI8/9");
-  runtime.use_task_context();
+  if (runtime.abi_version() < 6)
+    throw std::runtime_error("Stratum v4 H15 block-task tracing requires stock llama ABI6/8/9");
+  maybe_use_task_context(runtime);
   std::size_t manifest_bytes = 0, layer_rows = 0;
   NexusTraceManifestInfo chain_info{};
   if (nexus_ai_h15_manifest(0, tier, 140115000ULL, nullptr, 0, &manifest_bytes,
@@ -195,7 +222,7 @@ Hash trace_stratum_window_task_root(opoi::StockLlamaRuntime &runtime,
   struct ScratchRelease {
     opoi::StockLlamaRuntime &rt;
     ~ScratchRelease() noexcept {
-      try { rt.use_task_context(); } catch (...) {}
+      try { maybe_use_task_context(rt); } catch (...) {}
     }
   } scratch_release{runtime};
   if (runtime.abi_version() == 9) {
@@ -268,7 +295,13 @@ int main(int argc, char **argv) {
   std::string escrow_key_file;
   std::string escrow_cert_hex;
   std::uint64_t nonce_cursor = 0x4b455259584d3231ULL;
-  std::uint32_t batch_size = 8192;
+  std::uint32_t batch_size = 1024;
+  if (const char *env_batch = std::getenv("NEXUS_VULKAN_BATCH_SIZE")) {
+    try {
+      const auto parsed = static_cast<std::uint32_t>(std::stoul(env_batch));
+      if (parsed >= 64 && parsed <= 8192) batch_size = parsed;
+    } catch (...) {}
+  }
   bool submit_enabled = false;
   bool ai_responses_enabled = false;
   bool escrow_claims_enabled = false;
@@ -437,8 +470,24 @@ int main(int argc, char **argv) {
   // Preemption coordinator
   GpuPreemptionCoordinator gpu_ownership;
 
-  // Inference self test
-  startup.record("INFERENCE_SELF_TEST", StartupResult::Pass, "Resident Vulkan model inference engine verified");
+  // Inference self test on resident Vulkan engine
+  try {
+    const char *skip_self_test = std::getenv("NEXUS_SKIP_STARTUP_SELF_TEST");
+    if (!skip_self_test || std::string_view(skip_self_test) != "1") {
+      const auto self_test_challenge = opoi::parse_challenge(
+          "bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710:0011aaff");
+      const auto answer = shared_runtime->answer(self_test_challenge);
+      const auto self_test_wire = opoi::format_inference_result(self_test_challenge, answer);
+      maybe_use_task_context(*shared_runtime);
+      std::cout << "INFERENCE_SELF_TEST=PASS source=local_fixture response_bytes="
+                << self_test_wire.size() << " submitted=false vulkan_runtime_retained=true\n" << std::flush;
+    }
+    startup.record("INFERENCE_SELF_TEST", StartupResult::Pass, "Resident Vulkan model inference engine verified");
+  } catch (const std::exception &e) {
+    startup.record("INFERENCE_SELF_TEST", StartupResult::Blocked,
+                   std::string("Resident Vulkan self-test failed: ") + e.what());
+    return 78;
+  }
 
   // Escrow key discovery
   fs::path escrow_key_path;
@@ -487,11 +536,24 @@ int main(int argc, char **argv) {
     }
   }
 
-  // Format extra_data if escrow_cert_hex provided and missing in extra_data
+  // Format extra_data with authoritative VERSION if escrow_cert_hex provided and missing in extra_data
+  const std::string release_version = read_nexus_release_version(developer_data_root());
   if (extra_data.empty() || extra_data.find("/esig:") == std::string::npos) {
     if (!escrow_cert_hex.empty()) {
       const std::string escrow_hex = hex(escrow_pubkey.data(), escrow_pubkey.size());
-      extra_data = "NEXUS v0.0.3/escrow:" + escrow_hex + "/esig:" + escrow_cert_hex;
+      extra_data = "NEXUS v" + release_version + "/escrow:" + escrow_hex + "/esig:" + escrow_cert_hex;
+    }
+  } else if (extra_data.rfind("/escrow:", 0) == 0) {
+    extra_data = "NEXUS v" + release_version + extra_data;
+  }
+
+  // Verify Schnorr delegation certificate independently
+  const auto delegation_sig = delegation_from_extra(extra_data);
+  if (!pay_address.empty() && !extra_data.empty() && extra_data.find("/esig:") != std::string::npos) {
+    if (!ai::stock_verify_escrow_delegation(pay_address, escrow_pubkey, delegation_sig)) {
+      startup.record("ESCROW_IDENTITY_READY", StartupResult::Blocked,
+                     "stock Schnorr escrow delegation verification failed on Vulkan worker");
+      return 78;
     }
   }
 
@@ -518,11 +580,15 @@ int main(int argc, char **argv) {
 
   startup.record("ESCROW_IDENTITY_READY", StartupResult::Pass, "Escrow identity and Schnorr delegation verified");
 
-  // Isolated AI Response Service & H15 Audit Client for Sovereign Vulkan Worker
+  // Isolated AI Response Service, H15 Audit Client, Escrow Watcher & Strike Monitor for Sovereign Vulkan Worker
   std::unique_ptr<ai::H15AuditClient> h15_audits;
   std::unique_ptr<ai::AiResponseService> ai_response_service;
   std::unique_ptr<ai::EscrowWatcher> escrow_watcher;
+  std::unique_ptr<ai::StrikeMonitor> strike_monitor;
   ai::AiResponseTransport ai_response_transport(endpoint);
+  std::future<void> escrow_claim_task;
+  std::atomic_uint64_t next_claim_check_ns{0};
+  std::uint64_t last_claim_check_unix{0};
 
   if (service_identity && !pool_mode) {
     const auto ai_state_dir = developer_data_root() / "state" / "ai-service-vulkan";
@@ -550,7 +616,7 @@ int main(int argc, char **argv) {
     ai_config.native_h15 = bool(h15_audits) && h15_audits->ready();
     ai_config.escrow_secret = escrow_secret;
     ai_config.escrow_pubkey = escrow_pubkey;
-    ai_config.delegation_signature = delegation_from_extra(extra_data);
+    ai_config.delegation_signature = delegation_sig;
     ai_config.model_id = official_model;
     ai_config.payout_address = pay_address;
     ai_config.service_identity = *service_identity;
@@ -571,6 +637,29 @@ int main(int argc, char **argv) {
       escrow_watcher = std::make_unique<ai::EscrowWatcher>(
           escrow_secret, pay_address,
           escrow_state_dir / "audit.jsonl");
+      escrow_watcher->set_claim_construction_enabled(false);
+    } catch (...) {}
+
+    try {
+      strike_monitor = std::make_unique<ai::StrikeMonitor>(
+          *service_identity,
+          ai_state_dir / "strikes.jsonl",
+          [endpoint, identity = *service_identity] {
+            const auto rpc = probe_ai_service_rpc(endpoint, 0, identity, std::chrono::seconds(5),
+                                                  ServiceRpcQuery::StrikesOnly);
+            auto observed = rpc.strikes;
+            if (observed.identity.empty()) observed.identity = identity;
+            if (!rpc.strikes_available && observed.error.empty()) observed.error = "GetServiceStrikes unavailable";
+            return observed;
+          },
+          [](const ai::StrikeSnapshot &s) {
+            std::cout << "{\"event\":\"SERVICE_STRIKE_POLL\",\"identity\":\"" << s.identity
+                      << "\",\"availability\":\""
+                      << (s.availability == ai::StrikeSnapshot::Availability::Available ? "AVAILABLE" : "UNKNOWN")
+                      << "\",\"observed_unix_ms\":" << s.observed_unix_ms << "}\n" << std::flush;
+          },
+          std::chrono::seconds(60));
+      strike_monitor->start();
     } catch (...) {}
   }
 
@@ -610,7 +699,7 @@ int main(int argc, char **argv) {
     ingress_thread = std::thread([&] {
       try {
         run_live_job_client(
-            endpoint, pay_address, extra_data, job_queue, 0, 1, process_stop,
+            endpoint, pay_address, extra_data, job_queue, 0, 0, process_stop,
             [&](const std::string &wire) -> std::string {
               // OPoI challenge handler
               const auto challenge = opoi::parse_challenge(wire);
@@ -623,11 +712,11 @@ int main(int argc, char **argv) {
                     answer = shared_runtime->answer(challenge);
                     return answer;
                   },
-                  [] {});
+                  [&] { maybe_use_task_context(*shared_runtime); });
               telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
               return opoi::format_inference_result(challenge, answer);
             },
-            [&](const protowire::RpcBlock &block, bool) {
+            [&](const protowire::RpcBlock &block, bool from_backfill) {
               // Block added observer
               if (block.has_header()) {
                 auto prior = ai_current_daa.load(std::memory_order_relaxed);
@@ -667,11 +756,74 @@ int main(int argc, char **argv) {
                     }
                   }
                 }
+
+                if (escrow_watcher) {
+                  escrow_watcher->set_claim_construction_enabled(false);
+                  const auto escrow_res = escrow_watcher->handle_block(block);
+                  escrow_watcher->set_claim_construction_enabled(false);
+                  if (escrow_res.pending_count != 0) {
+                    std::cout << "ESCROW_WATCHER_BLOCK daa=" << block.header().daascore()
+                              << " pending_count=" << escrow_res.pending_count
+                              << " pending_amount_sompi=" << escrow_res.pending_amount_sompi
+                              << " claim_submission=" << (escrow_claims_enabled ? "ENABLED" : "DISABLED") << "\n" << std::flush;
+                  }
+                  if (!from_backfill && escrow_claims_enabled && !escrow_watcher->validation_in_progress()) {
+                    const auto now_ns = monotonic_ns();
+                    const auto unix_now = static_cast<std::uint64_t>(
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch()).count());
+                    const bool task_free = !escrow_claim_task.valid() ||
+                        escrow_claim_task.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+                    if (escrow_claim_task.valid() && task_free) escrow_claim_task.get();
+                    if (task_free &&
+                        ai::escrow_claim_check_due(now_ns, next_claim_check_ns.load(std::memory_order_acquire),
+                                                   unix_now, last_claim_check_unix) &&
+                        !process_stop.load(std::memory_order_relaxed)) {
+                      last_claim_check_unix = unix_now;
+                      next_claim_check_ns.store(now_ns + 1'800'000'000'000ULL, std::memory_order_release);
+                      escrow_claim_task = std::async(std::launch::async, [&, endpoint, claim_block = block]() mutable {
+                        try {
+                          const auto virtual_daa = ai::query_escrow_virtual_daa(endpoint);
+                          claim_block.Clear();
+                          claim_block.mutable_header()->set_daascore(virtual_daa);
+                          const auto ops = escrow_watcher->claim_outpoints(virtual_daa);
+                          const auto live = ai::query_escrow_utxos(endpoint, ops);
+                          if (process_stop.load(std::memory_order_relaxed)) return;
+                          auto candidate = escrow_watcher->verified_claim(claim_block, live);
+                          if (!candidate) return;
+                          auto tx = std::move(*candidate);
+                          const auto digest = ai::consensus_transaction_id(tx);
+                          if (!digest) return;
+                          const auto id = hex(digest->data(), digest->size());
+                          const auto res = ai::submit_ai_response_transaction(endpoint, tx, id);
+                          if (res.state == ai::AiResponseEffects::SubmitResult::State::Acknowledged) {
+                            (void)escrow_watcher->submit_result(id, std::nullopt);
+                          } else {
+                            (void)escrow_watcher->submit_result(
+                                id, res.detail.empty() ? std::string("ambiguous RPC outcome") : res.detail);
+                          }
+                          escrow_watcher->flush();
+                        } catch (...) {}
+                      });
+                    }
+                  }
+                }
               }
             },
             [&](const std::vector<std::string> &removed_hashes) {
               if (ai_response_service) {
                 ai_response_service->observe_removed_chain_blocks(removed_hashes);
+              }
+              if (escrow_watcher) {
+                for (const auto &text : removed_hashes) {
+                  try {
+                    const auto raw = decode_hex_secret(text);
+                    std::array<std::uint8_t, 32> hash{};
+                    std::copy(raw.begin(), raw.end(), hash.begin());
+                    escrow_watcher->chain_block_removed(hash);
+                  } catch (...) {}
+                }
+                escrow_watcher->flush();
               }
             });
       } catch (const std::exception &e) {
@@ -733,24 +885,80 @@ int main(int argc, char **argv) {
   // Main Mining & AI Preemption Loop
   const auto tile_count = gguf.chunk_count() / 32;
   PreparedRpcTemplateCache rpc_cache;
+  std::optional<TemplateJob> reusable_job;
+  const PreparedRpcTemplateCache::Work *active_prepared_template = nullptr;
+  const protowire::RpcBlock *active_block = nullptr;
   std::string last_pool_job_id;
   std::uint64_t last_pool_nonce_fixed = 0;
   std::uint64_t last_pool_nonce_mask = 0;
   const std::uint64_t initial_nonce_cursor = nonce_cursor;
+  std::uint64_t last_reconcile_ns = 0;
+
+  auto reconcile_discovered_journal = [&]() {
+    if (!ai_response_service || ai_response_service->journal().unresolved().empty()) return;
+    const auto now_ns = monotonic_ns();
+    if (last_reconcile_ns != 0 && now_ns - last_reconcile_ns < 2'000'000'000ULL) return;
+    last_reconcile_ns = now_ns;
+    const auto daa = ai_current_daa.load(std::memory_order_acquire);
+    if (service_identity) {
+      try {
+        auto snapshot = probe_ai_service_rpc(endpoint, 0, *service_identity,
+                                             std::chrono::seconds(2),
+                                             ServiceRpcQuery::ProvidersOnly);
+        if (snapshot.providers_available) {
+          service_rpc.providers_available = true;
+          service_rpc.providers = std::move(snapshot.providers);
+          service_rpc.providers_virtual_daa = snapshot.providers_virtual_daa;
+        }
+      } catch (...) {}
+    }
+    (void)ai_response_service->reconcile_discovered(
+        service_rpc.providers, daa, service_rpc.providers_available,
+        [&](std::string_view req_id) -> bool {
+          if (!h15_audits) return false;
+          try {
+            const auto raw_hash = decode_hex_secret(req_id);
+            if (raw_hash.size() != 32) return false;
+            std::array<std::uint8_t, 32> hash{};
+            std::copy(raw_hash.begin(), raw_hash.end(), hash.begin());
+            return h15_audits->response_for_request(hash).has_value();
+          } catch (...) {
+            return false;
+          }
+        });
+    (void)ai_response_service->reconcile_ambiguous([&](std::string_view txid) {
+      return ai_response_transport.known(txid);
+    });
+  };
 
   while (!process_stop.load(std::memory_order_relaxed)) {
-    // 0. Advance autonomous H15 on-chain audits if active
+    // 0. Advance autonomous H15 on-chain audits & journal reconciliation if active
     if (h15_audits) {
       const auto current_daa = ai_current_daa.load(std::memory_order_acquire);
       h15_audits->poll();
       h15_audits->advance(current_daa);
       h15_audits->submit_due(current_daa, ai_responses_enabled);
     }
+    if (!pool_mode) {
+      reconcile_discovered_journal();
+    }
 
     // 1. Process pending AI requests if any
     if (ai_queue.size() > 0) {
       auto req = ai_queue.pop();
       if (req && ai_response_service) {
+        if (service_identity) {
+          try {
+            auto snap = probe_ai_service_rpc(endpoint, 0, *service_identity,
+                                             std::chrono::seconds(5),
+                                             ServiceRpcQuery::ProvidersOnly);
+            if (snap.providers_available) {
+              service_rpc.providers_available = true;
+              service_rpc.providers = std::move(snap.providers);
+              service_rpc.providers_virtual_daa = snap.providers_virtual_daa;
+            }
+          } catch (...) {}
+        }
         std::string parse_why;
         const auto parsed_request = ai::parse_request(req->transaction, req->daa, &parse_why, "mainnet");
         if (parsed_request) {
@@ -765,7 +973,7 @@ int main(int argc, char **argv) {
                 [&] {
                   return shared_runtime->infer(opoi::official_qwen35_ai_prompt(prompt), max_tokens);
                 },
-                [] {});
+                [&] { maybe_use_task_context(*shared_runtime); });
           };
           if (h15_audits) {
             effects.infer_traced = [&](std::string_view prompt, std::uint32_t tokens, const std::array<std::uint8_t, 32> &hash) {
@@ -773,7 +981,7 @@ int main(int argc, char **argv) {
               return gpu_ownership.run_opoi(
                   [&] { shared_runtime->pom_release_pad(); },
                   [&] { return h15_audits->infer(prompt, tokens, hash); },
-                  [] {});
+                  [&] { maybe_use_task_context(*shared_runtime); });
             };
             effects.recover_traced = [&](const Hash &request) { return h15_audits->response_for_request(request); };
             effects.persist_trace = [&](std::string_view id, std::span<const std::uint8_t> payload, std::uint64_t daa, std::uint64_t deadline) {
@@ -816,9 +1024,22 @@ int main(int argc, char **argv) {
               req->daa, 0, parsed_request->max_tokens,
               req->daa >= ai::mainnet_signed_response_activation_daa);
 
-          ai_response_service->serve(
+          const auto serve_res = ai_response_service->serve(
               req->transaction, req->daa, service_rpc.providers, effects,
               deadline, ai_current_daa.load(std::memory_order_acquire));
+
+          if (escrow_watcher && parsed_request->inference_reward != 0 &&
+              (serve_res == ai::ServeResult::Submitted || serve_res == ai::ServeResult::Duplicate)) {
+            const auto record = ai_response_service->journal().get(parsed_request->stable_id);
+            if (record && (record->state == ai::ResponseState::RpcAcknowledged ||
+                           record->state == ai::ResponseState::ChainObserved ||
+                           record->state == ai::ResponseState::Finalized)) {
+              escrow_watcher->track_inference_outpoint(
+                  hex(parsed_request->txid.data(), parsed_request->txid.size()),
+                  req->daa, parsed_request->inference_reward);
+              escrow_watcher->flush();
+            }
+          }
 
           telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
         }
@@ -839,7 +1060,7 @@ int main(int argc, char **argv) {
               answer = shared_runtime->answer(parsed_challenge);
               return opoi::format_inference_result(parsed_challenge, answer);
             },
-            [] {});
+            [&] { maybe_use_task_context(*shared_runtime); });
         std::cout << "OPOI_RUNTIME=PASS source=STRATUM_V4 answer_bytes=" << answer.size() << "\n" << std::flush;
         (void)stratum_client->submit_challenge_response(challenge->model_id_hex, challenge->nonce_hex, answer);
         telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
@@ -885,7 +1106,7 @@ int main(int argc, char **argv) {
               [&] {
                 return trace_stratum_window_task_root(*shared_runtime, pool_job.header.pom_tier, pool_job.window_seed);
               },
-              [] {});
+              [&] { maybe_use_task_context(*shared_runtime); });
           stratum_client->commit_window_task_root(pool_job.window_seed, computed_task_root);
           const auto trace_ms = (monotonic_ns() - trace_start_ns) / 1.0e6;
           std::osyncstream(std::cout) << "STRATUM_V4_WINDOW_TRACE=PASS device=" << device_id
@@ -1021,15 +1242,50 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    // 2B. Fetch current Solo gRPC mining template
-    auto maybe_job = job_queue.wait_pop_for(std::chrono::milliseconds(50));
-    if (!maybe_job) continue;
-    const auto &job = *maybe_job;
+    // 2B. Fetch or reuse current Solo gRPC mining template continuously
+    const auto wait_start_ns = monotonic_ns();
+    auto maybe_job = job_queue.wait_pop_for(
+        std::chrono::milliseconds(reusable_job && reusable_job->lease.valid() ? 0 : 50));
+    const bool adopted_new_job = maybe_job.has_value();
+    auto *active_job = select_active_template_job(reusable_job, std::move(maybe_job));
+    telemetry.record_template_wait(monotonic_ns() - wait_start_ns);
+    if (!active_job) {
+      active_prepared_template = nullptr;
+      active_block = nullptr;
+      telemetry.set_gpu_activity("WAITING_TEMPLATE");
+      continue;
+    }
 
-    const auto &block = rpc_cache.block(job.fields.response_wire);
-    const auto header = header_from_rpc(block.header());
-    const auto pph = pre_pow_hash(header);
-    const auto target = decode_compact_target(header.bits);
+    const auto &job = *active_job;
+    if (!job.lease.valid()) continue;
+
+    try {
+      if (adopted_new_job || !active_prepared_template || !active_block) {
+        require_mining_eligible(job.fields);
+        if (job.fields.pay_address != pay_address ||
+            !opoi::valid_coinbase_extra_data(job.fields.extra_data, extra_data)) {
+          throw std::runtime_error("queued job payout/escrow request binding changed");
+        }
+        active_prepared_template = &rpc_cache.get(job.fields.response_wire);
+        active_block = &rpc_cache.cached_block();
+      }
+    } catch (const std::exception &e) {
+      std::cerr << "AMD_TEMPLATE_VALIDATION_ERROR: " << e.what() << "\n" << std::flush;
+      reusable_job.reset();
+      active_prepared_template = nullptr;
+      active_block = nullptr;
+      continue;
+    }
+
+    if (!job_queue.admission_allowed(job.generation) &&
+        !job_queue.wait_refresh_resolved(job.generation)) {
+      continue;
+    }
+
+    const auto &block = *active_block;
+    const auto &header = active_prepared_template->header;
+    const auto &pph = active_prepared_template->pre_pow;
+    const auto &target = active_prepared_template->target;
     if (target.zero) continue;
 
     // 3. Prepare PoM walk parameters
@@ -1059,6 +1315,7 @@ int main(int argc, char **argv) {
 
     std::int64_t winner = -1;
     const bool ran = gpu_ownership.run_pom([&] {
+      if (v5) maybe_use_task_context(*shared_runtime);
       if (v5 && shared_runtime->pom_v5_ready()) {
         static std::once_flag pad_log_flag;
         std::call_once(pad_log_flag, [&] {
@@ -1081,6 +1338,11 @@ int main(int argc, char **argv) {
     }
 
     telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
+    if (!job.lease.valid() || !job_queue.wait_refresh_resolved(job.generation)) {
+      telemetry.work_stale(dispatch_batch);
+      nonce_cursor += dispatch_batch;
+      continue;
+    }
     telemetry.eligible_attempts(dispatch_batch);
 
     // 5. Check if winner found
@@ -1129,9 +1391,13 @@ int main(int argc, char **argv) {
           const std::string proof_bytes(reinterpret_cast<const char*>(wire.data()), wire.size());
           network::PomWinner pom_winner{std::move(verified), header.daa_score, final, header.pom_tier, proof_bytes};
 
-          if (submit_enabled && submit_client) {
+          if (submit_enabled && submit_client && job.lease.valid() &&
+              job_queue.wait_refresh_resolved(job.generation)) {
             telemetry.set_state("ACTIVE", "IDLE", "", "SUBMIT_SENT");
-            auto submit_res = network::submit_pom_winner(*submit_client, block, pom_winner, pay_address, extra_data, true, std::chrono::seconds(5));
+            auto submit_res = network::submit_pom_winner(
+                *submit_client, block, pom_winner,
+                job.fields.pay_address, job.fields.extra_data,
+                true, std::chrono::seconds(5));
             telemetry.set_state("ACTIVE", "IDLE", "", network::submission_state_name(submit_res.state));
             std::osyncstream(std::cout) << "LIVE_SUBMIT_RESULT source=AMD_VULKAN state="
                                         << network::submission_state_name(submit_res.state)
@@ -1152,6 +1418,8 @@ int main(int argc, char **argv) {
   telemetry.set_state("TERMINATED", "IDLE", "CLEAN_SHUTDOWN", "DISABLED");
   job_queue.close();
   if (stratum_client) stratum_client->stop();
+  if (strike_monitor) strike_monitor->stop();
+  if (escrow_claim_task.valid()) escrow_claim_task.wait();
 
   if (telemetry_thread.joinable()) telemetry_thread.join();
   if (ingress_thread.joinable()) ingress_thread.join();
