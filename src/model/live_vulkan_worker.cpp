@@ -210,7 +210,7 @@ int main(int argc, char **argv) {
   std::string escrow_key_file;
   std::string escrow_cert_hex;
   std::uint64_t nonce_cursor = 0x4b455259584d3231ULL;
-  std::uint32_t batch_size = 16384;
+  std::uint32_t batch_size = 8192;
   bool submit_enabled = false;
   bool ai_responses_enabled = false;
   bool escrow_claims_enabled = false;
@@ -336,6 +336,7 @@ int main(int argc, char **argv) {
     }
     startup.record("CUDA_ENGINE_READY", StartupResult::Pass,
                    "libkeryx-llama-vk loaded and zero-dup resident walk ready on Vulkan");
+    std::cout << "POM_V5_CAPABILITY ready=" << (shared_runtime->pom_v5_ready() ? "TRUE" : "FALSE") << "\n" << std::flush;
   } catch (const std::exception &e) {
     startup.record("CUDA_ENGINE_READY", StartupResult::Blocked,
                    std::string("Vulkan runtime initialization failed: ") + e.what());
@@ -686,19 +687,28 @@ int main(int argc, char **argv) {
     const std::uint32_t h10 = (header.daa_score >= h10_activation_daa) ? 1u : 0u;
 
     // 4. Dispatch PoM batch on resident Vulkan engine
-    telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
-    telemetry.work_launched(batch_size);
-
     const bool v5 = (header.daa_score >= consensus::pom_v5_activation_daa);
     const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
                         : consensus::V5PadSpec{};
     const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
+    const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready()) ? std::min<std::uint32_t>(batch_size, 8192u) : batch_size;
+
+    telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
+    telemetry.work_launched(dispatch_batch);
 
     std::int64_t winner = -1;
     const bool ran = gpu_ownership.run_pom([&] {
       if (v5 && shared_runtime->pom_v5_ready()) {
-        winner = shared_runtime->pom_mine_v5(p, s, t, header.timestamp, nonce_cursor, batch_size,
+        static std::once_flag pad_log_flag;
+        std::call_once(pad_log_flag, [&] {
+          std::cout << "POM_V5_DISPATCH device=" << device_id << " pad_tiles=" << pad.tiles
+                    << " pad_mib=" << (pad.tiles / 1024) << " batch=" << dispatch_batch << "\n" << std::flush;
+        });
+        winner = shared_runtime->pom_mine_v5(p, s, t, header.timestamp, nonce_cursor, dispatch_batch,
                                              pad_words.data(), pad.tiles);
+        if (winner < -1) {
+          std::cerr << "POM_V5_DISPATCH_WARNING code=" << winner << " batch=" << dispatch_batch << "\n" << std::flush;
+        }
       } else {
         winner = shared_runtime->pom_mine(p, s, t, header.timestamp, nonce_cursor, batch_size, 256, h10);
       }
@@ -709,7 +719,7 @@ int main(int argc, char **argv) {
       continue;
     }
 
-    telemetry.work_completed(batch_size * 256, batch_size);
+    telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
 
     // 5. Check if winner found
     if (winner >= 0) {
@@ -771,7 +781,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    nonce_cursor += batch_size;
+    nonce_cursor += dispatch_batch;
   }
 
   std::cout << "LIVE_VULKAN_WORKER=SHUTDOWN\n" << std::flush;
