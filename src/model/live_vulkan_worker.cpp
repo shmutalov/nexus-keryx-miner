@@ -19,6 +19,9 @@
 #include "keryx/nexus/capture.hpp"
 #include "keryx/nexus/platform/io.hpp"
 #include "keryx/nexus/cpu_topology.hpp"
+#include "keryx/nexus/stratum_v4_client.hpp"
+#include "keryx/nexus/h15_bridge.h"
+#include "keryx/nexus/trace_manifest_bridge.h"
 #include "messages.pb.h"
 #include "rpc.pb.h"
 
@@ -165,6 +168,58 @@ std::string canonical_grpc_endpoint(std::string endpoint) {
   return endpoint;
 }
 
+Hash trace_stratum_window_task_root(opoi::StockLlamaRuntime &runtime,
+                                    std::uint8_t tier, const Hash &window_seed) {
+  if (runtime.abi_version() != 8 && runtime.abi_version() != 9)
+    throw std::runtime_error("Stratum v4 H15 block-task tracing requires stock llama ABI8/9");
+  runtime.use_task_context();
+  std::size_t manifest_bytes = 0, layer_rows = 0;
+  NexusTraceManifestInfo chain_info{};
+  if (nexus_ai_h15_manifest(0, tier, 140115000ULL, nullptr, 0, &manifest_bytes,
+                            nullptr, 0, &layer_rows, &chain_info) != 2) {
+    throw std::runtime_error("Stratum v4 H15 chain manifest query failed");
+  }
+  std::vector<std::uint8_t> chain_manifest(manifest_bytes);
+  std::vector<opoi::SequenceLayer> chain_layers(std::max<std::size_t>(1, layer_rows));
+  if (nexus_ai_h15_manifest(0, tier, 140115000ULL, chain_manifest.data(), manifest_bytes,
+                            &manifest_bytes, reinterpret_cast<std::uint32_t *>(chain_layers.data()),
+                            chain_layers.size(), &layer_rows, &chain_info) != 0) {
+    throw std::runtime_error("Stratum v4 H15 chain manifest load failed");
+  }
+  std::array<std::int32_t, 64> tokens{};
+  std::size_t token_count = tokens.size();
+  if (nexus_h15_block_task_tokens(tier, window_seed.data(), tokens.data(), &token_count) != 0 ||
+      token_count == 0) {
+    throw std::runtime_error(std::string("Stratum v4 H15 block_task_tokens failed: ") + nexus_h15_error());
+  }
+  struct ScratchRelease {
+    opoi::StockLlamaRuntime &rt;
+    ~ScratchRelease() noexcept {
+      try { rt.use_task_context(); } catch (...) {}
+    }
+  } scratch_release{runtime};
+  if (runtime.abi_version() == 9) {
+    (void)runtime.configure_sequence({}, 0, 0, 0, 0);
+  }
+  (void)runtime.configure_trace(chain_manifest, static_cast<std::uint32_t>(token_count),
+                                chain_info.position_leaves);
+  const auto traced = runtime.trace_tokens(std::span<const std::int32_t>(tokens.data(), token_count));
+  NexusH15Capture raw{
+      traced.tokens.data(),
+      traced.ubatch.data(),
+      reinterpret_cast<const std::uint8_t *>(traced.leaves.data()),
+      nullptr,
+      traced.tokens.size(),
+      chain_info.position_leaves,
+      0,
+      traced.prompt_positions};
+  Hash task_root{};
+  if (nexus_h15_block_task_root(&raw, tier, window_seed.data(), task_root.data()) != 0) {
+    throw std::runtime_error(std::string("Stratum v4 H15 block_task_root failed: ") + nexus_h15_error());
+  }
+  return task_root;
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -198,6 +253,9 @@ int main(int argc, char **argv) {
   std::string endpoint = "grpc://127.0.0.1:22110";
   std::string pay_address;
   std::string extra_data;
+  std::string pool_worker;
+  std::string pool_password = "x";
+  std::vector<std::string> backup_pool_urls;
   std::string models_dir = (home_path / "Scaricati" / "KERYX" / "models").string();
   std::string model_path;
   std::string tree_path;
@@ -230,6 +288,21 @@ int main(int argc, char **argv) {
     else if (arg == "--keryxd-address" || arg == "--endpoint") { if (i + 1 < argc) endpoint = argv[++i]; }
     else if (arg == "-a" || arg == "--address") { if (i + 1 < argc) pay_address = argv[++i]; }
     else if (arg == "--extra-data") { if (i + 1 < argc) extra_data = argv[++i]; }
+    else if (arg == "--worker") { if (i + 1 < argc) pool_worker = argv[++i]; }
+    else if (arg == "--password") { if (i + 1 < argc) pool_password = argv[++i]; }
+    else if (arg == "--backup-urls") {
+      if (i + 1 < argc) {
+        std::string urls = argv[++i];
+        std::size_t start = 0;
+        while (start < urls.size()) {
+          auto comma = urls.find(',', start);
+          if (comma == std::string::npos) comma = urls.size();
+          auto token = urls.substr(start, comma - start);
+          if (!token.empty()) backup_pool_urls.push_back(token);
+          start = comma + 1;
+        }
+      }
+    }
     else if (arg == "--models-dir") { if (i + 1 < argc) models_dir = argv[++i]; }
     else if (arg == "--model") { if (i + 1 < argc) model_path = argv[++i]; }
     else if (arg == "--tree") { if (i + 1 < argc) tree_path = argv[++i]; }
@@ -275,7 +348,12 @@ int main(int argc, char **argv) {
     }
   }
 
-  endpoint = canonical_grpc_endpoint(endpoint);
+  const bool pool_mode = stratum::is_stratum_endpoint_url(endpoint);
+  if (!pool_mode) {
+    endpoint = canonical_grpc_endpoint(endpoint);
+  } else if (pool_worker.empty()) {
+    pool_worker = pay_address;
+  }
 
   StartupReadiness startup([](std::string_view event) {
     std::cout << event << '\n' << std::flush;
@@ -286,6 +364,7 @@ int main(int argc, char **argv) {
   const auto cpu_part = platform::get_adaptive_partition(platform::CpuRole::SecondaryAmd);
   const unsigned int proof_threads = cpu_part.recommended_proof_threads;
   std::cout << "LIVE_VULKAN_WORKER=BOOT device=" << device_id << " endpoint=" << endpoint
+            << " mode=" << (pool_mode ? "POOL_STRATUM_V4" : "SOLO_GRPC")
             << " submit=" << (submit_enabled ? "ENABLED" : "DISABLED")
             << " ai_response=" << (ai_responses_enabled ? "ENABLED" : "DISABLED")
             << " proof_threads=" << proof_threads << "\n" << std::flush;
@@ -296,29 +375,41 @@ int main(int argc, char **argv) {
   telemetry.set_pom_backend("vulkan-jit");
   telemetry.set_state("STARTUP", "STARTUP", "INITIALIZING", submit_enabled ? "ARMED" : "DISABLED");
 
-  NativePomTelemetry::StratumFields solo_stratum;
-  solo_stratum.connected = true;
-  solo_stratum.mode = "solo";
-  solo_stratum.state = "SOLO_GRPC";
-  solo_stratum.endpoint = endpoint;
-  solo_stratum.worker = pay_address;
-  telemetry.set_stratum(solo_stratum);
+  if (!pool_mode) {
+    NativePomTelemetry::StratumFields solo_stratum;
+    solo_stratum.connected = true;
+    solo_stratum.mode = "solo";
+    solo_stratum.state = "SOLO_GRPC";
+    solo_stratum.endpoint = endpoint;
+    solo_stratum.worker = pay_address;
+    telemetry.set_stratum(solo_stratum);
 
-  // Probe gRPC node connectivity
-  try {
-    const auto probe_node = probe_node_readiness(endpoint, std::chrono::seconds(5));
-    if (probe_node.network != "mainnet" || !probe_node.synced) {
-      startup.record("NODE_SYNC", StartupResult::Blocked, "Node is not synced to mainnet");
+    // Probe gRPC node connectivity
+    try {
+      const auto probe_node = probe_node_readiness(endpoint, std::chrono::seconds(5));
+      if (probe_node.network != "mainnet" || !probe_node.synced) {
+        startup.record("NODE_SYNC", StartupResult::Blocked, "Node is not synced to mainnet");
+        return 78;
+      }
+      startup.record("NODE_SYNC", StartupResult::Pass, "Node synced to mainnet, version=" + probe_node.version);
+    } catch (const std::exception &e) {
+      startup.record("NODE_SYNC", StartupResult::Blocked, std::string("Node connection failed: ") + e.what());
       return 78;
     }
-    startup.record("NODE_SYNC", StartupResult::Pass, "Node synced to mainnet, version=" + probe_node.version);
-  } catch (const std::exception &e) {
-    startup.record("NODE_SYNC", StartupResult::Blocked, std::string("Node connection failed: ") + e.what());
-    return 78;
-  }
 
-  // Probe local IPFS endpoint
-  startup.record("IPFS_READY", StartupResult::Pass, "Local IPFS endpoint reachable at " + ipfs_endpoint);
+    // Probe local IPFS endpoint
+    startup.record("IPFS_READY", StartupResult::Pass, "Local IPFS endpoint reachable at " + ipfs_endpoint);
+  } else {
+    NativePomTelemetry::StratumFields init_stratum;
+    init_stratum.connected = false;
+    init_stratum.mode = "pool";
+    init_stratum.state = "CONNECTING";
+    init_stratum.endpoint = endpoint;
+    init_stratum.worker = pool_worker;
+    telemetry.set_stratum(init_stratum);
+    startup.record("NODE_SYNC", StartupResult::Pass, "Stratum v4 pool mode active; standalone pool transport configured");
+    startup.record("IPFS_READY", StartupResult::Pass, "Stratum v4 pool mode active; standalone pool transport configured");
+  }
 
   // Verify GGUF model and Merkle index
   model::ReadOnlyGguf gguf(model_path);
@@ -417,9 +508,9 @@ int main(int argc, char **argv) {
       service_identity ? *service_identity : "",
       true);
 
-  // Probe AI service RPC
+  // Probe AI service RPC (Solo mode)
   ai::ServiceRpcSnapshot service_rpc;
-  if (service_identity) {
+  if (service_identity && !pool_mode) {
     try {
       service_rpc = probe_ai_service_rpc(endpoint, 0, *service_identity, std::chrono::seconds(5));
     } catch (...) {}
@@ -427,17 +518,30 @@ int main(int argc, char **argv) {
 
   startup.record("ESCROW_IDENTITY_READY", StartupResult::Pass, "Escrow identity and Schnorr delegation verified");
 
-  // AI Response Service & H15 Audit Client
+  // Isolated AI Response Service & H15 Audit Client for Sovereign Vulkan Worker
   std::unique_ptr<ai::H15AuditClient> h15_audits;
   std::unique_ptr<ai::AiResponseService> ai_response_service;
   std::unique_ptr<ai::EscrowWatcher> escrow_watcher;
   ai::AiResponseTransport ai_response_transport(endpoint);
 
-  if (service_identity) {
-    const auto audit_path = developer_data_root() / "state" / "ai-service" / "h15";
+  if (service_identity && !pool_mode) {
+    const auto ai_state_dir = developer_data_root() / "state" / "ai-service-vulkan";
+    const auto audit_path = ai_state_dir / "h15";
+    const auto escrow_state_dir = developer_data_root() / "state" / "escrow-vulkan";
+    try {
+      fs::create_directories(audit_path);
+      fs::create_directories(escrow_state_dir);
+    } catch (...) {}
+
     try {
       h15_audits = std::make_unique<ai::H15AuditClient>(
           *shared_runtime, gguf, merkle, audit_path, escrow_secret, endpoint, official_model, false);
+      h15_audits->set_gpu_owner([&](const std::function<void()> &work) {
+        gpu_ownership.run_opoi(
+            [&] { shared_runtime->pom_release_pad(); },
+            [&] { work(); return true; },
+            [] {});
+      });
     } catch (const std::exception &e) {
       std::cerr << "H15_AUDIT_WARNING: " << e.what() << "\n" << std::flush;
     }
@@ -454,7 +558,7 @@ int main(int argc, char **argv) {
     ai_config.tier = 0;
     ai_config.private_inline_activation_daa = ai::mainnet_private_inference_gate_daa;
     ai_config.signed_response_activation_daa = ai::mainnet_signed_response_activation_daa;
-    ai_config.journal_path = developer_data_root() / "state" / "ai-service" / "ai-response.journal";
+    ai_config.journal_path = ai_state_dir / "ai-response.journal";
 
     try {
       ai_response_service = std::make_unique<ai::AiResponseService>(std::move(ai_config));
@@ -466,7 +570,7 @@ int main(int argc, char **argv) {
     try {
       escrow_watcher = std::make_unique<ai::EscrowWatcher>(
           escrow_secret, pay_address,
-          developer_data_root() / "state" / "escrow" / "audit.jsonl");
+          escrow_state_dir / "audit.jsonl");
     } catch (...) {}
   }
 
@@ -478,87 +582,136 @@ int main(int argc, char **argv) {
   startup.record("ESCROW_CLAIM_ENGINE_READY", StartupResult::Pass, "escrow claim engine initialized");
   startup.record("STRIKE_MONITOR_STATUS", StartupResult::Pass, "strike monitor checked; 0 strikes recorded");
 
-  // Submission Client
-  auto submit_client = std::make_unique<network::SubmitBlockClient>(endpoint);
+  // Submission & Stratum Clients
+  std::unique_ptr<network::SubmitBlockClient> submit_client;
+  std::unique_ptr<stratum::StratumV4Client> stratum_client;
+  if (!pool_mode) {
+    submit_client = std::make_unique<network::SubmitBlockClient>(endpoint);
+  } else {
+    stratum::StratumClientConfig scfg;
+    scfg.pool_url = endpoint;
+    scfg.backup_urls = backup_pool_urls;
+    scfg.worker = pool_worker;
+    scfg.password = pool_password;
+    scfg.user_agent = "keryx-miner-supr/0.15.6";
+    scfg.declared_model_id_hex = hex(official_model.data(), official_model.size());
+    stratum_client = std::make_unique<stratum::StratumV4Client>(std::move(scfg));
+    stratum_client->start();
+  }
 
   // Queues
   LiveJobQueue job_queue;
   AiRequestQueue ai_queue;
   std::atomic_uint64_t ai_current_daa{140115000ULL};
 
-  // Launch Live Ingress Thread via run_live_job_client
-  std::thread ingress_thread([&] {
-    try {
-      run_live_job_client(
-          endpoint, pay_address, extra_data, job_queue, 0, 1, process_stop,
-          [&](const std::string &wire) -> std::string {
-            // OPoI challenge handler
-            const auto challenge = opoi::parse_challenge(wire);
-            std::string answer;
-            gpu_ownership.run_opoi(
-                [] {},
-                [&] {
-                  return shared_runtime->answer(challenge);
-                },
-                [] {});
-            return opoi::format_inference_result(challenge, answer);
-          },
-          [&](const protowire::RpcBlock &block, bool) {
-            // Block added observer
-            if (block.has_header()) {
-              auto prior = ai_current_daa.load(std::memory_order_relaxed);
-              while (prior < block.header().daascore() &&
-                     !ai_current_daa.compare_exchange_weak(
-                         prior, block.header().daascore(),
-                         std::memory_order_release, std::memory_order_relaxed)) {}
+  // Launch Live Ingress Thread via run_live_job_client (Solo mode)
+  std::thread ingress_thread;
+  if (!pool_mode) {
+    ingress_thread = std::thread([&] {
+      try {
+        run_live_job_client(
+            endpoint, pay_address, extra_data, job_queue, 0, 1, process_stop,
+            [&](const std::string &wire) -> std::string {
+              // OPoI challenge handler
+              const auto challenge = opoi::parse_challenge(wire);
+              std::string answer;
+              telemetry.set_gpu_activity("PAUSED_FOR_OPOI");
+              telemetry.set_state("PAUSED", "RUNNING", "OPOI_CHALLENGE", submit_enabled ? "ARMED" : "DISABLED");
+              gpu_ownership.run_opoi(
+                  [&] { shared_runtime->pom_release_pad(); },
+                  [&] {
+                    answer = shared_runtime->answer(challenge);
+                    return answer;
+                  },
+                  [] {});
+              telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+              return opoi::format_inference_result(challenge, answer);
+            },
+            [&](const protowire::RpcBlock &block, bool) {
+              // Block added observer
+              if (block.has_header()) {
+                auto prior = ai_current_daa.load(std::memory_order_relaxed);
+                while (prior < block.header().daascore() &&
+                       !ai_current_daa.compare_exchange_weak(
+                           prior, block.header().daascore(),
+                           std::memory_order_release, std::memory_order_relaxed)) {}
 
-              if (ai_response_service) {
-                const auto response_observed = ai_response_service->observe_block(block);
-                if (response_observed) {
-                  std::cout << "AI_RESPONSE_CHAIN_OBSERVED count=" << response_observed
-                            << " daa=" << block.header().daascore()
-                            << " finality=NOT_CLAIMED\n" << std::flush;
-                }
-                bool has_assigned = false;
-                for (const auto &tx : block.transactions()) {
-                  if (tx.subnetworkid() == ai::request_subnetwork) {
-                    const bool assigned = ai_response_service->discover(
-                        tx, block.header().daascore(),
-                        service_rpc.providers_available ? &service_rpc.providers : nullptr,
-                        ai_current_daa.load(std::memory_order_acquire));
-                    if (assigned) {
-                      has_assigned = true;
-                      const auto dig = ai::consensus_transaction_id(tx);
-                      if (dig) {
-                        std::cout << "{\"event\":\"AI_REQUEST_ASSIGNED\",\"request_id\":\""
-                                  << hex(dig->data(), 32) << "\",\"daa\":"
-                                  << block.header().daascore() << "}\n" << std::flush;
+                if (ai_response_service) {
+                  const auto response_observed = ai_response_service->observe_block(block);
+                  if (response_observed) {
+                    std::cout << "AI_RESPONSE_CHAIN_OBSERVED count=" << response_observed
+                              << " daa=" << block.header().daascore()
+                              << " finality=NOT_CLAIMED\n" << std::flush;
+                  }
+                  bool has_assigned = false;
+                  for (const auto &tx : block.transactions()) {
+                    if (tx.subnetworkid() == ai::request_subnetwork) {
+                      const bool assigned = ai_response_service->discover(
+                          tx, block.header().daascore(),
+                          service_rpc.providers_available ? &service_rpc.providers : nullptr,
+                          ai_current_daa.load(std::memory_order_acquire));
+                      if (assigned) {
+                        has_assigned = true;
+                        const auto dig = ai::consensus_transaction_id(tx);
+                        if (dig) {
+                          std::cout << "{\"event\":\"AI_REQUEST_ASSIGNED\",\"request_id\":\""
+                                    << hex(dig->data(), 32) << "\",\"daa\":"
+                                    << block.header().daascore() << "}\n" << std::flush;
+                        }
                       }
                     }
                   }
-                }
-                if (has_assigned) {
-                  if (!ai_queue.push(block)) {
-                    std::cerr << "bounded AiRequest queue full\n" << std::flush;
+                  if (has_assigned) {
+                    if (!ai_queue.push(block)) {
+                      std::cerr << "bounded AiRequest queue full\n" << std::flush;
+                    }
                   }
                 }
               }
-            }
-          },
-          [&](const std::vector<std::string> &removed_hashes) {
-            if (ai_response_service) {
-              ai_response_service->observe_removed_chain_blocks(removed_hashes);
-            }
-          });
-    } catch (const std::exception &e) {
-      std::cerr << "INGRESS_ERROR: " << e.what() << "\n" << std::flush;
-    }
-  });
+            },
+            [&](const std::vector<std::string> &removed_hashes) {
+              if (ai_response_service) {
+                ai_response_service->observe_removed_chain_blocks(removed_hashes);
+              }
+            });
+      } catch (const std::exception &e) {
+        std::cerr << "INGRESS_ERROR: " << e.what() << "\n" << std::flush;
+      }
+    });
+  }
 
   // Periodic Telemetry Thread (1 Hz) matching matrix dashboard
   std::thread telemetry_thread([&] {
     while (!process_stop.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (stratum_client) {
+        const auto st = stratum_client->telemetry_snapshot();
+        NativePomTelemetry::StratumFields sf;
+        sf.mode = "pool";
+        sf.connected = st.connected;
+        sf.state = st.state;
+        sf.endpoint = st.endpoint;
+        sf.worker = st.worker;
+        sf.ping_ms = st.ping_ms;
+        sf.difficulty = st.difficulty;
+        sf.accepted_shares = st.accepted_shares;
+        sf.rejected_shares = st.rejected_shares;
+        sf.stale_shares = st.stale_shares;
+        sf.duplicate_shares = st.duplicate_shares;
+        sf.blocks_submitted = st.blocks_submitted;
+        sf.pending_shares = st.pending_shares;
+        sf.reconnect_count = st.reconnect_count;
+        sf.challenges_passed = st.challenges_passed;
+        sf.active_job_id = st.active_job_id;
+        sf.window_seed_hex = st.window_seed_hex;
+        sf.task_root_hex = st.task_root_hex;
+        sf.last_error = st.last_error;
+        sf.last_share_status = st.last_share_status;
+        telemetry.set_stratum(sf);
+        telemetry.set_job_invalidations(st.jobs_received > 0 ? st.jobs_received - 1 : 0);
+      } else {
+        telemetry.set_job_invalidations(job_queue.virtual_chain_invalidations());
+      }
       const auto now = monotonic_ns();
       auto snapshot = telemetry.json_snapshot(now);
       // Augment snapshot with gpu_backends & gpu_ready for dashboard UI
@@ -580,8 +733,20 @@ int main(int argc, char **argv) {
   // Main Mining & AI Preemption Loop
   const auto tile_count = gguf.chunk_count() / 32;
   PreparedRpcTemplateCache rpc_cache;
+  std::string last_pool_job_id;
+  std::uint64_t last_pool_nonce_fixed = 0;
+  std::uint64_t last_pool_nonce_mask = 0;
+  const std::uint64_t initial_nonce_cursor = nonce_cursor;
 
   while (!process_stop.load(std::memory_order_relaxed)) {
+    // 0. Advance autonomous H15 on-chain audits if active
+    if (h15_audits) {
+      const auto current_daa = ai_current_daa.load(std::memory_order_acquire);
+      h15_audits->poll();
+      h15_audits->advance(current_daa);
+      h15_audits->submit_due(current_daa, ai_responses_enabled);
+    }
+
     // 1. Process pending AI requests if any
     if (ai_queue.size() > 0) {
       auto req = ai_queue.pop();
@@ -660,7 +825,203 @@ int main(int argc, char **argv) {
       }
     }
 
-    // 2. Fetch current mining template
+    // 2A. Stratum v4 Pool Mode Autonomous Loop
+    if (pool_mode && stratum_client) {
+      if (auto challenge = stratum_client->take_pending_challenge()) {
+        std::string answer;
+        const auto parsed_challenge = opoi::parse_challenge(challenge->model_id_hex + ":" + challenge->nonce_hex);
+        telemetry.set_gpu_activity("PAUSED_FOR_OPOI");
+        telemetry.set_state("PAUSED", "RUNNING", "OPOI_CHALLENGE", submit_enabled ? "ARMED" : "DISABLED");
+        (void)gpu_ownership.run_opoi(
+            [&] { shared_runtime->pom_release_pad(); },
+            [&] {
+              std::cout << "OPOI_RUNTIME=START source=STRATUM_V4 device=" << device_id << "\n" << std::flush;
+              answer = shared_runtime->answer(parsed_challenge);
+              return opoi::format_inference_result(parsed_challenge, answer);
+            },
+            [] {});
+        std::cout << "OPOI_RUNTIME=PASS source=STRATUM_V4 answer_bytes=" << answer.size() << "\n" << std::flush;
+        (void)stratum_client->submit_challenge_response(challenge->model_id_hex, challenge->nonce_hex, answer);
+        telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+        telemetry.set_gpu_activity("WAITING_TEMPLATE");
+        continue;
+      }
+
+      const auto wait_start_ns = monotonic_ns();
+      auto maybe_pool_job = stratum_client->current_job();
+      if (!maybe_pool_job) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        maybe_pool_job = stratum_client->current_job();
+      }
+      telemetry.record_template_wait(monotonic_ns() - wait_start_ns);
+      if (!maybe_pool_job) {
+        telemetry.set_gpu_activity("WAITING_TEMPLATE");
+        continue;
+      }
+      auto pool_job = *maybe_pool_job;
+      if (pool_job.job_id != last_pool_job_id ||
+          pool_job.nonce_fixed != last_pool_nonce_fixed ||
+          pool_job.nonce_mask != last_pool_nonce_mask) {
+        last_pool_job_id = pool_job.job_id;
+        last_pool_nonce_fixed = pool_job.nonce_fixed;
+        last_pool_nonce_mask = pool_job.nonce_mask;
+        nonce_cursor = (initial_nonce_cursor & (pool_job.nonce_mask >> 1U)) | pool_job.nonce_fixed;
+      }
+
+      auto prior_daa = ai_current_daa.load(std::memory_order_relaxed);
+      while (prior_daa < pool_job.header.daa_score &&
+             !ai_current_daa.compare_exchange_weak(
+                 prior_daa, pool_job.header.daa_score,
+                 std::memory_order_release, std::memory_order_relaxed)) {}
+
+      if (pool_job.header.daa_score >= consensus::block_task_activation_daa &&
+          pool_job.has_window_seed && !pool_job.has_task_root) {
+        try {
+          const auto trace_start_ns = monotonic_ns();
+          telemetry.set_gpu_activity("PAUSED_FOR_H15_WINDOW_TRACE");
+          telemetry.set_state("PAUSED", "RUNNING", "H15_WINDOW_TRACE", submit_enabled ? "ARMED" : "DISABLED");
+          const auto computed_task_root = gpu_ownership.run_opoi(
+              [&] { shared_runtime->pom_release_pad(); },
+              [&] {
+                return trace_stratum_window_task_root(*shared_runtime, pool_job.header.pom_tier, pool_job.window_seed);
+              },
+              [] {});
+          stratum_client->commit_window_task_root(pool_job.window_seed, computed_task_root);
+          const auto trace_ms = (monotonic_ns() - trace_start_ns) / 1.0e6;
+          std::osyncstream(std::cout) << "STRATUM_V4_WINDOW_TRACE=PASS device=" << device_id
+                                      << " window_seed=" << hex(pool_job.window_seed.data(), pool_job.window_seed.size())
+                                      << " task_root=" << hex(computed_task_root.data(), computed_task_root.size())
+                                      << " elapsed_ms=" << trace_ms << "\n" << std::flush;
+          telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+          auto refreshed_job = stratum_client->current_job();
+          if (!refreshed_job) continue;
+          pool_job = *refreshed_job;
+        } catch (const std::exception &e) {
+          std::cerr << "STRATUM_V4_WINDOW_TRACE_ERROR: " << e.what() << "\n" << std::flush;
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          continue;
+        }
+      }
+
+      if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id)) continue;
+
+      const auto &header = pool_job.header;
+      const auto &pph = pool_job.pre_pow;
+      const auto &eff_target = pool_job.effective_target;
+
+      std::uint64_t p[4]{}, s[4]{}, t[4]{};
+      for (unsigned i = 0; i < 4; ++i) {
+        std::uint64_t p_word = 0, t_word = 0, s_word = 0;
+        for (unsigned b = 0; b < 8; ++b) {
+          p_word |= std::uint64_t(pph.data()[8 * i + b]) << (8 * b);
+          t_word |= std::uint64_t(eff_target.data()[8 * i + b]) << (8 * b);
+          s_word |= std::uint64_t(pph.data()[8 * i + b] ^ SEED_H14_TAG[8 * i + b]) << (8 * b);
+        }
+        p[i] = p_word ^ POM_H3_SALT[i];
+        t[i] = t_word;
+        s[i] = s_word;
+      }
+      const std::uint32_t h10 = (header.daa_score >= h10_activation_daa) ? 1u : 0u;
+      const bool v5 = (header.daa_score >= consensus::pom_v5_activation_daa);
+      const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
+                          : consensus::V5PadSpec{};
+      const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
+      const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready()) ? std::min<std::uint32_t>(batch_size, 8192u) : batch_size;
+      const std::uint64_t batch_start = ((nonce_cursor & pool_job.nonce_mask) | pool_job.nonce_fixed);
+
+      telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
+      telemetry.work_launched(dispatch_batch);
+
+      std::int64_t winner = -1;
+      const bool ran = gpu_ownership.run_pom([&] {
+        if (v5 && shared_runtime->pom_v5_ready()) {
+          winner = shared_runtime->pom_mine_v5(p, s, t, header.timestamp, batch_start, dispatch_batch,
+                                               pad_words.data(), pad.tiles);
+        } else {
+          winner = shared_runtime->pom_mine(p, s, t, header.timestamp, batch_start, dispatch_batch, 256, h10);
+        }
+      });
+
+      if (!ran) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        continue;
+      }
+
+      telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
+      if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id)) {
+        telemetry.work_stale(dispatch_batch);
+        continue;
+      }
+      telemetry.eligible_attempts(dispatch_batch);
+
+      if (winner >= 0) {
+        const std::uint64_t winning_nonce = batch_start + static_cast<std::uint64_t>(winner);
+        std::cout << "LIVE_RESIDENT_TARGET=FOUND mode=POOL device=" << device_id << " nonce=" << winning_nonce
+                  << " dGPU_winner_offset=" << winner << "\n" << std::flush;
+        telemetry.target_satisfied();
+        try {
+          const auto seed = block_seed(pph, header.timestamp, winning_nonce, header.daa_score);
+          auto walk = walk_v5_from_model(seed, tile_count, pad, [&](std::uint64_t tile) {
+            std::array<std::uint8_t, tile_bytes> bytes;
+            gguf.read_tile_into(tile, bytes);
+            return bytes;
+          });
+          const auto proof = prove_v5_from_walk_parallel(walk, header.pom_tier, tile_count,
+              [&](std::uint64_t tile) {
+                std::array<std::uint8_t, tile_bytes> bytes;
+                gguf.read_tile_into(tile, bytes);
+                return bytes;
+              },
+              [&](std::uint64_t tile) { return merkle.tile_path(tile); },
+              proof_threads);
+          const auto final = final_state(walk);
+          const auto pow = pom_pow_value_h3(final, pph);
+          if (little_endian_leq(pow, eff_target)) {
+            const auto wire = borsh_v5_container(proof, final, pow);
+            telemetry.proof_completed();
+            telemetry.proof_fresh(false);
+            if (submit_enabled && stratum_client->is_job_current(pool_job.generation, pool_job.job_id)) {
+              auto solved_header = header;
+              solved_header.nonce = winning_nonce;
+              solved_header.pom_final_state = final;
+              solved_header.pom_tier = header.pom_tier;
+              solved_header.task_root = pool_job.task_root;
+              const auto solved_hash = consensus::hash_header_override(
+                  solved_header, 0, 0, false, false,
+                  pool_job.header.daa_score >= consensus::block_task_activation_daa);
+              stratum::VerifiedPoolShare share;
+              share.job_generation = pool_job.generation;
+              share.job_id = pool_job.job_id;
+              share.protocol_version = pool_job.protocol_version;
+              share.nonce = winning_nonce;
+              share.daa_score = header.daa_score;
+              share.timestamp = header.timestamp;
+              share.final_state = final;
+              share.pre_pow = pph;
+              share.pow_value = pow;
+              share.effective_target = eff_target;
+              share.network_target = pool_job.network_target;
+              share.block_hash = solved_hash;
+              share.window_seed = pool_job.window_seed;
+              share.has_window_seed = pool_job.has_window_seed;
+              share.task_root = pool_job.task_root;
+              share.has_task_root = pool_job.has_task_root;
+              share.pom_proof_borsh = wire;
+              telemetry.set_state("ACTIVE", "IDLE", "", "SUBMIT_SENT");
+              const auto sub_id = stratum_client->submit_share(share);
+              telemetry.set_state("ACTIVE", "IDLE", "", sub_id ? "SUBMIT_SENT" : "STALE");
+            }
+          }
+        } catch (const std::exception &e) {
+          std::cerr << "AMD_POOL_PROOF_BUILD_ERROR: " << e.what() << "\n" << std::flush;
+        }
+      }
+
+      nonce_cursor = (((batch_start + dispatch_batch) & pool_job.nonce_mask) | pool_job.nonce_fixed);
+      continue;
+    }
+
+    // 2B. Fetch current Solo gRPC mining template
     auto maybe_job = job_queue.wait_pop_for(std::chrono::milliseconds(50));
     if (!maybe_job) continue;
     const auto &job = *maybe_job;
@@ -720,6 +1081,7 @@ int main(int argc, char **argv) {
     }
 
     telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
+    telemetry.eligible_attempts(dispatch_batch);
 
     // 5. Check if winner found
     if (winner >= 0) {
@@ -753,6 +1115,8 @@ int main(int argc, char **argv) {
         if (little_endian_leq(pow, target.little_endian)) {
           const auto wire = borsh_v5_container(proof, final, pow);
           const auto response_digest = blake3_digest(job.fields.response_wire.data(), job.fields.response_wire.size());
+          telemetry.proof_completed();
+          telemetry.proof_fresh(false);
 
           network::VerifiedSubmission verified;
           verified.job_id = hex(response_digest.data(), response_digest.size());
@@ -786,6 +1150,8 @@ int main(int argc, char **argv) {
 
   std::cout << "LIVE_VULKAN_WORKER=SHUTDOWN\n" << std::flush;
   telemetry.set_state("TERMINATED", "IDLE", "CLEAN_SHUTDOWN", "DISABLED");
+  job_queue.close();
+  if (stratum_client) stratum_client->stop();
 
   if (telemetry_thread.joinable()) telemetry_thread.join();
   if (ingress_thread.joinable()) ingress_thread.join();
