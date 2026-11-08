@@ -53,6 +53,9 @@ def parse_args():
                         help="Escrow certificate hex")
     parser.add_argument("--ctx", type=int, default=8192, help="Keryx LLM Context window (default: 8192)")
     parser.add_argument("--vulkan-batch", type=int, default=2048, help="Batch size for Vulkan worker (default: 2048)")
+    parser.add_argument("--pool-url", type=str, default="", help="Stratum pool URL (optional, e.g. stratum+tcp://pool.keryx.net:4444)")
+    parser.add_argument("--pool-worker", type=str, default="", help="Stratum worker name (optional, defaults to address)")
+    parser.add_argument("--pool-password", type=str, default="x", help="Stratum pool password (e.g. d=4 for fixed difficulty, default: x)")
     return parser.parse_args()
 
 
@@ -134,6 +137,11 @@ def main():
 
     env = os.environ.copy()
     env["KERYX_LLAMA_CTX"] = str(args.ctx)
+    if args.pool_url:
+        env["NEXUS_MINING_MODE"] = "pool"
+        env["NEXUS_POOL_URL"] = args.pool_url
+        env["NEXUS_POOL_WORKER"] = args.pool_worker or args.address
+        env["NEXUS_POOL_PASSWORD"] = args.pool_password
 
     # 1. NVIDIA Worker (CUDA)
     if target_gpus in ("nvidia", "dual"):
@@ -168,7 +176,7 @@ def main():
                     vk_env["VK_ICD_FILENAMES"] = "/usr/share/vulkan/icd.d/radeon_icd.json"
                 vk_env["VK_LOADER_LAYERS_DISABLE"] = "~implicit~"
 
-            node_url = f"grpc://{args.keryxd_address}:{args.port}"
+            node_url = args.pool_url if args.pool_url else f"grpc://{args.keryxd_address}:{args.port}"
             cmd = [
                 str(vk_bin),
                 "--keryxd-address", node_url,
@@ -178,6 +186,11 @@ def main():
                 "--address", args.address,
                 "--extra-data", "NEXUS v0.0.5",
             ]
+            if args.pool_url:
+                cmd.extend([
+                    "--worker", args.pool_worker or args.address,
+                    "--pool-password", args.pool_password,
+                ])
             print(f"[Launcher] Launching AMD/Cross-Vendor Vulkan Worker: {vk_bin.name}")
             p_vk = subprocess.Popen(cmd, env=vk_env)
             processes.append((p_vk, "AMD Vulkan Worker"))

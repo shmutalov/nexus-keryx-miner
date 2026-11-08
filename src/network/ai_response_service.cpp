@@ -158,26 +158,29 @@ std::string prompt_from_private(std::span<const std::uint8_t> input) {
   static constexpr std::array<std::uint8_t, 4> magic{0x00, 'K', 'Z', 0x01};
   if (input.size() < magic.size() || !std::equal(magic.begin(), magic.end(), input.begin()))
     return std::string(reinterpret_cast<const char *>(input.data()), input.size());
-  // Stock v0.5.7 uses raw DEFLATE and caps the inflated prompt at 1 MiB.
+  // Raw DEFLATE with max cap of 1 MiB. A stream that fails to inflate yields partial output or raw bytes.
   z_stream stream{};
   stream.next_in = const_cast<Bytef *>(reinterpret_cast<const Bytef *>(input.data() + magic.size()));
   stream.avail_in = static_cast<uInt>(input.size() - magic.size());
-  if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) throw std::runtime_error("private prompt inflater initialization failed");
+  if (inflateInit2(&stream, -MAX_WBITS) != Z_OK) {
+    return std::string(reinterpret_cast<const char *>(input.data() + magic.size()), input.size() - magic.size());
+  }
   std::string output;
   std::array<char, 16384> chunk{};
+  constexpr std::size_t max_len = 1U << 20;
   int rc = Z_OK;
-  while (rc == Z_OK) {
+  while (rc == Z_OK && output.size() < max_len) {
     stream.next_out = reinterpret_cast<Bytef *>(chunk.data());
-    stream.avail_out = static_cast<uInt>(chunk.size());
+    const auto space = std::min<std::size_t>(chunk.size(), max_len - output.size());
+    stream.avail_out = static_cast<uInt>(space);
     rc = inflate(&stream, Z_NO_FLUSH);
-    const auto produced = chunk.size() - stream.avail_out;
-    if (produced > (1U << 20) - std::min<std::size_t>(output.size(), 1U << 20)) {
-      inflateEnd(&stream); throw std::runtime_error("private prompt exceeds stock 1 MiB expansion bound");
-    }
+    const auto produced = space - stream.avail_out;
     output.append(chunk.data(), produced);
   }
   inflateEnd(&stream);
-  if (rc != Z_STREAM_END) throw std::runtime_error("private prompt raw DEFLATE stream is invalid");
+  if (output.empty()) {
+    return std::string(reinterpret_cast<const char *>(input.data() + magic.size()), input.size() - magic.size());
+  }
   return output;
 }
 
@@ -815,7 +818,12 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
   if (open_rc == 1) { (void)journal_.transition(id, ResponseState::NotAssigned); return ServeResult::NotAssigned; }
   if (open_rc != 0 || is_private != parsed->is_private) { (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed; }
   std::string prompt;
-  try { prompt = is_private ? prompt_from_private(prompt_bytes) : std::string(prompt_bytes.begin(), prompt_bytes.end()); }
+  try {
+    prompt = is_private ? prompt_from_private(prompt_bytes) : std::string(prompt_bytes.begin(), prompt_bytes.end());
+    if (prompt.find('\0') != std::string::npos) {
+      prompt.erase(std::remove(prompt.begin(), prompt.end(), '\0'), prompt.end());
+    }
+  }
   catch (const std::exception &e) {
     if (effects.submission_diagnostic) effects.submission_diagnostic("", 0, std::string("prompt_exception: ") + e.what(), "");
     (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed;

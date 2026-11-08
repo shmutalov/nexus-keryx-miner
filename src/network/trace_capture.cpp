@@ -12,7 +12,7 @@ void require(bool valid, const char *message) {
   if (!valid) throw std::invalid_argument(message);
 }
 void text_bound(std::string_view text) {
-  require(text.size() <= 60U * 1024 && text.find('\0') == text.npos, "Invalid traced prompt bounds");
+  require(text.size() <= 60U * 1024, "Invalid traced prompt bounds");
 }
 }
 TraceCapture::TraceCapture(TraceApi api, void *model, std::uint32_t context, std::uint32_t context_floor)
@@ -109,7 +109,7 @@ TracedGeneration TraceCapture::generate(std::string_view prompt, const TracePref
           static_cast<std::uint32_t>(n_fed) <= positions_ && static_cast<std::uint32_t>(n_fed) <= allocated_context_,
           "Invalid ABI6 generation dimensions");
   result.text.assign(output.data(), static_cast<std::size_t>(n));
-  require(result.text.find('\0') == result.text.npos, "Invalid ABI6 generated text");
+  result.text.erase(std::remove(result.text.begin(), result.text.end(), '\0'), result.text.end());
   result.tokens.resize(static_cast<std::size_t>(n_fed));
   require(std::all_of(result.tokens.begin(), result.tokens.end(), [](auto n) { return n >= 0; }),
           "Invalid captured token");

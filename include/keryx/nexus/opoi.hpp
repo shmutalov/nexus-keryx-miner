@@ -21,6 +21,9 @@ struct Challenge {
 };
 
 Challenge parse_challenge(const std::string &wire);
+std::string sanitize_nul_bytes(std::string_view text);
+std::size_t prompt_budget(std::size_t ctx_floor, std::size_t max_tokens) noexcept;
+std::optional<std::string> head_tail_cut(std::string_view prompt, std::size_t cap);
 std::string official_qwen35_prompt(const std::string &nonce_hex);
 // Exact v0.5.7 Qwen family ChatML wrapper for AiRequest prompts.
 std::string official_qwen35_ai_prompt(std::string_view user_prompt);
