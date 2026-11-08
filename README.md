@@ -2,9 +2,9 @@
 
 **An experimental, source-first Proof-of-Model miner with a native GPU worker, independent proof verification and a local desktop control surface.**
 
-Nexus brings Keryx mining, AI service status, wallet authorization, escrow monitoring and GPU telemetry into a single Linux desktop application. The mining engine is primarily C++20 with CUDA support; Rust components handle independent verification and signing-related work, while Python provides local control and presentation services. The desktop is built with Tauri.
+Nexus brings Keryx mining, AI service status, wallet authorization, escrow monitoring and GPU telemetry into a unified desktop application and cross-platform native CLI. The mining engine is primarily C++20 with CUDA and Vulkan support; Rust components handle independent verification and signing-related work, while Python provides local control and presentation services. The desktop is built with Tauri 2.
 
-> **Project status — 0.0.5 beta.** Linux x86-64 remains the development baseline. A **native Windows x64 CUDA CLI preview** is developed and tested on GitHub Actions; GPU execution on Windows is not yet validated. Dual Independent Multi-GPU architecture (NVIDIA CUDA + AMD Vulkan), Hardfork 16 (H16) consensus readiness, Stratum v4 multipool failover with verifiable inference/audit openings, and 2-decimal power efficiency telemetry are integrated in v0.0.5. Models, Merkle trees, keys and private installation state are external inputs.
+> **Project status — 0.0.5 beta.** Linux x86-64 (Ubuntu 24.04 baseline) and **native Windows x64 CUDA CLI** (MSVC, no WSL required) are fully integrated with automated CI/CD builds and releases. Release v0.0.5 introduces **Dual Independent Multi-GPU architecture** (NVIDIA CUDA SM 8.6, 8.9, 12.0 + AMD Vulkan 1.3 / BDA / Polaris & RDNA3), **Hardfork 16 (H16) consensus readiness**, **Stratum v4 multipool failover engine** with upstream v0.6.0 verifiable inference and cryptographic audit openings (`mining.ai_draw` and `mining.ai_opening`), and standard **2-decimal power efficiency telemetry** (`kH/W`, `MH/W`, `H/W`). Models, Merkle trees, keys and private installation state remain external inputs.
 
 ![Nexus desktop overview](docs/screenshots/hero-overview.png)
 
@@ -19,13 +19,36 @@ See the [0.0.5 release notes](docs/release-0.0.5.md) (and previous [0.0.4 notes]
 - **Stratum v4 Multipool engine:** robust multi-pool support with automatic failover (Suprnova, KeryxPool, and custom endpoints) and 100% standalone pool operation without requiring local nodes or Kubo IPFS.
 - **Stratum Verifiable Inference & Audit Openings:** upstream protocol v0.6.0 compliance (`mining.ai_request`, `mining.ai_response` with trace commitments, `mining.ai_draw` 7-param relay, and `mining.ai_opening` proof generation across `PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID`).
 - **Standard 2-decimal Power Efficiency:** real-time telemetric reporting of individual GPU and rig-wide power draw and efficiency (`kH/W`, `MH/W`, `H/W`) aligned with upstream standards.
-- **Desktop UI v0.0.5 parity:** responsive 4-column tables for Single GPU, Dual GPU, and Rig Fleet views with unblocked vertical scrolling (`overflow-y: auto !important`).
+- **Native Cross-Platform CLI:** automated GitHub Actions matrix compiling native Linux x86-64 and Windows x64 (MSVC) binaries, Rust verifier, and matching inference runtime without WSL dependencies.
+- **Desktop UI v0.0.5 parity (100% English):** clean, English interface with responsive 4-column tables for Single GPU, Dual GPU, and Rig Fleet views with unblocked vertical scrolling (`overflow-y: auto !important`).
 - **Native Proof-of-Model execution:** current-job handling, nonce scheduling, device-side PoM work, witness construction, target checks and explicit submission boundaries.
 - **Independent verification:** a Rust oracle can verify canonical proof material independently of the optimized GPU execution path.
 - **GPU monitoring and selection:** separate device visibility, workload selection, admission checks, telemetry and guarded handoff; a device shown in the UI is not necessarily admitted for mining.
 - **AI service integration:** tracks model readiness, assignments, responses and deadlines; AI work takes priority over new mining batches when authorized and available.
 - **Wallet and escrow workflows:** protected wallet configuration, delegation/certificate validation, UTXO and claim visibility, and distinct states for RPC acknowledgment and on-chain confirmation.
 - **Local controls and diagnostics:** desktop actions, a loopback API and an optional authenticated MCP service, with source proposals isolated from the running miner.
+
+## Hardware and Architecture Support Matrix
+
+| Architecture / Vendor | Execution Backend | Supported Hardware | Scope & Capabilities |
+| --- | --- | --- | --- |
+| **NVIDIA GeForce RTX** | CUDA Driver API (SM 8.6, 8.9, 12.0) | RTX 30 Series (Ampere), RTX 40 Series (Ada Lovelace), RTX 50 Series | Resident CUDA kernel, tensor-core solver, chaseless solver, native PoM execution, H15/H16 adaptive context |
+| **AMD Radeon** | Vulkan 1.3 / Buffer Device Address (BDA) | RX 400 / RX 500 (Polaris), RX 7000 Series (RDNA3) | Buffer Device Address (BDA) SPIR-V shader chunk walking, OPoI draw integration, isolated concurrent execution |
+| **Host / Independent Oracle** | Rust & C++20 | Linux x86-64, Windows x64 | Independent proof verification against pinned protocol, deterministic test suite, consensus audits |
+
+## Mining Workflows: Stratum Pool vs Solo Node
+
+Nexus supports two distinct, production-ready operational workflows:
+
+1. **Standalone Stratum v4 Pool Mining (Zero Node / Zero IPFS):**
+   - Connects directly to community stratum pools such as **Suprnova** (`stratum+tcp://...`) or **KeryxPool**.
+   - Operates in 100% standalone mode without needing a local `keryxd` node, RocksDB chain data, or local Kubo IPFS daemon.
+   - Built-in multi-pool failover: automatically re-subscribes, negotiates extranonce/target difficulty, and redirects work if a primary pool becomes unreachable.
+   - Full upstream v0.6.0 support for verifiable AI inference tasks and audit proof generation (`mining.ai_draw` and `mining.ai_opening`).
+
+2. **Decentralized Solo Mining (Local Node & gRPC):**
+   - Connects directly to a local or remote `keryxd` node via gRPC (`127.0.0.1:22110`).
+   - Receives raw block templates, performs native Proof-of-Model nonce solving, constructs block submissions, and validates chain acceptance independently.
 
 ## Downloads and Windows
 
@@ -187,10 +210,18 @@ Please read [SECURITY.md](SECURITY.md) before reporting vulnerabilities or publi
 
 ## Upstream Citations and Acknowledgments
 
-Nexus builds upon and incorporates protocols, specifications, and reference implementations from the upstream Keryx ecosystem:
+Nexus builds upon, extends, and incorporates protocols, specifications, and reference implementations from the upstream Keryx ecosystem and community contributors:
 
-- **[Keryx-Labs/keryx-miner](https://github.com/Keryx-Labs/keryx-miner):**
-  - Protocol v0.6.0 Stratum verifiable inference tracing and cryptographic audit openings (commit `d434fdb` by Slash).
+- **[Suprnova](https://suprnova.cc) (`ocminer` / [keryx-miner-supr](https://github.com/ocminer/keryx-miner-supr)):**
+  - Pioneering the Stratum v4 pool mining protocol implementation for Keryx.
+  - Stratum pool job dispatcher, share difficulty target negotiation, and failover mechanics.
+  - Active hosting and testing of community mining pool infrastructure.
+- **[shmutalov](https://github.com/shmutalov) ([keryx-miner-rdna3](https://github.com/shmutalov/keryx-miner-rdna3), [keryx-wallet-extension](https://github.com/shmutalov/keryx-wallet-extension)):**
+  - AMD GPU Vulkan runtime execution path for RDNA3 and Polaris architectures.
+  - SPIR-V shader optimizations and Buffer Device Address (BDA) memory walking for Proof-of-Model chunks.
+  - Client-side wallet interaction patterns and Schnorr transaction signing references.
+- **[Keryx-Labs/keryx-miner](https://github.com/Keryx-Labs/keryx-miner) (Slash):**
+  - Protocol v0.6.0 Stratum verifiable inference tracing and cryptographic audit openings (`mining.ai_draw`, `mining.ai_opening`, commit `d434fdb`).
   - High-precision 2-decimal power efficiency calculations (`kH/W`, `MH/W`, `H/W`, commit `fc9f315d`).
   - Dynamic context laddering and VRAM headroom management (commit `126dac97`).
   - Sibling rank hashing and load sharing across multi-rig deployments (commits `ae8e38eb`, `5b4b88b1`, `b0d9d18e`).

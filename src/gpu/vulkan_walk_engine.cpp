@@ -168,7 +168,7 @@ struct VulkanWalkEngine::Impl {
         if(!icd || (std::string(icd)!=expected_icd && !(mixed && icd==allowed_mixed)) ||
            !legacy || std::string(legacy)!=icd || !layers || std::string(layers)!="~implicit~")
             throw std::runtime_error("Explicit device-scoped Vulkan loader environment is required");
-        if((!nvidia_test && pci_id!="" NEXUS_SECONDARY_GPU_ID "") || cap<1 || cap>32768)throw std::runtime_error("Unsupported device/capacity");
+        if((!nvidia_test && pci_id != "" NEXUS_SECONDARY_GPU_ID "" && pci_id.rfind("pci:", 0) != 0 && pci_id != "auto" && !pci_id.empty()) || cap<1 || cap>32768)throw std::runtime_error("Unsupported device/capacity");
         capacity=cap;
         cached_readback=cache_outputs;
         if(resident && (resident<2 || resident>(1ULL<<32)))throw std::invalid_argument("Invalid resident canonical tile count");
@@ -231,7 +231,7 @@ struct VulkanWalkEngine::Impl {
                     throw std::runtime_error("NVIDIA replay UUID/PCI identity mismatch");
                 if(gpu)throw std::runtime_error("Ambiguous NVIDIA Vulkan device selection");
                 gpu=candidate;std::cout<<"DEVICE_ID="<<id.str()<<"\nDEVICE="<<props.deviceName<<'\n';
-            } else if (props.vendorID == 0x1002 && props.deviceID == 0x67df) {
+            } else if (props.vendorID == 0x1002) {
                 {
                     const char* requested = pci_id.c_str();
                     VkPhysicalDevicePCIBusInfoPropertiesEXT pci{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PCI_BUS_INFO_PROPERTIES_EXT};
@@ -240,10 +240,10 @@ struct VulkanWalkEngine::Impl {
                     std::ostringstream id;
                     id << "pci:" << std::hex << std::setfill('0') << std::setw(4) << pci.pciDomain << ':'
                        << std::setw(2) << pci.pciBus << ':' << std::setw(2) << pci.pciDevice << '.' << pci.pciFunction;
-                    if (id.str() != requested) continue;
+                    if (pci_id != "auto" && !pci_id.empty() && id.str() != requested) continue;
                     std::cout << "DEVICE_ID=" << id.str() << '\n';
                 }
-                if (gpu) throw std::runtime_error("Ambiguous AMD Polaris device selection");
+                if (gpu) throw std::runtime_error("Ambiguous AMD Vulkan device selection");
                 gpu = candidate;
                 std::cout << "DEVICE=" << props.deviceName << '\n';
             }

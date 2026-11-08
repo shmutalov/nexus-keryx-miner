@@ -434,9 +434,11 @@ int run_client(const std::string &endpoint, const std::string &pay_address,
       return request;
     };
     auto observe_block = [&](const protowire::RpcBlock &block, bool from_backfill) {
-      std::cout << "AI_BLOCK_OBSERVED source=" << (from_backfill ? "startup_backfill" : "block_added")
-                << " daa=" << (block.has_header() ? block.header().daascore() : 0)
-                << " tx_count=" << block.transactions_size() << " submit=DISABLED\n" << std::flush;
+      if (!from_backfill) {
+        std::cout << "AI_BLOCK_OBSERVED source=block_added"
+                  << " daa=" << (block.has_header() ? block.header().daascore() : 0)
+                  << " tx_count=" << block.transactions_size() << " submit=DISABLED\n" << std::flush;
+      }
       if (!ai_block_observer) return;
       try { ai_block_observer(block, from_backfill); }
       catch (const std::exception &e) {
@@ -452,8 +454,10 @@ int run_client(const std::string &endpoint, const std::string &pay_address,
         const auto id = next_id++;
         send(get_block_request(id, hash));
         block_fetches.emplace(id, true);
-        std::cout << "AI_BACKFILL_GETBLOCK_SENT id=" << id << " remaining=" << (backfill.scheduled_count())
-                  << " in_flight=" << block_fetches.size() << "\n" << std::flush;
+        if (id % 250 == 0 || backfill.scheduled_count() == 0) {
+          std::cout << "AI_BACKFILL_GETBLOCK_SENT id=" << id << " remaining=" << (backfill.scheduled_count())
+                    << " in_flight=" << block_fetches.size() << "\n" << std::flush;
+        }
       }
     };
     auto request_template = [&]() {

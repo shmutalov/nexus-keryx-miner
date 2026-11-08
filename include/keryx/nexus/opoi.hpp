@@ -74,6 +74,18 @@ public:
   std::pair<std::vector<std::uint8_t>, std::vector<std::uint8_t>> replay_trace(
       const TracedGeneration &, std::uint32_t position, std::uint32_t leaf_x, std::uint32_t leaf_y);
 
+  // PoM walk exports (zero-dup resident mining via libkeryx-llama-vk / CUDA).
+  bool pom_ready() const;
+  std::uint64_t pom_n_chunks() const;
+  std::int64_t pom_mine(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
+                        std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
+                        std::uint32_t k = 256, std::uint32_t h10 = 1);
+  bool pom_v5_ready() const;
+  std::int64_t pom_mine_v5(const std::uint64_t p[4], const std::uint64_t s[4], const std::uint64_t t[4],
+                           std::uint64_t timestamp, std::uint64_t start_nonce, std::uint32_t batch,
+                           const std::uint64_t pad_seed[4], std::uint64_t pad_tiles);
+  void pom_release_pad();
+
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

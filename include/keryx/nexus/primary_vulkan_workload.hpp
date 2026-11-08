@@ -13,15 +13,15 @@ public:
   PrimaryVulkanWorkload(std::string device,std::string module,std::string sha,
       GpuWorkCoordinator &owner,const model::ReadOnlyGguf &model,
       model::SparseMerkleIndex &merkle,RustProofVerifier &verifier,
-      std::string payout,std::string identity)
+      std::string payout,std::string identity,MiningLane lane=MiningLane::Nvidia)
     :device_(std::move(device)),module_(std::move(module)),sha_(std::move(sha)),
      owner_(owner),model_(model),merkle_(merkle),verifier_(verifier),
-     payout_(std::move(payout)),identity_(std::move(identity)) {}
+     payout_(std::move(payout)),identity_(std::move(identity)),lane_(lane) {}
   bool prepare(const std::function<bool()> &cancelled={}) {
     if(cancelled&&cancelled())return false;
     if(!engine_) {
       engine_=std::make_unique<consensus::VulkanWalkEngine>(device_,module_,sha_,batch_limit,model_.chunk_count()/32);
-      pipeline_=std::make_unique<AmdCandidatePipeline>(owner_,*engine_,model_,merkle_,verifier_,payout_,identity_,MiningLane::Nvidia);
+      pipeline_=std::make_unique<AmdCandidatePipeline>(owner_,*engine_,model_,merkle_,verifier_,payout_,identity_,lane_);
     }
     if(loaded_)return true;
     loaded_=engine_->load_resident([&](auto first,auto bytes){model_.read_tiles_streaming(first,bytes);},cancelled);
@@ -46,6 +46,7 @@ private:
   model::SparseMerkleIndex &merkle_;
   RustProofVerifier &verifier_;
   std::string payout_,identity_;
+  MiningLane lane_{MiningLane::Nvidia};
   std::unique_ptr<consensus::VulkanWalkEngine> engine_;
   std::unique_ptr<AmdCandidatePipeline> pipeline_;
   bool loaded_{false};

@@ -48,7 +48,7 @@ inline LiveWorkerConfig parse_live_worker_config(int argc, char **argv,
     const auto selected_backend = require_production_gpu_backend(backend, device_id, authorized_uuid, vulkan_worker);
     if(selected_backend==GpuBackend::CudaDriver && (!visible||std::string_view(visible)!=authorized_uuid))
       throw std::runtime_error("CUDA_VISIBLE_DEVICES must contain only the authorized CUDA UUID");
-    if((selected_backend==GpuBackend::VulkanJit || selected_backend==GpuBackend::VulkanBda) && visible && *visible)
+    if((selected_backend==GpuBackend::VulkanJit || selected_backend==GpuBackend::VulkanBda) && visible && *visible && !vulkan_worker)
       throw std::runtime_error("Vulkan-only workflow must exclude native CUDA devices");
     const std::string endpoint=argv[1],pay=argv[2],extra=argv[3];
     const fs::path model_path=argv[4],tree_path=argv[5],meta_path=argv[6],oracle=argv[7],outdir=argv[8];
