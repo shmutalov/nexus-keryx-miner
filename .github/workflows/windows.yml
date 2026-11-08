@@ -244,7 +244,7 @@ jobs:
             -DVCPKG_MANIFEST_DIR="$PWD/tools/windows" -DVCPKG_OVERLAY_TRIPLETS="$PWD/tools/cmake/triplets" -DVCPKG_TARGET_TRIPLET=x64-linux \
             -DVCPKG_MANIFEST_FEATURES=worker -DNEXUS_ENABLE_GRPC=ON -DNEXUS_ENABLE_CUDA=ON \
             -DNEXUS_ENABLE_VULKAN_JIT=OFF -DBUILD_TESTING=OFF
-          cmake --build build/linux-worker --target nexus-live-cuda-worker --parallel 2
+          cmake --build build/linux-worker --target nexus-live-cuda-worker nexus-live-vulkan-worker --parallel 2
           python3 tools/fetch_upstream.py
           cargo build --release --locked --manifest-path oracle-rust/Cargo.toml
       - name: AI bridge protocol and recovery tests
