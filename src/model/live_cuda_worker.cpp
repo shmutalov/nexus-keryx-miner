@@ -1084,6 +1084,9 @@ int main(int argc,char **argv) {
       scfg.declared_model_id_hex = hex(official_model.data(), official_model.size());
       stratum_client = std::make_unique<stratum::StratumV4Client>(std::move(scfg));
       stratum_client->start();
+      gpu_ownership.set_busy_callback([client = stratum_client.get()](bool busy) {
+        if (client) client->set_ai_inference_busy(busy);
+      });
     }
 
     const auto tile_count=gguf.chunk_count()/32;

@@ -223,6 +223,15 @@ struct VulkanBdaResidentEngine::Impl {
         fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
         VK_CHECK(vkCreateFence(device, &fence_info, nullptr, &fence));
 
+        VkPhysicalDeviceProperties device_props{};
+        vkGetPhysicalDeviceProperties(physical_device, &device_props);
+        const VkDeviceSize max_storage_range = device_props.limits.maxStorageBufferRange;
+        const VkDeviceSize safe_offsets_bytes = std::min<VkDeviceSize>(max_storage_range, 1024ULL * 1024 * 1024);
+        const std::size_t max_allowed_batch = static_cast<std::size_t>(safe_offsets_bytes / (256 * sizeof(uint64_t)));
+        if (max_batch_size > max_allowed_batch && max_allowed_batch > 0) {
+            max_batch_size = max_allowed_batch;
+        }
+
         // Allocate fast buffers: device local VRAM for compute + cached host staging
         buf_seeds = create_buffer(device, physical_device, max_batch_size * sizeof(uint64_t),
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
@@ -462,6 +471,96 @@ bool VulkanBdaResidentEngine::run_batch(
         throw std::invalid_argument("BDA trace capacity exceeded");
     if (cancelled && cancelled()) return false;
 
+    const bool need_offsets = copy_offsets || diagnostics;
+
+    if (!diagnostics && !need_offsets) {
+        constexpr std::size_t kSubDispatchNonces = 2048;
+        out.offsets.clear();
+        out.final_states.clear();
+        out.diagnostic_states.clear();
+        out.winner_index = std::nullopt;
+
+        const auto start_total = std::chrono::high_resolution_clock::now();
+        std::size_t total_processed = 0;
+
+        for (std::size_t offset = 0; offset < seeds.size(); offset += kSubDispatchNonces) {
+            if (cancelled && cancelled()) return false;
+            const std::size_t sub_count = std::min(kSubDispatchNonces, seeds.size() - offset);
+
+            if (p.buf_winner.mapped) {
+                *static_cast<uint32_t*>(p.buf_winner.mapped) = 0xFFFFFFFFu;
+            }
+
+            std::memcpy(p.buf_seeds.mapped, seeds.data() + offset, sub_count * sizeof(uint64_t));
+            const auto padded = (sub_count + 3) / 4 * 4;
+            std::fill(static_cast<uint64_t*>(p.buf_seeds.mapped) + sub_count,
+                      static_cast<uint64_t*>(p.buf_seeds.mapped) + padded, 0);
+
+            VK_CHECK(vkResetFences(p.device, 1, &p.fence));
+            VK_CHECK(vkResetCommandBuffer(p.cmd_buffer, 0));
+
+            VkCommandBufferBeginInfo begin_info{};
+            begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            VK_CHECK(vkBeginCommandBuffer(p.cmd_buffer, &begin_info));
+
+            vkCmdBindPipeline(p.cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
+            vkCmdBindDescriptorSets(p.cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &p.descriptor_set, 0, nullptr);
+
+            PushConstants pc{
+                .bank0_addr = p.bank0_addr,
+                .bank1_addr = p.bank1_addr,
+                .ntiles = p.model_tiles,
+                .split_tiles = p.split_tiles,
+                .diagnostics = 0u,
+                .write_offsets = 0u,
+                .p0 = p0, .p1 = p1, .p2 = p2, .p3 = p3,
+                .t0 = t0, .t1 = t1, .t2 = t2, .t3 = t3,
+                .inv_ntiles = (p.model_tiles > 0) ? (0xFFFFFFFFFFFFFFFFULL / p.model_tiles) : 0ULL
+            };
+            vkCmdPushConstants(p.cmd_buffer, p.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PushConstants), &pc);
+
+            uint32_t workgroups = static_cast<uint32_t>((sub_count + 3) / 4);
+            vkCmdDispatch(p.cmd_buffer, workgroups, 1, 1);
+            VK_CHECK(vkEndCommandBuffer(p.cmd_buffer));
+
+            if (cancelled && cancelled()) return false;
+
+            VkSubmitInfo submit_info{};
+            submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            submit_info.commandBufferCount = 1;
+            submit_info.pCommandBuffers = &p.cmd_buffer;
+
+            VK_CHECK(vkQueueSubmit(p.queue, 1, &submit_info, p.fence));
+            ++p.stats.batches_submitted;
+
+            if (offset == 0 && after_enqueue) {
+                try { after_enqueue(); } catch (...) {}
+            }
+
+            VkResult wait_res = vkWaitForFences(p.device, 1, &p.fence, VK_TRUE, 5000000000ULL);
+            if (wait_res != VK_SUCCESS) {
+                throw std::runtime_error("PoM kernel timeout or error");
+            }
+
+            total_processed += sub_count;
+
+            if (p.buf_winner.mapped) {
+                uint32_t win = *static_cast<uint32_t*>(p.buf_winner.mapped);
+                if (win != 0xFFFFFFFFu && win < sub_count) {
+                    out.winner_index = static_cast<uint32_t>(offset + win);
+                    break;
+                }
+            }
+        }
+
+        auto end_total = std::chrono::high_resolution_clock::now();
+        p.stats.last_dispatch_ms = std::chrono::duration<double, std::milli>(end_total - start_total).count();
+        ++p.stats.batches_completed;
+        p.stats.nonces_processed += total_processed;
+
+        return true;
+    }
+
     // Reset winner atomic to 0xFFFFFFFF
     if (p.buf_winner.mapped) {
         *static_cast<uint32_t*>(p.buf_winner.mapped) = 0xFFFFFFFFu;
@@ -484,7 +583,6 @@ bool VulkanBdaResidentEngine::run_batch(
     vkCmdBindPipeline(p.cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline);
     vkCmdBindDescriptorSets(p.cmd_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipeline_layout, 0, 1, &p.descriptor_set, 0, nullptr);
 
-    const bool need_offsets = copy_offsets || diagnostics;
     PushConstants pc{
         .bank0_addr = p.bank0_addr,
         .bank1_addr = p.bank1_addr,

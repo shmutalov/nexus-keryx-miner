@@ -693,6 +693,9 @@ int main(int argc, char **argv) {
     scfg.declared_model_id_hex = hex(official_model.data(), official_model.size());
     stratum_client = std::make_unique<stratum::StratumV4Client>(std::move(scfg));
     stratum_client->start();
+    gpu_ownership.set_busy_callback([client = stratum_client.get()](bool busy) {
+      if (client) client->set_ai_inference_busy(busy);
+    });
   }
 
   // Queues
@@ -1154,7 +1157,10 @@ int main(int argc, char **argv) {
       const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
                           : consensus::V5PadSpec{};
       const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
-      const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready()) ? std::min<std::uint32_t>(batch_size, 8192u) : batch_size;
+      const std::uint32_t preferred_v5 = shared_runtime->pom_v5_batch();
+      const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready())
+          ? std::min<std::uint32_t>(batch_size, preferred_v5 ? preferred_v5 : 8192u)
+          : batch_size;
       const std::uint64_t batch_start = ((nonce_cursor & pool_job.nonce_mask) | pool_job.nonce_fixed);
 
       telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
@@ -1315,7 +1321,10 @@ int main(int argc, char **argv) {
     const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
                         : consensus::V5PadSpec{};
     const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
-    const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready()) ? std::min<std::uint32_t>(batch_size, 8192u) : batch_size;
+    const std::uint32_t preferred_v5 = shared_runtime->pom_v5_batch();
+    const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready())
+        ? std::min<std::uint32_t>(batch_size, preferred_v5 ? preferred_v5 : 8192u)
+        : batch_size;
 
     telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
     telemetry.work_launched(dispatch_batch);
