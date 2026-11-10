@@ -827,3 +827,36 @@ fn signed_response_and_trace_bytes_cannot_be_substituted() {
     c.request = [4; 32];
     assert!(validate_response(&[1; 32], &bytes, &c).is_err());
 }
+
+#[test]
+fn awaited_child_is_replayed_when_local_acceptance_draw_differs() {
+    let (_dir,mut s,id)=node_setup();
+    s.resolve_deadlines().unwrap();
+    let capture=&s.pending[&id].capture;
+    let draw=seq::draw_attn(&p::TierManifest::for_attn(capture.tier).unwrap(),
+        &capture.trace.record,&p::trace_seed(&[11;32],&id)).unwrap();
+    let part=keryx_verifiable_inference::attn::Partial{o:vec![0.0;draw.dv],m:0.0,l:1.0};
+    let mut partials=attn_blocks::encode_partial(&part);
+    partials.extend(attn_blocks::encode_partial(&part));
+    let weights=attn_blocks::child_weights(&attn_blocks::decode_partials(&partials,draw.dv).unwrap()).unwrap();
+    let local=p::draw_attention_child(&[13;32],&id,0,&weights).unwrap();
+    let wanted=1-local;
+    let op=opening::AttnOpening{response_txid:id,partials,..Default::default()};
+    let mut piece=dummy_piece(id,true);
+    piece.payload=signing(&[1;32],&opening::seeded(&op.encode(),&[11;32]).unwrap()).unwrap();
+    piece.id=audit_txid(&piece.payload);piece.accepted=Some(([12;32],140115110));
+    s.pending.get_mut(&id).unwrap().state.pieces=vec![piece];
+    s.chain.push(ChainBlock{hash:[12;32],daa:140115110,accepted:vec![]});
+    s.chain.push(ChainBlock{hash:[13;32],daa:140115210,accepted:vec![]});
+    let mut row=node_row(&s,id,[11;32]);row.path=vec![wanted];row.pieces=2;
+    s.awaited_ids(140115211);
+    s.apply_awaited(AwaitedFrame{daa:140115211,openings:vec![row]}).unwrap();
+    let mut called=false;
+    s.advance(140115211,None,|_,_,_,path,prev|{
+        assert_eq!(path,&[wanted]);assert!(prev.is_some());called=true;
+        Err("probe stops before proof construction or effects".into())
+    }).unwrap();
+    assert!(called,"verified node child stalled behind a local draw mismatch");
+    assert_eq!(s.pending[&id].state.pieces.len(),1);
+    assert!(s.pending[&id].state.pieces[0].accepted.is_some());
+}

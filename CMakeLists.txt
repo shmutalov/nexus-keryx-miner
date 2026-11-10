@@ -322,12 +322,18 @@ int main() {
 
   add_library(nexus_grpc src/network/grpc_client.cpp src/network/grpc_header.cpp
     src/network/ai_reorg_reconciliation.cpp
-    src/network/submit_block_client.cpp src/network/submission_pipeline.cpp
+    src/network/submit_block_client.cpp src/network/submission_pipeline.cpp src/network/submission_ledger.cpp
     src/network/opoi.cpp src/network/trace_capture.cpp src/network/ai_service.cpp src/network/ai_response_service.cpp src/network/h15_audit_client.cpp
     src/network/escrow_watcher.cpp src/network/strike_monitor.cpp
-    src/network/stratum_v4_client.cpp)
+    src/network/stratum_v4_client.cpp src/network/pool_telemetry.cpp src/network/pool_ai_service.cpp)
   add_executable(nexus-h15-worker-rpc EXCLUDE_FROM_ALL tests/h15_worker_rpc.cpp)
   target_link_libraries(nexus-h15-worker-rpc PRIVATE nexus_node_proto)
+  add_executable(nexus-pool-ai-service-test tests/pool_ai_service_test.cpp)
+  target_link_libraries(nexus-pool-ai-service-test PRIVATE nexus_grpc)
+  add_test(NAME pool_ai_durable_restart_nul_and_operator_isolation
+    COMMAND nexus-pool-ai-service-test "${CMAKE_BINARY_DIR}/test-data/pool-ai-service")
+  add_executable(nexus-h15-nul-native-test EXCLUDE_FROM_ALL tests/h15_nul_native_test.cpp)
+  target_link_libraries(nexus-h15-nul-native-test PRIVATE nexus_grpc)
   add_executable(nexus-h15-native-test EXCLUDE_FROM_ALL tests/h15_native_test.cpp)
   target_link_libraries(nexus-h15-native-test PRIVATE nexus_grpc)
   if(NEXUS_ENABLE_CUDA)
@@ -655,8 +661,6 @@ if(BUILD_TESTING)
   add_test(NAME gpu_opoi_preemption_lifecycle COMMAND nexus-gpu-preemption-test)
   if(NEXUS_ENABLE_GRPC)
     add_executable(nexus-opoi-protocol-test tests/opoi_protocol_test.cpp)
-  add_executable(nexus-trace-capture-test tests/trace_capture_test.cpp src/network/trace_capture.cpp)
-  target_include_directories(nexus-trace-capture-test PRIVATE include)
   add_test(NAME abi6_trace_capture_bounds_and_replay COMMAND nexus-trace-capture-test)
   add_executable(nexus-trace-stage2-adapter-test tests/trace_stage2_adapter_test.cpp src/network/trace_capture.cpp)
   target_include_directories(nexus-trace-stage2-adapter-test PRIVATE include)
@@ -703,8 +707,6 @@ endif()
 
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if(BUILD_TESTING AND NEXUS_ENABLE_GRPC)
-  add_executable(nexus-escrow-claim-mock-test tests/escrow_claim_mock_test.cpp)
-  target_link_libraries(nexus-escrow-claim-mock-test PRIVATE nexus_grpc)
   add_test(NAME escrow_claim_mock COMMAND nexus-escrow-claim-mock-test "${CMAKE_BINARY_DIR}/test-data/escrow-claim-mock")
   add_test(NAME worker_submission_mode_policy COMMAND nexus-worker-mode-test)
   if(TARGET nexus-live-cuda-worker AND Python3_Interpreter_FOUND)
@@ -888,3 +890,120 @@ endif()
 
 
 nexus_configure_test_drivers()
+
+if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-network-security-test tests/network_security_test.cpp)
+  target_link_libraries(nexus-network-security-test PRIVATE nexus_grpc)
+  nexus_warnings(nexus-network-security-test -Wall -Wextra -Wpedantic)
+  add_test(NAME network_security_invariants COMMAND nexus-network-security-test)
+  set_tests_properties(network_security_invariants PROPERTIES TIMEOUT 30)
+endif()
+
+add_executable(nexus-resident-route-test tests/resident_route_test.cpp)
+target_include_directories(nexus-resident-route-test PRIVATE include)
+add_test(NAME resident_route_and_canonical_layout COMMAND nexus-resident-route-test)
+
+option(NEXUS_BUILD_NETWORK_SANITIZERS "Build instrumented network regression driver" OFF)
+if(NEXUS_BUILD_NETWORK_SANITIZERS AND NEXUS_ENABLE_GRPC AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang" AND NOT WIN32)
+  add_executable(nexus-pool-ai-sanitize-test tests/pool_ai_service_test.cpp
+    src/network/pool_ai_service.cpp src/network/stratum_v4_client.cpp src/network/pool_telemetry.cpp src/network/submission_ledger.cpp)
+  target_compile_options(nexus-pool-ai-sanitize-test PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined,float-cast-overflow)
+  target_link_options(nexus-pool-ai-sanitize-test PRIVATE -fsanitize=address,undefined,float-cast-overflow)
+  target_link_libraries(nexus-pool-ai-sanitize-test PRIVATE nexus_grpc)
+  add_executable(nexus-pool-telemetry-sanitize-test tests/pool_telemetry_test.cpp
+    src/network/stratum_v4_client.cpp src/network/pool_telemetry.cpp src/network/submission_ledger.cpp)
+  target_compile_options(nexus-pool-telemetry-sanitize-test PRIVATE -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined,float-cast-overflow)
+  target_link_options(nexus-pool-telemetry-sanitize-test PRIVATE -fsanitize=address,undefined,float-cast-overflow)
+  target_link_libraries(nexus-pool-telemetry-sanitize-test PRIVATE nexus_grpc)
+  add_executable(nexus-network-security-sanitize-test tests/network_security_test.cpp
+    src/network/stratum_v4_client.cpp src/network/submit_block_client.cpp src/network/submission_ledger.cpp)
+  target_compile_options(nexus-network-security-sanitize-test PRIVATE -O1 -g -fno-omit-frame-pointer
+    -fsanitize=address,undefined,float-cast-overflow)
+  target_link_options(nexus-network-security-sanitize-test PRIVATE -fsanitize=address,undefined,float-cast-overflow)
+  target_link_libraries(nexus-network-security-sanitize-test PRIVATE nexus_grpc)
+
+  foreach(kind IN ITEMS submission-ledger solo-submission-ledger stratum-share-binding)
+    if(kind STREQUAL "submission-ledger")
+      set(ledger_test_source tests/submission_ledger_test.cpp)
+      set(ledger_transport_source "")
+    elseif(kind STREQUAL "solo-submission-ledger")
+      set(ledger_test_source tests/solo_submission_ledger_test.cpp)
+      set(ledger_transport_source src/network/submit_block_client.cpp)
+    else()
+      set(ledger_test_source tests/stratum_share_binding_test.cpp)
+      set(ledger_transport_source src/network/stratum_v4_client.cpp)
+    endif()
+    add_executable(nexus-${kind}-sanitize-test ${ledger_test_source}
+      src/network/submission_ledger.cpp ${ledger_transport_source})
+    target_compile_options(nexus-${kind}-sanitize-test PRIVATE -O1 -g -fno-omit-frame-pointer
+      -fsanitize=address,undefined)
+    target_link_options(nexus-${kind}-sanitize-test PRIVATE -fsanitize=address,undefined)
+    target_link_libraries(nexus-${kind}-sanitize-test PRIVATE nexus_grpc)
+    add_test(NAME ${kind}_address_undefined_sanitizers
+      COMMAND nexus-${kind}-sanitize-test "${CMAKE_BINARY_DIR}/test-data/${kind}-sanitize")
+    set_tests_properties(${kind}_address_undefined_sanitizers PROPERTIES TIMEOUT 45)
+  endforeach()
+endif()
+
+if(NEXUS_ENABLE_GRPC AND Python3_Interpreter_FOUND AND UNIX)
+  add_test(NAME stratum_tls_authentication_and_shutdown
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/stratum_tls_security.py"
+      "$<TARGET_FILE:nexus-network-security-test>" "${CMAKE_BINARY_DIR}/test-data/stratum-tls-security")
+  set_tests_properties(stratum_tls_authentication_and_shutdown PROPERTIES TIMEOUT 90 LABELS "offline;network;tls")
+endif()
+
+if(NEXUS_ENABLE_GRPC AND NEXUS_ENABLE_CUDA)
+  add_executable(nexus-resident-layout-probe tests/resident_layout_probe.cpp)
+  target_link_libraries(nexus-resident-layout-probe PRIVATE nexus_grpc nexus_cuda)
+endif()
+
+add_executable(nexus-post-submit-audits-test tests/post_submit_audits_test.cpp)
+target_include_directories(nexus-post-submit-audits-test PRIVATE include)
+add_test(NAME post_submit_task_lifetime_and_backpressure COMMAND nexus-post-submit-audits-test)
+set_tests_properties(post_submit_task_lifetime_and_backpressure PROPERTIES TIMEOUT 20)
+
+if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-ai-request-admission-test tests/ai_request_admission_test.cpp)
+  target_link_libraries(nexus-ai-request-admission-test PRIVATE nexus_grpc)
+  add_test(NAME canonical_ai_request_admission_and_missed_receipt COMMAND nexus-ai-request-admission-test)
+endif()
+
+if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-trace-capture-test tests/trace_capture_test.cpp src/network/trace_capture.cpp)
+  target_include_directories(nexus-trace-capture-test PRIVATE include)
+  add_executable(nexus-pool-telemetry-test tests/pool_telemetry_test.cpp)
+  target_link_libraries(nexus-pool-telemetry-test PRIVATE nexus_grpc)
+  add_test(NAME pool_telemetry_protocol_and_receipt_isolation COMMAND nexus-pool-telemetry-test)
+  add_executable(nexus-escrow-claim-mock-test tests/escrow_claim_mock_test.cpp)
+  target_link_libraries(nexus-escrow-claim-mock-test PRIVATE nexus_grpc)
+  add_executable(nexus-h15-chain-restore-test tests/h15_chain_restore_test.cpp)
+  target_link_libraries(nexus-h15-chain-restore-test PRIVATE nexus_grpc)
+  add_test(NAME h15_restore_budget_progress_and_durable_cursor COMMAND nexus-h15-chain-restore-test "${CMAKE_BINARY_DIR}/test-data/h15-chain-restore")
+endif()
+
+if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-stratum-share-binding-test tests/stratum_share_binding_test.cpp)
+  target_link_libraries(nexus-stratum-share-binding-test PRIVATE nexus_grpc)
+  add_test(NAME stratum_job_bound_difficulty_and_durable_delivery COMMAND nexus-stratum-share-binding-test "${CMAKE_BINARY_DIR}/test-data/stratum-share-ledger")
+endif()
+
+if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-submission-ledger-test tests/submission_ledger_test.cpp)
+  target_link_libraries(nexus-submission-ledger-test PRIVATE nexus_grpc)
+  add_test(NAME durable_submission_intent_receipt_crash_and_process_race
+    COMMAND nexus-submission-ledger-test "${CMAKE_BINARY_DIR}/test-data/submission-ledger")
+endif()
+
+if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-solo-submission-ledger-test tests/solo_submission_ledger_test.cpp)
+  target_link_libraries(nexus-solo-submission-ledger-test PRIVATE nexus_grpc)
+  add_test(NAME solo_submission_restart_receipts_and_chain_reconciliation
+    COMMAND nexus-solo-submission-ledger-test "${CMAKE_BINARY_DIR}/test-data/solo-submission-ledger")
+endif()
+
+if(NEXUS_ENABLE_GRPC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(nexus-stratum-ledger-socket-test tests/stratum_ledger_socket_test.cpp)
+  target_link_libraries(nexus-stratum-ledger-socket-test PRIVATE nexus_grpc)
+  add_test(NAME stratum_socket_ack_loss_restart_does_not_retransmit
+    COMMAND nexus-stratum-ledger-socket-test "${CMAKE_BINARY_DIR}/test-data/stratum-ledger-socket")
+endif()

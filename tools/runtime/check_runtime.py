@@ -11,6 +11,7 @@ import sys
 WRAPPER_EXPORTS = (
     'abi', 'last_error', 'load', 'tensor_count', 'context_acquire', 'context_release',
     'context_info', 'tensor_info', 'tensor_device', 'generate', 'generate_traced',
+    'generate_n', 'generate_traced_n',
     'trace_tokens', 'trace_configure', 'trace_leaf_count', 'trace_read', 'replay',
     'replay_multi', 'probe_device', 'free',
 )

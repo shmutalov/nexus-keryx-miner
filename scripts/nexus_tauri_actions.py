@@ -186,7 +186,7 @@ def action(name, value, confirmed=False):
         url = value.get('url', value) if isinstance(value, dict) else value
         res = nexus_mining_mode.test_connection(str(url))
         if res.get('ok'):
-            msg = f"Connection OK: {res.get('ping_ms', 0):.1f} ms"
+            msg = f"Pool protocol OK: {res.get('ping_ms', 0):.1f} ms. {res.get('notice', 'Mining authorization and escrow access are untested')}"
         else:
             msg = f"Connection FAILED: {res.get('error', 'Unreachable')}"
         return {'message': msg, 'test_result': res}

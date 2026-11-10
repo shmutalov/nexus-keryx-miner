@@ -573,6 +573,10 @@ class DashboardModel:
                     "task_root": str(stratum.get("task_root", "")),
                     "last_error": str(stratum.get("last_error", "")),
                     "last_share_status": str(stratum.get("last_share_status", "NONE")),
+                    "pool_telemetry_state": str(stratum.get("pool_telemetry_state", "N/A")),
+                    "pool_metadata_sent": stratum.get("pool_metadata_sent"),
+                    "pool_metadata_acked": stratum.get("pool_metadata_acked"),
+                    "pool_trace_ready": stratum.get("pool_trace_ready") is True,
                 }
             if state.get('pom_backend') in ('cuda-driver', 'vulkan-jit', 'vulkan-bda', 'vulkan-rdna3'):
                 self.pom_backend = {'schema_version': 1, 'device_id': AUTHORIZED_GPU,
@@ -1369,6 +1373,9 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
                 ("Mining mode", "POOL (Stratum v4 Sovereign Worker)"),
                 ("Selected pool", f"{pool_name} · {endpoint}"),
                 ("Connection status", f"{state_str} · Ping {ping_text}"),
+                ("Pool telemetry", stratum.get("pool_telemetry_state", "N/A")),
+                ("Pool AI service", "Verified" if stratum.get("pool_trace_ready") else "Not qualified"),
+                ("Pool escrow access", "Operator approval required for Nexus" if active_pool_id == "keryxpool" else "Pool policy; qualification not assessed"),
                 ("Current difficulty", diff_text),
                 ("Submitted shares", shares_text),
                 ("Worker identifier", stratum.get('worker') or payout),

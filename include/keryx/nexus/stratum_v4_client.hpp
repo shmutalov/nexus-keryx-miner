@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <memory>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -18,9 +20,12 @@
 #include <unordered_set>
 #include <vector>
 
+#include "keryx/nexus/pool_telemetry.hpp"
 #include "keryx/nexus/consensus/pom_v4.hpp"
 #include "keryx/nexus/consensus/pom_v5.hpp"
 #include "rpc.pb.h"
+
+namespace keryx::nexus::network { class SubmissionLedger; }
 
 namespace keryx::nexus::stratum {
 
@@ -60,21 +65,27 @@ struct StratumEndpoint {
 
 StratumEndpoint parse_stratum_endpoint(std::string_view url);
 bool is_stratum_endpoint_url(std::string_view url) noexcept;
+bool is_public_trace_ip(std::string_view address);
 
 struct StratumClientConfig {
   std::string pool_url;
   std::vector<std::string> backup_urls;
   std::string worker;
   std::string password{"x"};
-  std::string user_agent{"keryx-miner-supr/0.15.6"};
+  std::string user_agent{nexus_pool_agent};
+  PoolTelemetryOptions pool_telemetry;
   std::string protocol_tag{"keryx-stratum-v3"};
   std::string declared_model_id_hex{
       "9631eb996d2dc26efcab2c2ebd7a0eb28fb9f4fbddeca4bfbe0ec1fb1f2c9005"};
-  bool tls_verify_peer{false};
+  bool tls_verify_peer{true};
+  // Cross-host trace upload destinations require explicit deployment admission.
+  std::vector<std::string> trace_upload_hosts;
   int connect_timeout_ms{5000};
   int io_timeout_ms{5000};
   int reconnect_initial_ms{500};
   int reconnect_max_ms{15000};
+  // Production workers supply a private absolute journal; protocol-only mocks may omit it.
+  std::filesystem::path submission_journal;
 };
 
 struct StratumPoolJob {
@@ -109,6 +120,10 @@ struct StratumChallenge {
   std::string nonce_hex;
   std::chrono::steady_clock::time_point received_at{};
 };
+struct PoolAiMessage {
+  std::string scope, wire;
+  std::chrono::steady_clock::time_point received_at;
+};
 
 struct VerifiedPoolShare {
   std::uint64_t job_generation{0};
@@ -134,6 +149,7 @@ struct VerifiedPoolShare {
 
 struct PendingShareRecord {
   std::uint64_t rpc_id{0};
+  Hash ledger_id{};
   std::uint64_t job_generation{0};
   std::string job_id;
   std::uint64_t nonce{0};
@@ -170,6 +186,9 @@ struct StratumTelemetrySnapshot {
   std::string task_root_hex;
   std::string last_error;
   std::string last_share_status;
+  std::string pool_telemetry_state;
+  std::uint64_t pool_metadata_sent{}, pool_metadata_acked{};
+  bool pool_trace_ready{};
 };
 
 Hash difficulty_to_target(double difficulty);
@@ -213,6 +232,13 @@ public:
                                std::string_view stage);
 
   StratumTelemetrySnapshot telemetry_snapshot() const;
+  // Low-priority producer publishes cumulative completed walks, with no I/O.
+  void update_pool_work(std::uint64_t completed,
+      std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+  void poll_pool_extensions(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+  void qualify_pool_ai(); // called only after native traced replay self-test
+  std::optional<PoolAiMessage> take_pool_ai();
+  bool submit_pool_ai_result(std::string_view scope,std::string_view result);
 
   std::size_t endpoint_count() const noexcept { return endpoints_.size(); }
   std::size_t active_endpoint_index() const noexcept { return active_endpoint_index_; }
@@ -238,10 +264,15 @@ private:
   void io_loop();
   void close_socket_locked();
   bool send_line_locked(const std::string &line);
+  enum class MetadataWrite { Skipped, Sent, Broken };
+  MetadataWrite send_metadata_locked(const std::string &line);
   bool read_line_once(std::string &out_line);
   void record_error_locked(std::string message);
 
   StratumClientConfig config_;
+  std::deque<PoolAiMessage> pool_ai_queue_;
+  std::map<std::uint64_t,std::chrono::steady_clock::time_point> pool_ai_pending_;
+  std::unique_ptr<network::SubmissionLedger> submission_ledger_;
   std::vector<StratumEndpoint> endpoints_;
   std::size_t active_endpoint_index_{0};
   StratumEndpoint endpoint_;
@@ -254,7 +285,7 @@ private:
   bool loopback_test_mode_{false};
 
   std::thread io_thread_;
-  std::unique_ptr<SocketHandle> socket_;
+  std::shared_ptr<SocketHandle> socket_;
 
   ConnectionState state_{ConnectionState::Disconnected};
   std::uint64_t next_rpc_id_{1};
@@ -262,6 +293,16 @@ private:
   std::uint64_t authorize_rpc_id_{0};
   std::chrono::steady_clock::time_point subscribe_sent_at_{};
   std::chrono::steady_clock::time_point authorize_sent_at_{};
+
+  bool subscribed_{false}, authorized_{false}, hello_sent_{false};
+  bool metadata_session_enabled_{false},metadata_session_acked_{false};
+  std::string hello_json_, pool_telemetry_state_{"DISABLED"};
+  std::uint64_t pool_metadata_sent_{}, pool_metadata_acked_{};
+  std::map<std::uint64_t,std::chrono::steady_clock::time_point> metadata_pending_;
+  std::chrono::steady_clock::time_point metadata_started_{std::chrono::steady_clock::now()};
+  std::chrono::steady_clock::time_point next_metadata_{}, next_declare_{};
+  struct WorkSample { std::uint64_t completed{}; std::chrono::steady_clock::time_point at; };
+  std::optional<WorkSample> pool_work_, pool_rate_base_;
 
   double current_difficulty_{1.0};
   Hash current_share_target_{};
@@ -271,6 +312,7 @@ private:
   bool pool_supports_b64_proof_{false};
   std::atomic<bool> ai_inference_busy_{false};
   std::unordered_map<std::string, std::string> trace_upload_urls_;
+  std::mutex trace_upload_mutex_;
 
   std::optional<StratumPoolJob> active_job_;
   std::unordered_map<std::string, std::uint64_t> job_ids_seen_;

@@ -25,6 +25,10 @@
 #include "keryx/nexus/scoped_file_cache_guard.hpp"
 #include "keryx/nexus/cpu_topology.hpp"
 #include "keryx/nexus/stratum_v4_client.hpp"
+#include "keryx/nexus/post_submit_audits.hpp"
+#include "keryx/nexus/nonce_interval.hpp"
+#include "keryx/nexus/rust_proof_verifier.hpp"
+#include "keryx/nexus/proof_artifact_buffers.hpp"
 #include "keryx/nexus/h15_bridge.h"
 #include "keryx/nexus/trace_manifest_bridge.h"
 #include "messages.pb.h"
@@ -685,16 +689,29 @@ int main(int argc, char **argv) {
 
   // Submission & Stratum Clients
   std::unique_ptr<network::SubmitBlockClient> submit_client;
+  // Declared after the client: tasks drain before their dependency is destroyed.
+  PostSubmitAudits chain_observers;
+  if (submit_enabled && oracle_path.empty())
+    throw std::runtime_error("Vulkan submission requires an independent Rust verifier");
+  RustProofVerifier proof_verifier(oracle_path);
   std::unique_ptr<stratum::StratumV4Client> stratum_client;
   if (!pool_mode) {
-    submit_client = std::make_unique<network::SubmitBlockClient>(endpoint);
+    submit_client = std::make_unique<network::SubmitBlockClient>(endpoint,developer_data_root()/"state"/"submissions"/"solo-blocks.journal");
   } else {
     stratum::StratumClientConfig scfg;
     scfg.pool_url = endpoint;
     scfg.backup_urls = backup_pool_urls;
     scfg.worker = pool_worker;
     scfg.password = pool_password;
-    scfg.user_agent = "keryx-miner-supr/0.15.6";
+    scfg.submission_journal=developer_data_root()/"state"/"submissions"/"pool-shares.journal";
+    scfg.user_agent = stratum::nexus_pool_agent;
+    const auto disabled=[](const char *name){const char *v=std::getenv(name);return v&&(std::string_view(v)=="1"||std::string_view(v)=="true");};
+    scfg.pool_telemetry.enabled=!disabled("NEXUS_POOL_TELEMETRY_DISABLE")&&!disabled("KERYX_TELEMETRY_DISABLE");
+    scfg.pool_telemetry.build="vulkan";
+    scfg.pool_telemetry.model_id=hex(official_model.data(),official_model.size());
+    scfg.pool_telemetry.tier=0;
+    // The local H15 route does not certify Stratum trace/opening dispatch.
+    scfg.pool_telemetry.trace_ready=false;
     scfg.declared_model_id_hex = hex(official_model.data(), official_model.size());
     stratum_client = std::make_unique<stratum::StratumV4Client>(std::move(scfg));
     stratum_client->start();
@@ -852,6 +869,7 @@ int main(int argc, char **argv) {
     while (!process_stop.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::seconds(1));
       if (stratum_client) {
+        stratum_client->update_pool_work(telemetry.counters().gpu_work_units_completed);
         const auto st = stratum_client->telemetry_snapshot();
         NativePomTelemetry::StratumFields sf;
         sf.mode = "pool";
@@ -874,6 +892,9 @@ int main(int argc, char **argv) {
         sf.task_root_hex = st.task_root_hex;
         sf.last_error = st.last_error;
         sf.last_share_status = st.last_share_status;
+          sf.pool_telemetry_state=st.pool_telemetry_state;
+          sf.pool_metadata_sent=st.pool_metadata_sent;sf.pool_metadata_acked=st.pool_metadata_acked;
+          sf.pool_trace_ready=st.pool_trace_ready;
         telemetry.set_stratum(sf);
         telemetry.set_job_invalidations(st.jobs_received > 0 ? st.jobs_received - 1 : 0);
       } else {
@@ -907,6 +928,8 @@ int main(int argc, char **argv) {
   std::uint64_t last_pool_nonce_fixed = 0;
   std::uint64_t last_pool_nonce_mask = 0;
   const std::uint64_t initial_nonce_cursor = nonce_cursor;
+  bool pool_nonce_exhausted=false;
+  bool solo_nonce_exhausted=false;
   std::uint64_t last_reconcile_ns = 0;
 
   auto reconcile_discovered_journal = [&]() {
@@ -1104,6 +1127,7 @@ int main(int argc, char **argv) {
         last_pool_nonce_fixed = pool_job.nonce_fixed;
         last_pool_nonce_mask = pool_job.nonce_mask;
         nonce_cursor = (initial_nonce_cursor & (pool_job.nonce_mask >> 1U)) | pool_job.nonce_fixed;
+        pool_nonce_exhausted=false;
       }
 
       auto prior_daa = ai_current_daa.load(std::memory_order_relaxed);
@@ -1161,14 +1185,22 @@ int main(int argc, char **argv) {
       }
       const std::uint32_t h10 = (header.daa_score >= h10_activation_daa) ? 1u : 0u;
       const bool v5 = (header.daa_score >= consensus::pom_v5_activation_daa);
+      if(v5 && !shared_runtime->pom_v5_ready()) throw std::runtime_error("Vulkan PoM v5 export unavailable");
       const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
                           : consensus::V5PadSpec{};
       const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
       const std::uint32_t preferred_v5 = shared_runtime->pom_v5_batch();
-      const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready())
+      const std::uint32_t requested_batch = (v5 && shared_runtime->pom_v5_ready())
           ? std::min<std::uint32_t>(batch_size, preferred_v5 ? preferred_v5 : 8192u)
           : batch_size;
-      const std::uint64_t batch_start = ((nonce_cursor & pool_job.nonce_mask) | pool_job.nonce_fixed);
+      const std::uint64_t batch_start=nonce_cursor;
+      const auto dispatch_batch=static_cast<std::uint32_t>(pool_nonce_exhausted?0:bounded_nonce_batch(
+          batch_start,pool_job.nonce_fixed|pool_job.nonce_mask,requested_batch));
+      if(!dispatch_batch) {
+        if(!pool_nonce_exhausted) std::cout<<"NONCE_RANGE_EXHAUSTED backend=VULKAN action=WAIT_NEW_JOB\n"<<std::flush;
+        pool_nonce_exhausted=true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;
+      }
 
       telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
       telemetry.work_launched(dispatch_batch);
@@ -1188,6 +1220,9 @@ int main(int argc, char **argv) {
         continue;
       }
 
+      if(winner < -1) throw std::runtime_error("Vulkan pool dispatch failed");
+      pool_nonce_exhausted=consume_nonce_interval(nonce_cursor,pool_job.nonce_fixed|pool_job.nonce_mask,dispatch_batch);
+      if(pool_nonce_exhausted) std::cout<<"NONCE_RANGE_EXHAUSTED backend=VULKAN action=WAIT_NEW_JOB\n"<<std::flush;
       telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
       if (!stratum_client->is_job_current(pool_job.generation, pool_job.job_id)) {
         telemetry.work_stale(dispatch_batch);
@@ -1196,7 +1231,7 @@ int main(int argc, char **argv) {
       telemetry.eligible_attempts(dispatch_batch);
 
       if (winner >= 0) {
-        const std::uint64_t winning_nonce = batch_start + static_cast<std::uint64_t>(winner);
+        const std::uint64_t winning_nonce=checked_winner_nonce(batch_start,dispatch_batch,winner);
         std::cout << "LIVE_RESIDENT_TARGET=FOUND mode=POOL device=" << device_id << " nonce=" << winning_nonce
                   << " dGPU_winner_offset=" << winner << "\n" << std::flush;
         telemetry.target_satisfied();
@@ -1219,7 +1254,13 @@ int main(int argc, char **argv) {
           const auto pow = pom_pow_value_h3(final, pph);
           if (little_endian_leq(pow, eff_target)) {
             const auto wire = borsh_v5_container(proof, final, pow);
+            const ProofArtifactContext context{seed,gguf.chunk_count(),header.timestamp,winning_nonce,
+                header.daa_score,pool_job.generation,final,header.pom_tier,official_root,
+                eff_target,pph,{},pow};
+            const auto artifacts=encode_proof_artifacts(context,walk,wire.size());
+            proof_verifier.verify(artifacts.context_prefix,artifacts.trace,wire);
             telemetry.proof_completed();
+            telemetry.proof_rust_verified();
             telemetry.proof_fresh(false);
             if (submit_enabled && stratum_client->is_job_current(pool_job.generation, pool_job.job_id)) {
               auto solved_header = header;
@@ -1258,7 +1299,6 @@ int main(int argc, char **argv) {
         }
       }
 
-      nonce_cursor = (((batch_start + dispatch_batch) & pool_job.nonce_mask) | pool_job.nonce_fixed);
       continue;
     }
 
@@ -1325,14 +1365,23 @@ int main(int argc, char **argv) {
 
     // 4. Dispatch PoM batch on resident Vulkan engine
     const bool v5 = (header.daa_score >= consensus::pom_v5_activation_daa);
+    if(v5 && !shared_runtime->pom_v5_ready()) throw std::runtime_error("Vulkan PoM v5 export unavailable");
     const auto pad = v5 ? official_v5_pad(header.pom_tier, official_model, official_root, header.daa_score)
                         : consensus::V5PadSpec{};
     const auto pad_words = v5 ? v5_pad_seed_words(pad.seed) : std::array<std::uint64_t, 4>{};
     const std::uint32_t preferred_v5 = shared_runtime->pom_v5_batch();
-    const std::uint32_t dispatch_batch = (v5 && shared_runtime->pom_v5_ready())
+    const std::uint32_t requested_batch = (v5 && shared_runtime->pom_v5_ready())
         ? std::min<std::uint32_t>(batch_size, preferred_v5 ? preferred_v5 : 8192u)
         : batch_size;
 
+    const auto batch_start=nonce_cursor;
+    const auto dispatch_batch=static_cast<std::uint32_t>(solo_nonce_exhausted?0:bounded_nonce_batch(
+        batch_start,UINT64_MAX,requested_batch));
+    if(!dispatch_batch) {
+      solo_nonce_exhausted=true;
+      telemetry.set_gpu_activity("NONCE_RANGE_EXHAUSTED");
+      std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;
+    }
     telemetry.set_gpu_activity("VULKAN_RESIDENT_SEARCH");
     telemetry.work_launched(dispatch_batch);
 
@@ -1345,13 +1394,13 @@ int main(int argc, char **argv) {
           std::cout << "POM_V5_DISPATCH device=" << device_id << " pad_tiles=" << pad.tiles
                     << " pad_mib=" << (pad.tiles / 1024) << " batch=" << dispatch_batch << "\n" << std::flush;
         });
-        winner = shared_runtime->pom_mine_v5(p, s, t, header.timestamp, nonce_cursor, dispatch_batch,
+        winner = shared_runtime->pom_mine_v5(p, s, t, header.timestamp, batch_start, dispatch_batch,
                                              pad_words.data(), pad.tiles);
         if (winner < -1) {
           std::cerr << "POM_V5_DISPATCH_WARNING code=" << winner << " batch=" << dispatch_batch << "\n" << std::flush;
         }
       } else {
-        winner = shared_runtime->pom_mine(p, s, t, header.timestamp, nonce_cursor, batch_size, 256, h10);
+        winner = shared_runtime->pom_mine(p, s, t, header.timestamp, batch_start, dispatch_batch, 256, h10);
       }
     });
 
@@ -1360,17 +1409,18 @@ int main(int argc, char **argv) {
       continue;
     }
 
+    if(winner < -1) throw std::runtime_error("Vulkan SOLO dispatch failed");
+    solo_nonce_exhausted=consume_nonce_interval(nonce_cursor,UINT64_MAX,dispatch_batch);
     telemetry.work_completed(dispatch_batch * 256, dispatch_batch);
     if (winner < 0 && (!job.lease.valid() || !job_queue.wait_refresh_resolved(job.generation))) {
       telemetry.work_stale(dispatch_batch);
-      nonce_cursor += dispatch_batch;
       continue;
     }
     telemetry.eligible_attempts(dispatch_batch);
 
     // 5. Check if winner found
     if (winner >= 0) {
-      const std::uint64_t winning_nonce = nonce_cursor + static_cast<std::uint64_t>(winner);
+      const std::uint64_t winning_nonce=checked_winner_nonce(batch_start,dispatch_batch,winner);
       std::cout << "LIVE_RESIDENT_TARGET=FOUND device=" << device_id << " nonce=" << winning_nonce
                 << " dGPU_winner_offset=" << winner << "\n" << std::flush;
       telemetry.target_satisfied();
@@ -1410,6 +1460,11 @@ int main(int argc, char **argv) {
         if (little_endian_leq(pow, target.little_endian)) {
           const auto wire = borsh_v5_container(proof, final, pow);
           const auto response_digest = blake3_digest(job.fields.response_wire.data(), job.fields.response_wire.size());
+          const ProofArtifactContext context{seed,gguf.chunk_count(),header.timestamp,winning_nonce,
+              header.daa_score,job.generation,final,header.pom_tier,official_root,
+              target.little_endian,pph,response_digest,pow};
+          const auto artifacts=encode_proof_artifacts(context,walk,wire.size());
+          proof_verifier.verify(artifacts.context_prefix,artifacts.trace,wire);
           telemetry.proof_completed();
           telemetry.proof_rust_verified();
           telemetry.proof_fresh(false);
@@ -1439,10 +1494,11 @@ int main(int argc, char **argv) {
                                         << network::submission_state_name(submit_res.state)
                                         << " hash=" << submit_res.block_hash << " nonce=" << winning_nonce << "\n" << std::flush;
             if (!submit_res.block_hash.empty()) {
-              std::thread([client_ptr = submit_client.get(), submit_res]() mutable {
+              chain_observers.enqueue({}, [client_ptr = submit_client.get(), submit_res]() mutable {
                 try {
                   const auto chain = client_ptr->observe_chain(
-                      submit_res, std::chrono::seconds(30), std::chrono::seconds(2), 6);
+                      submit_res, std::chrono::seconds(30), std::chrono::seconds(2), 6,
+                      [] { return process_stop.load(std::memory_order_acquire); });
                   std::osyncstream(std::cout)
                       << "LIVE_CHAIN_STATUS state=" << network::submission_state_name(chain.state)
                       << " hash=" << chain.block_hash
@@ -1451,8 +1507,13 @@ int main(int argc, char **argv) {
                       << " selected_tip_blue_score=" << chain.selected_tip_blue_score
                       << " reorg_observed=" << (chain.reorg_observed ? "true" : "false")
                       << " confirmation_policy=6_blue_score_depth_not_finality\n" << std::flush;
-                } catch (...) {}
-              }).detach();
+                } catch (const std::exception &e) {
+                  std::osyncstream(std::cerr)<<"CHAIN_OBSERVER_FAILED detail="<<e.what()<<"\n";
+                  throw;
+                }
+              }, [](std::exception_ptr) {
+                std::osyncstream(std::cerr) << "CHAIN_OBSERVER_FAILED source=AMD_VULKAN\n";
+              });
             }
           } else {
             std::cout << "AMD_WINNER_VERIFIED nonce=" << winning_nonce << " submit=DISABLED\n" << std::flush;
@@ -1463,7 +1524,6 @@ int main(int argc, char **argv) {
       }
     }
 
-    nonce_cursor += dispatch_batch;
   }
 
   std::cout << "LIVE_VULKAN_WORKER=SHUTDOWN\n" << std::flush;

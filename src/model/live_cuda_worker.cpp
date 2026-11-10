@@ -41,6 +41,7 @@
 #include "keryx/nexus/network/submit_block_client.hpp"
 #include "keryx/nexus/ai_response_service.hpp"
 #include "keryx/nexus/h15_audit_client.hpp"
+#include "keryx/nexus/pool_ai_service.hpp"
 #include "keryx/nexus/pom_vram_admission.hpp"
 #include "keryx/nexus/escrow_watcher.hpp"
 #include "keryx/nexus/escrow_claim_policy.hpp"
@@ -49,6 +50,7 @@
 #include "keryx/nexus/live_worker_config.hpp"
 #include "keryx/nexus/native_telemetry.hpp"
 #include "keryx/nexus/proof_artifacts.hpp"
+#include "keryx/nexus/nonce_interval.hpp"
 #include "keryx/nexus/proof_artifact_buffers.hpp"
 #include "keryx/nexus/rust_proof_verifier.hpp"
 #include "keryx/nexus/rpc_template_cache.hpp"
@@ -612,6 +614,7 @@ int main(int argc,char **argv) {
   bool escrow_claims_enabled=false;
   std::future<void> escrow_claim_task;
   std::atomic_uint64_t next_claim_check_ns{0};
+  std::atomic_bool claim_burn_backlog{false};
   fs::path claim_journal;
   fs::path claim_cadence_file;
   std::uint64_t last_claim_check_unix=0;
@@ -925,6 +928,7 @@ int main(int argc,char **argv) {
             });
           };
           while(std::getline(prior_claims,line)) {
+            claim_burn_backlog.store(ai::escrow_burn_receipt_backlog(line));
             for(std::size_t pos=0;(pos=line.find(key,pos))!=std::string::npos;pos+=key.size()) {
               const auto start=pos+key.size();
               if(start+64<line.size()&&line[start+64]=='"') {
@@ -1080,7 +1084,20 @@ int main(int argc,char **argv) {
       scfg.backup_urls = config.backup_pool_urls;
       scfg.worker = pool_worker;
       scfg.password = pool_password;
-      scfg.user_agent = "keryx-miner-supr/0.15.6";
+      scfg.submission_journal=developer_data_root()/"state"/"submissions"/"pool-shares.journal";
+      scfg.user_agent = stratum::nexus_pool_agent;
+    const auto disabled=[](const char *name){const char *v=std::getenv(name);return v&&(std::string_view(v)=="1"||std::string_view(v)=="true");};
+    scfg.pool_telemetry.enabled=!disabled("NEXUS_POOL_TELEMETRY_DISABLE")&&!disabled("KERYX_TELEMETRY_DISABLE");
+    scfg.pool_telemetry.build="cuda";
+    scfg.pool_telemetry.model_id=hex(official_model.data(),official_model.size());
+    scfg.pool_telemetry.tier=0;
+    // The local H15 route does not certify Stratum trace/opening dispatch.
+    scfg.pool_telemetry.trace_ready=false;
+    const char *gpu_name=std::getenv("NEXUS_PRIMARY_GPU_NAME");
+    scfg.pool_telemetry.devices.push_back({0,"NVIDIA",gpu_name?gpu_name:""});
+#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
+    if(secondary_pom_enabled)scfg.pool_telemetry.devices.push_back({1,"AMD",""});
+#endif
       scfg.declared_model_id_hex = hex(official_model.data(), official_model.size());
       stratum_client = std::make_unique<stratum::StratumV4Client>(std::move(scfg));
       stratum_client->start();
@@ -1107,7 +1124,7 @@ int main(int argc,char **argv) {
     // Live constructs one gate/client for the worker lifetime so ambiguous
     // outcomes cannot be retried as duplicates in this process.
     std::unique_ptr<network::SubmitBlockClient> submit_client;
-    if(submit_enabled) submit_client=std::make_unique<network::SubmitBlockClient>(endpoint);
+    if(submit_enabled) submit_client=std::make_unique<network::SubmitBlockClient>(endpoint,developer_data_root()/"state"/"submissions"/"solo-blocks.journal");
     std::vector<std::future<void>> chain_observers; // bounded read-only RPC observers; never own CUDA
     std::mutex chain_observers_mutex;
     std::uint64_t resident_batch_size=live_resident_batch_size;
@@ -1232,14 +1249,63 @@ int main(int argc,char **argv) {
       return answer;
     };
 #endif
+    std::atomic_uint64_t ai_gpu_pause_started_ns{0};
+    const auto note_ai_gpu_pause=[&] {
+      std::uint64_t empty=0;
+      (void)ai_gpu_pause_started_ns.compare_exchange_strong(empty,monotonic_ns());
+    };
+    const auto note_ai_pom_resumed=[&] {
+      const auto started=ai_gpu_pause_started_ns.exchange(0);
+      if(started)std::osyncstream(std::cout)<<"{\"event\":\"AI_POM_RESUMED\",\"schema_version\":1,\"elapsed_ns\":"
+          <<monotonic_ns()-started<<",\"evidence\":\"first_completed_pom_batch\"}\n"<<std::flush;
+    };
     if(h15_audits)h15_audits->set_gpu_owner([&](const std::function<void()>&work){
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
       SecondaryLanePause pause(secondary_lane.get());
 #endif
-      gpu_ownership.run_opoi([&]{resident.reset();engine.reset();},[&]{work();return true;},[]{});
+      gpu_ownership.run_opoi([&]{note_ai_gpu_pause();resident.reset();engine.reset();},[&]{work();return true;},[]{});
     });
+    std::unique_ptr<ai::H15AuditClient> pool_h15;
+    std::unique_ptr<ai::PoolAiService> pool_ai;
+    if(pool_mode&&stratum_client&&native_h15_route&&ai_responses_enabled&&shared_runtime->supports_length_aware_tracing()) {
+      pool_h15=std::make_unique<ai::H15AuditClient>(*shared_runtime,gguf,merkle,
+          developer_data_root()/"state"/"pool-ai"/"engine",escrow_secret,endpoint,official_model,true);
+      pool_h15->set_gpu_owner([&](const std::function<void()>&work){
+#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
+        SecondaryLanePause pause(secondary_lane.get());
+#endif
+        gpu_ownership.run_opoi([&]{note_ai_gpu_pause();resident.reset();engine.reset();},[&]{work();return true;},[]{});
+      });
+      Hash self_request{};self_request.fill(0x5a);
+      constexpr char self_prompt[]="Nexus pool check\0Reply OK.";
+      gpu_ownership.run_opoi([&]{resident.reset();engine.reset();},[&]{
+        (void)pool_h15->infer(std::string_view(self_prompt,sizeof(self_prompt)-1),16,self_request);return true;
+      },[]{});
+      const auto checked=pool_h15->verify_capture(2);
+      if(!checked[0])throw std::runtime_error("Pool AI native traced self-test had no verified pieces");
+      pool_ai=std::make_unique<ai::PoolAiService>(developer_data_root()/"state"/"pool-ai"/"records",official_model,
+        [&](std::string_view prompt,std::uint32_t tokens,const Hash&request){
+          telemetry.set_state("PAUSED","RUNNING","POOL_AI_TRACE",submit_enabled?"ARMED":"DISABLED");
+          return gpu_ownership.run_opoi([&]{note_ai_gpu_pause();resident.reset();engine.reset();},[&]{
+            ai::PoolAiService::Capture result;result.answer=pool_h15->infer(prompt,tokens,request);
+            result.record=pool_h15->export_pool_capture();return result;
+          },[]{});
+        },[&](auto capture,const Hash&request,const Hash&response,const Hash&seed,auto path,auto previous){
+          telemetry.set_state("PAUSED","RUNNING","POOL_AI_OPENING",submit_enabled?"ARMED":"DISABLED");
+          return pool_h15->open_pool_capture(capture,request,response,seed,path,previous);
+        });
+      stratum_client->qualify_pool_ai();
+      std::cout<<"POOL_AI_ROUTE=QUALIFIED native=true sized_prompt=true verified_seeds=2 durable_capture_before_send=true\n"<<std::flush;
+    }
     std::atomic_bool ai_queue_overflow{false};
     std::atomic_uint64_t ai_current_daa{service_rpc.providers_virtual_daa};
+    const auto canonical_request_admission=[&](std::string_view id) {
+      const auto result=ai_response_transport.request_admission(id,escrow_key,*service_identity);
+      auto prior=ai_current_daa.load(std::memory_order_relaxed);
+      while(prior<result.virtual_daa && !ai_current_daa.compare_exchange_weak(
+          prior,result.virtual_daa,std::memory_order_release,std::memory_order_relaxed)){}
+      return result;
+    };
 
     auto serve_ai_request=[&](QueuedAiRequest request) {
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
@@ -1289,6 +1355,7 @@ int main(int argc,char **argv) {
             release_amd_for_inference();
             if(primary_vulkan_workload)primary_vulkan_workload->release();
 #endif
+            note_ai_gpu_pause();
             resident.reset();
             if(engine) {
               engine.reset();
@@ -1324,18 +1391,26 @@ int main(int argc,char **argv) {
       if(h15_audits){
         effects.infer_traced=[&](std::string_view prompt,std::uint32_t tokens,const std::array<std::uint8_t,32>&hash){
           telemetry.set_state("PAUSED","RUNNING","H15_TRACE",submit_enabled?"ARMED":"DISABLED");
+          const auto preemption_started_ns=monotonic_ns();
           return gpu_ownership.run_opoi([&]{
 #ifdef NEXUS_ENABLE_SECONDARY_VULKAN
             release_amd_for_inference();
             if(primary_vulkan_workload)primary_vulkan_workload->release();
 #endif
+            note_ai_gpu_pause();
             resident.reset();
             if(engine) {
               engine.reset();
               std::cout<<"AI_GPU_PREEMPTION=POM_RELEASED request_id="<<request.id<<"\n"<<std::flush;
             }
           },
-              [&]{return h15_audits->infer(prompt,tokens,hash);},[]{});
+              [&]{
+                record_phase("gpu_preemption",monotonic_ns()-preemption_started_ns);
+                const auto started=monotonic_ns();
+                auto result=h15_audits->infer(prompt,tokens,hash);
+                record_phase("model_inference",monotonic_ns()-started);
+                return result;
+              },[]{});
         };
         effects.recover_traced=[&](const Hash &request){return h15_audits->response_for_request(request);};
         effects.persist_trace=[&](std::string_view id,std::span<const std::uint8_t>payload,std::uint64_t daa,std::uint64_t deadline){h15_audits->commit(id,payload,daa,deadline);native_trace_persisted=true;};
@@ -1359,6 +1434,7 @@ int main(int argc,char **argv) {
         return ai_response_transport.known(txid);
       };
       effects.current_daa=[&] { return ai_current_daa.load(std::memory_order_acquire); };
+      effects.request_admission=canonical_request_admission;
       effects.wait_before_retry=[&](std::uint32_t milliseconds) {
         if(h15_audits){h15_audits->poll();h15_audits->advance(ai_current_daa.load(),milliseconds/100);h15_audits->submit_due(ai_current_daa.load(),ai_responses_enabled);}
         const auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(milliseconds);
@@ -1444,7 +1520,10 @@ int main(int argc,char **argv) {
 #endif
       delete p;
     });
-    if (!pool_mode) {
+    if(pool_mode && stratum_client)stratum_client->start();
+    if (!pool_mode || pool_local_node_ready) {
+    std::cout<<"AI_NODE_INGRESS=START mode="<<(pool_mode?"POOL":"SOLO")
+             <<" priority=AI_BEFORE_POM\n"<<std::flush;
     ingress=std::thread([&]{
       try {
         const auto ingress_rc=run_live_job_client(endpoint,pay,extra,queue,0,0,stop,[&](const std::string &wire) {
@@ -1534,7 +1613,7 @@ int main(int argc,char **argv) {
           if(escrow_claim_task.valid()&&task_free)escrow_claim_task.get();
           const bool claim_check=escrow_claims_enabled&&task_free&&startup_backfill_complete.load(std::memory_order_acquire)&&
               startup_backfill_done.load(std::memory_order_acquire)&&!escrow_watcher->validation_in_progress()&&
-              ai::escrow_claim_check_due(now,next_claim_check_ns.load(std::memory_order_acquire),unix_now,last_claim_check_unix)&&!stop.load(std::memory_order_relaxed);
+              ai::escrow_claim_cycle_due(now,next_claim_check_ns.load(std::memory_order_acquire),unix_now,last_claim_check_unix,claim_burn_backlog.load(std::memory_order_acquire))&&!stop.load(std::memory_order_relaxed);
           if(claim_check) {
             const auto temporary=claim_cadence_file.string()+".new."+std::to_string(keryx::nexus::platform::io::getpid());
             const int fd=keryx::nexus::platform::io::open(temporary.c_str(),O_WRONLY|O_CREAT|O_EXCL|O_CLOEXEC|O_NOFOLLOW,0600);
@@ -1550,12 +1629,13 @@ int main(int argc,char **argv) {
           }
           // Discovery stays active on every block. Only one stock claim-selection
           // attempt is admitted per 30-minute interval, outside historical backfill.
+          // Explicit rejected burn backlog permits bounded repair cycles every minute.
           escrow_watcher->set_claim_construction_enabled(false);
           const auto escrow = escrow_watcher->handle_block(block);
           escrow_watcher->set_claim_construction_enabled(false);
           if(claim_check) {
-            next_claim_check_ns.store(now+1'800'000'000'000ULL,std::memory_order_release);
-            std::osyncstream(std::cout)<<"ESCROW_CLAIM_CHECK interval_sec=1800 candidate=UTXO_QUERY_PENDING"<<"\n"<<std::flush;
+            next_claim_check_ns.store(now+(claim_burn_backlog.load()?60ULL:1800ULL)*1'000'000'000ULL,std::memory_order_release);
+            std::osyncstream(std::cout)<<"ESCROW_CLAIM_CHECK interval_sec="<<(claim_burn_backlog.load()?60:1800)<<" candidate=UTXO_QUERY_PENDING"<<"\n"<<std::flush;
           }
           if (claim_check) {
             escrow_claim_task=std::async(std::launch::async,[&,endpoint,claim_block=block]() mutable {
@@ -1578,14 +1658,19 @@ int main(int argc,char **argv) {
                 std::osyncstream(std::cout)<<"ESCROW_CLAIM_CHECK_BLOCKED detail_hex="<<hex(reinterpret_cast<const std::uint8_t*>(detail.data()),detail.size())<<"\n"<<std::flush;
                 return;
               }
-              if(stop.load(std::memory_order_relaxed))return;
+              const auto repair_started=std::chrono::steady_clock::now();
+              std::unordered_set<std::string> repair_ids;
+              for(unsigned repair=0;repair<ai::escrow_burn_repair_attempts;++repair) {
+              if(stop.load(std::memory_order_relaxed)||ai_requests.size()!=0||
+                 std::chrono::steady_clock::now()-repair_started>std::chrono::seconds(20))return;
               auto candidate=escrow_watcher->verified_claim(claim_block,live);
-              if(!candidate){std::osyncstream(std::cout)<<"ESCROW_CLAIM_VERIFIED candidate=NONE\n"<<std::flush;return;}
+              if(!candidate){claim_burn_backlog.store(false);std::osyncstream(std::cout)<<"ESCROW_CLAIM_VERIFIED candidate=NONE\n"<<std::flush;return;}
               auto tx=std::move(*candidate);
               const auto digest=ai::consensus_transaction_id(tx);
               if(!digest||tx.inputs_size()<1||tx.inputs_size()>87||tx.outputs_size()!=1||tx.subnetworkid()!=std::string(40,'0'))
                 throw std::runtime_error("stock escrow claim structure or canonical transaction ID invalid");
               const auto id=hex(digest->data(),digest->size());
+              if(!repair_ids.insert(id).second)throw std::runtime_error("escrow repair repeated unchanged claim");
               {std::lock_guard lock(claim_ids_mutex);if(own_claim_ids.size()>=10000&&!own_claim_ids.contains(id))throw std::runtime_error("bounded claim history exhausted");own_claim_ids.insert(id);}
               const auto record=[&](std::string_view stage,std::string_view detail={}) {
                 const std::string line="{\"event\":\"ESCROW_CLAIM_SUBMISSION\",\"state\":\""+std::string(stage)+"\",\"txid\":\""+id+"\",\"inputs\":"+std::to_string(tx.inputs_size())+",\"payout_sompi\":"+std::to_string(tx.outputs(0).amount())+",\"fee_sompi\":30000000,\"observed_monotonic_ns\":"+std::to_string(monotonic_ns())+",\"detail_hex\":\""+hex(reinterpret_cast<const std::uint8_t*>(detail.data()),detail.size())+"\"}\n";
@@ -1612,6 +1697,15 @@ int main(int argc,char **argv) {
                 if(escrow_watcher->submit_result(id,detail)==0)throw std::runtime_error("stock claim error correlation failed");
               }
               escrow_watcher->flush();
+              const bool repair_burn=result.state==ai::AiResponseEffects::SubmitResult::State::Rejected &&
+                  ai::escrow_named_burn_rejection(result.detail,tx);
+              claim_burn_backlog.store(repair_burn,std::memory_order_release);
+              next_claim_check_ns.store(monotonic_ns()+(repair_burn?60ULL:1800ULL)*1'000'000'000ULL,std::memory_order_release);
+              if(!repair_burn)break;
+              std::osyncstream(std::cout)<<"ESCROW_BURN_REPAIR attempt="<<repair+1
+                <<" max_attempts="<<ai::escrow_burn_repair_attempts
+                <<" rejected_members_persisted=true next="<<(repair+1==ai::escrow_burn_repair_attempts?"WAIT_BOUNDED_REPAIR_CYCLE":"REBUILD_VALIDATED_BATCH")<<"\n"<<std::flush;
+              }
             });
           }
           if (escrow.pending_count != 0)
@@ -1653,6 +1747,7 @@ int main(int argc,char **argv) {
     shutdown_watcher=std::thread([&]{
       while(!stop.load(std::memory_order_relaxed)) std::this_thread::sleep_for(std::chrono::milliseconds(20));
       queue.close();
+      if(stratum_client)stratum_client->stop();
     });
     std::cout<<"AI_STARTUP_BACKFILL=WAITING before_pom=true transactions="
              <<(ai_responses_enabled?"AUTHORIZED":"DISABLED")<<"\n"<<std::flush;
@@ -1671,7 +1766,6 @@ int main(int argc,char **argv) {
              <<" unavailable="<<startup_backfill_unavailable.load(std::memory_order_acquire)
              <<" known_pending="<<ai_requests.size()<<" before_pom=true\n"<<std::flush;
     } else {
-      if (stratum_client) stratum_client->start();
       startup_backfill_complete.store(true, std::memory_order_release);
       startup_backfill_done.store(true, std::memory_order_release);
       shutdown_watcher=std::thread([&]{
@@ -1696,6 +1790,7 @@ int main(int argc,char **argv) {
     std::cout<<"{\"event\":\"POM_BACKEND_SELECTED\",\"schema_version\":1,\"backend\":\""
       <<(is_bda_vulkan?"vulkan-bda":(primary_vulkan?"vulkan-jit":"cuda-driver"))<<"\",\"device_id\":\""<<gpu_uuid<<"\"}\n"<<std::flush;
     std::uint64_t nonce_cursor=first_nonce;
+    bool pool_nonce_exhausted=false;
     std::size_t completed=0,jobs_seen=0;
     std::cout<<"LIVE_CUDA_WORKER=START uuid="<<gpu_uuid<<" cuda_engine_instances="<<cuda_engine_initializations.load(std::memory_order_relaxed)<<" submit="
              <<(submit_enabled?"ENABLED":"DISABLED")
@@ -1754,7 +1849,7 @@ int main(int argc,char **argv) {
       }
       const auto amb_rec = ai_response_service->reconcile_ambiguous([&](std::string_view txid) {
         return ai_response_transport.known(txid);
-      });
+      },canonical_request_admission);
       if (amb_rec > 0) {
         std::osyncstream(std::cout) << "AI_RESPONSE_RECONCILIATION=RESOLVED count=" << amb_rec << "\n" << std::flush;
       }
@@ -1841,7 +1936,8 @@ int main(int argc,char **argv) {
         std::osyncstream(std::cout)<<"POM_H15_LIFECYCLE pom="<<pom_lifecycle.pom_state()<<" h15="<<pom_lifecycle.service_state()<<" mode="<<pom_lifecycle.operational_mode()<<" canary_pom_phase_finished="<<phase_finished<<" h15_service_still_active="<<(h15_service_initialized.load()&&!stop.load())<<" safe_to_exit="<<(safe_exit?"true":"false")<<" reason="<<barrier_reason<<"\n"<<std::flush;
         live_selection->refresh();
         if (stratum_client) {
-          const auto st = stratum_client->telemetry_snapshot();
+          stratum_client->update_pool_work(telemetry.counters().gpu_work_units_completed);
+        const auto st = stratum_client->telemetry_snapshot();
           NativePomTelemetry::StratumFields sf;
           sf.mode = "pool";
           sf.connected = st.connected;
@@ -1863,6 +1959,9 @@ int main(int argc,char **argv) {
           sf.task_root_hex = st.task_root_hex;
           sf.last_error = st.last_error;
           sf.last_share_status = st.last_share_status;
+          sf.pool_telemetry_state=st.pool_telemetry_state;
+          sf.pool_metadata_sent=st.pool_metadata_sent;sf.pool_metadata_acked=st.pool_metadata_acked;
+          sf.pool_trace_ready=st.pool_trace_ready;
           telemetry.set_stratum(sf);
           telemetry.set_job_invalidations(st.jobs_received > 0 ? st.jobs_received - 1 : 0);
         } else {
@@ -1945,6 +2044,19 @@ int main(int argc,char **argv) {
         std::erase_if(proof_auditors,[](auto &f){if(f.wait_for(std::chrono::seconds(0))==std::future_status::ready){f.get();return true;}return false;});}
       // This boundary is reached only after ongoing bounded PoM work retires.
       // Release under the same GPU owner; never reset shared_runtime/model.
+      if(pool_ai&&stratum_client) {
+        if(auto message=stratum_client->take_pool_ai()) {
+          try {
+            auto result=pool_ai->handle(message->scope,pool_worker,message->wire);
+            const bool sent=stratum_client->submit_pool_ai_result(message->scope,result);
+            std::cout<<"POOL_AI_RESULT sent="<<(sent?"true":"false")<<" scope_bound=true pool_signing_required=true\n"<<std::flush;
+          }catch(const std::exception&){
+            std::cout<<"POOL_AI_REQUEST_FAILED scope_bound=true empty_response_sent=false\n"<<std::flush;
+          }
+          telemetry.set_state("ACTIVE","IDLE","",submit_enabled?"ARMED":"DISABLED");
+          continue;
+        }
+      }
       if(pom_lifecycle.cancel_pom()) {
         if((!pool_mode||pool_local_node_ready)&&(!h15_audits||!h15_audits->ready()))pom_lifecycle.service_unavailable();
         pom_lifecycle.settle_pause([&]{return gpu_ownership.run_pom([&]{resident.reset();engine.reset();
@@ -2029,6 +2141,7 @@ int main(int argc,char **argv) {
           last_pool_generation = pool_job.generation;
           ++jobs_seen;
           nonce_cursor = (first_nonce & (pool_job.nonce_mask >> 1U)) | pool_job.nonce_fixed;
+          pool_nonce_exhausted=false;
         } else {
           last_pool_generation = pool_job.generation;
         }
@@ -2093,10 +2206,16 @@ int main(int argc,char **argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
           }
-          const std::uint64_t batch_count = nonce_limit == 0
-              ? resident_batch_size
-              : std::min<std::uint64_t>(256, nonce_limit - completed);
-          const std::uint64_t batch_start = ((nonce_cursor & pool_job.nonce_mask) | pool_job.nonce_fixed);
+          const auto requested_count = nonce_limit == 0 ? resident_batch_size
+              : std::min<std::uint64_t>(256, nonce_limit-completed);
+          const std::uint64_t batch_start=nonce_cursor;
+          const auto batch_count=pool_nonce_exhausted?0:bounded_nonce_batch(batch_start,
+              pool_job.nonce_fixed|pool_job.nonce_mask,requested_count);
+          if(!batch_count) {
+            if(!pool_nonce_exhausted) std::cout<<"NONCE_RANGE_EXHAUSTED backend=CUDA action=WAIT_NEW_JOB\n"<<std::flush;
+            pool_nonce_exhausted=true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(25));continue;
+          }
           ResidentSearchResult search;
           telemetry.set_gpu_activity("CUDA_RESIDENT_SEARCH");
           bool searched = false;
@@ -2107,7 +2226,7 @@ int main(int argc,char **argv) {
                 if (v5) shared_runtime->use_task_context();
                 if (!resident) {
                   resident = std::make_unique<CudaResidentSearch>(
-                      std::string(gpu_uuid), gguf, shared_runtime->resident_tensors());
+                      std::string(gpu_uuid), gguf, shared_runtime->resident_tensors(), shared_runtime->canonical_weights());
                   cuda_engine_initializations.fetch_add(1, std::memory_order_relaxed);
                   std::cout << "POM_ALLOCATION_READY lazy_restore=true engine_instances="
                             << cuda_engine_initializations.load(std::memory_order_relaxed) << "\n" << std::flush;
@@ -2134,6 +2253,7 @@ int main(int argc,char **argv) {
                 telemetry.work_launched(batch_count);
                 search = resident->run(pph, header.timestamp, header.daa_score, eff_target, batch_start, batch_count);
                 telemetry.work_completed(search.completed * walk_steps, search.completed);
+                if(search.completed)note_ai_pom_resumed();
               });
           } catch (const PomVramAdmissionDenied &denied) {
             degrade_pom(denied);
@@ -2145,7 +2265,8 @@ int main(int argc,char **argv) {
             telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
           }
           telemetry.record_search_host(preparation_end_ns - preparation_start_ns, refresh_end_ns - preparation_end_ns);
-          nonce_cursor = (((batch_start + search.completed) & pool_job.nonce_mask) | pool_job.nonce_fixed);
+          pool_nonce_exhausted=consume_nonce_interval(nonce_cursor,pool_job.nonce_fixed|pool_job.nonce_mask,search.completed);
+          if(pool_nonce_exhausted) std::cout<<"NONCE_RANGE_EXHAUSTED backend=CUDA action=WAIT_NEW_JOB\n"<<std::flush;
           telemetry.record_cuda_times(search.kernel_ms, 0, 0, search.kernel_ms);
           if (!live_selection->allows(LiveGpuSelection::Nvidia, primary_selection_token) ||
               !stratum_client->is_job_current(pool_job.generation, pool_job.job_id) ||
@@ -2467,7 +2588,7 @@ int main(int argc,char **argv) {
           // Ownership is drained here; the next AI call releases the pad first.
           if(v5)shared_runtime->use_task_context();
           if(!resident) {
-            resident=std::make_unique<CudaResidentSearch>(std::string(gpu_uuid),gguf,shared_runtime->resident_tensors());
+            resident=std::make_unique<CudaResidentSearch>(std::string(gpu_uuid),gguf,shared_runtime->resident_tensors(),shared_runtime->canonical_weights());
             cuda_engine_initializations.fetch_add(1,std::memory_order_relaxed);
             std::cout<<"POM_ALLOCATION_READY lazy_restore=true engine_instances="
                      <<cuda_engine_initializations.load(std::memory_order_relaxed)<<"\n"<<std::flush;
@@ -2485,6 +2606,7 @@ int main(int argc,char **argv) {
           telemetry.work_launched(batch_count);
           search=resident->run(pph,header.timestamp,header.daa_score,target.little_endian,batch_start,batch_count);
           telemetry.work_completed(search.completed*walk_steps,search.completed);
+          if(search.completed)note_ai_pom_resumed();
         });
         } catch(const PomVramAdmissionDenied &denied) {
           degrade_pom(denied);
@@ -2565,7 +2687,25 @@ int main(int argc,char **argv) {
           const auto wire=borsh_v5_container(proof,final,pow);
           const auto pack_end_ns=monotonic_ns();
 
-          // === FAST-PATH IMMEDIATE SUBMISSION (sub-millisecond latency to network) ===
+          // Strict receipt: independent Rust verification precedes submission.
+          const ProofArtifactContext context{seed,gguf.chunk_count(),header.timestamp,winning_nonce,header.daa_score,job.generation,final,header.pom_tier,official_root,target.little_endian,pph,response_digest,pow};
+          const auto artifacts=encode_proof_artifacts(context,diagnostic,wire.size());
+          const auto name=safe_name(job.generation,winning_nonce);
+          const std::array<fs::path,3> paths{outdir/(name+".proof"),outdir/(name+".context"),outdir/(name+".trace")};
+          for(const auto &path:paths)if(fs::exists(path))throw std::runtime_error("H15 proof artifact already exists");
+          {std::ofstream f(paths[0],std::ios::binary);put(f,wire.data(),wire.size());}
+          {std::ofstream f(paths[1],std::ios::binary);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
+          {std::ofstream f(paths[2],std::ios::binary);put(f,artifacts.trace.data(),artifacts.trace.size());}
+          {
+            std::lock_guard lk(rust_verifier_mutex);
+            rust_verifier.verify(artifacts.context_prefix,artifacts.trace,wire);
+          }
+          startup_parity_verified=true;
+          telemetry.proof_completed();telemetry.proof_rust_verified();
+          release_verified_nonwinner_artifacts(paths,true,target_met);
+          std::cout<<"LIVE_H15_CUDA_NONCE=PASS nonce="<<winning_nonce
+                   <<" states=257 offsets=256 rust=PASS verification_policy=STRICT_RUST_PRE_SUBMIT target_satisfied="
+                   <<(target_met?"true":"false")<<"\n"<<std::flush;
           if(target_met){
             telemetry.target_satisfied();
             // Bounded backpressure: never create an unbounded submit queue.
@@ -2591,7 +2731,10 @@ int main(int argc,char **argv) {
                   <<",\"connect_ms\":"<<timing_value(result.timing.connect_ms)<<",\"stream_ms\":"<<timing_value(result.timing.stream_ms)
                   <<",\"prepare_ms\":"<<timing_value(result.timing.prepare_ms)<<",\"write_ms\":"<<timing_value(result.timing.write_ms)
                   <<",\"response_ms\":"<<timing_value(result.timing.response_ms)<<",\"finish_ms\":"<<timing_value(result.timing.finish_ms)
-                  <<",\"total_ms\":"<<timing_value(result.timing.total_ms)<<"}\n"<<std::flush;
+                  <<",\"journal_intent_ms\":"<<timing_value(result.timing.journal_intent_ms)
+                <<",\"journal_sent_ms\":"<<timing_value(result.timing.journal_sent_ms)
+                <<",\"journal_receipt_ms\":"<<timing_value(result.timing.journal_receipt_ms)
+                <<",\"total_ms\":"<<timing_value(result.timing.total_ms)<<"}\n"<<std::flush;
                 observe_submission(result);
               } catch(const std::exception &e) {
                 std::osyncstream(std::cerr)<<"LIVE_H15_SUBMIT_FAILED nonce="<<winning_nonce<<" detail="<<e.what()<<"\n"<<std::flush;
@@ -2609,53 +2752,6 @@ int main(int argc,char **argv) {
             <<",\"cpu_wait_ms\":"<<(parity_end_ns-gather_end_ns)/1e6
             <<",\"pack_ms\":"<<(pack_end_ns-parity_end_ns)/1e6
             <<",\"proof_total_ms\":"<<(pack_end_ns-proof_begin_ns)/1e6<<"}\n";
-          // === FORENSIC ARTIFACT PERSISTENCE & RUST VERIFICATION ===
-          const ProofArtifactContext context{seed,gguf.chunk_count(),header.timestamp,winning_nonce,header.daa_score,job.generation,final,header.pom_tier,official_root,target.little_endian,pph,response_digest,pow};
-          const auto artifacts=encode_proof_artifacts(context,diagnostic,wire.size());
-          const auto name=safe_name(job.generation,winning_nonce);
-          const std::array<fs::path,3> paths{outdir/(name+".proof"),outdir/(name+".context"),outdir/(name+".trace")};
-          if(!startup_parity_verified) {
-            for(const auto &path:paths)if(fs::exists(path))throw std::runtime_error("H15 proof artifact already exists");
-            {std::ofstream f(paths[0],std::ios::binary);put(f,wire.data(),wire.size());}
-            {std::ofstream f(paths[1],std::ios::binary);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
-            {std::ofstream f(paths[2],std::ios::binary);put(f,artifacts.trace.data(),artifacts.trace.size());}
-            RustProofVerifier::Result rust;
-            {
-              std::lock_guard lk(rust_verifier_mutex);
-              rust=rust_verifier.verify(artifacts.context_prefix,artifacts.trace,wire);
-            }
-            (void)rust;
-            release_verified_nonwinner_artifacts(paths,true,target_met);
-            startup_parity_verified=true;telemetry.proof_completed();telemetry.proof_rust_verified();
-            std::cout<<"LIVE_H15_CUDA_NONCE=PASS nonce="<<winning_nonce<<" states=257 offsets=256 rust=PASS target_satisfied="<<(target_met?"true":"false")<<"\n"<<std::flush;
-          } else {
-            std::lock_guard lock(proof_auditors_mutex);
-            std::erase_if(proof_auditors,[](auto &f){if(f.wait_for(std::chrono::seconds(0))==std::future_status::ready){f.get();return true;}return false;});
-            if(proof_auditors.size()>=4) {
-              proof_auditors.front().get();proof_auditors.erase(proof_auditors.begin());
-            }
-            proof_auditors.push_back(std::async(std::launch::async, [paths, wire, artifacts, target_met, winning_nonce, &rust_verifier, &rust_verifier_mutex, &telemetry] {
-              try {
-                std::error_code ec;
-                for(const auto &path:paths) fs::remove(path, ec);
-                {std::ofstream f(paths[0],std::ios::binary|std::ios::trunc);put(f,wire.data(),wire.size());}
-                {std::ofstream f(paths[1],std::ios::binary|std::ios::trunc);put(f,artifacts.context_prefix.data(),artifacts.context_prefix.size());}
-                {std::ofstream f(paths[2],std::ios::binary|std::ios::trunc);put(f,artifacts.trace.data(),artifacts.trace.size());}
-                RustProofVerifier::Result rust;
-                {
-                  std::lock_guard lk(rust_verifier_mutex);
-                  rust = rust_verifier.verify(artifacts.context_prefix, artifacts.trace, wire);
-                }
-                (void)rust;
-                release_verified_nonwinner_artifacts(paths, true, target_met);
-                telemetry.proof_completed();
-                telemetry.proof_rust_verified();
-                std::osyncstream(std::cout) << "LIVE_H15_CUDA_NONCE=PASS nonce=" << winning_nonce << " states=257 offsets=256 rust=PASS target_satisfied=" << (target_met ? "true" : "false") << "\n" << std::flush;
-              } catch (const std::exception &e) {
-                std::osyncstream(std::cerr) << "BACKGROUND_AUDIT_WARNING nonce=" << winning_nonce << " detail=" << e.what() << " recovery=verifier_reset_submissions_kept_armed\n" << std::flush;
-              }
-            }));
-          }
           continue;
         }
         std::optional<PreparedNonce> prefetched;
@@ -3004,6 +3100,9 @@ int main(int argc,char **argv) {
                 <<",\"connect_ms\":"<<timing_value(result.timing.connect_ms)<<",\"stream_ms\":"<<timing_value(result.timing.stream_ms)
                 <<",\"prepare_ms\":"<<timing_value(result.timing.prepare_ms)<<",\"write_ms\":"<<timing_value(result.timing.write_ms)
                 <<",\"response_ms\":"<<timing_value(result.timing.response_ms)<<",\"finish_ms\":"<<timing_value(result.timing.finish_ms)
+                <<",\"journal_intent_ms\":"<<timing_value(result.timing.journal_intent_ms)
+                <<",\"journal_sent_ms\":"<<timing_value(result.timing.journal_sent_ms)
+                <<",\"journal_receipt_ms\":"<<timing_value(result.timing.journal_receipt_ms)
                 <<",\"total_ms\":"<<timing_value(result.timing.total_ms)<<"}\n"<<std::flush;
               observe_submission(result);
             }

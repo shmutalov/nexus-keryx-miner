@@ -22,7 +22,8 @@ class CudaResidentSearch final {
   CudaResidentSearch(); // CPU driver-fixture constructor; absent from delivered worker.
 #endif
   CudaResidentSearch(const std::string &uuid, const model::ReadOnlyGguf &gguf,
-                     const std::vector<opoi::ResidentTensor> &tensors);
+                     const std::vector<opoi::ResidentTensor> &tensors,
+                     std::optional<opoi::CanonicalWeightBlob> canonical = {});
   ~CudaResidentSearch();
   // Exact canonical bytes from the already verified resident model. Caller
   // must own PoM GPU admission; this does not allocate or launch a kernel.

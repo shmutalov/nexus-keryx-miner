@@ -700,6 +700,25 @@ int main(int argc,char **argv){
     } catch(const std::exception &e){std::cerr<<"REAL_INFERENCE_ERROR type=exception detail="<<e.what()<<"\n"<<std::flush;throw;}
     return last_answer;};
   {
+   // Encrypted request -> decrypt -> inference must preserve every prompt byte.
+   const auto nul_fixture=fixture(fs::path(argv[2]).parent_path()/"private-nul.req");
+   AiResponseService svc(config_for(nul_fixture,dir/"private-nul.journal"));svc.recover();
+   unsigned calls=0;bool exact_prompt=false;
+   auto effects=effects_for(endpoint,[&](std::string_view prompt,std::uint32_t){
+     ++calls;constexpr char expected[]="before\0middle\0after";
+     exact_prompt=prompt==std::string_view(expected,sizeof(expected)-1);
+     require(exact_prompt,"private prompt NUL bytes changed before inference");
+     require(opoi::official_qwen35_ai_prompt(prompt).find(std::string(expected,sizeof(expected)-1))!=std::string::npos,"ordinary chat template stripped NUL bytes");
+     return std::string("NUL prompt preserved");
+   },service,ipfs_api);
+   // Refuse publication after the callback: this regression needs no response tx.
+   effects.publish_and_readback=[](auto)->std::array<std::uint8_t,34>{throw std::runtime_error("NUL fixture publication deliberately stopped");};
+   effects.submit=[](auto,auto){return AiResponseEffects::SubmitResult{AiResponseEffects::SubmitResult::State::Rejected,"isolated NUL regression"};};
+   const auto result=svc.serve(nul_fixture.tx,mainnet_private_inference_gate_daa+100,{},effects);
+   require(exact_prompt&&calls==1&&result==ServeResult::Failed,"NUL private request did not reach exact inference callback");
+   std::cout<<"PRIVATE_NUL_PROMPT=PASS embedded_nuls=2 mainnet_transactions=0\n";
+  }
+  {
    // Exercise the Rust network matrix through the actual C++ ABI without a GPU.
    using keryx::nexus::protocol::flags;
    using keryx::nexus::protocol::require_legacy_worker_era;
@@ -1015,6 +1034,41 @@ int main(int argc,char **argv){
     AiResponseService recovered(config_for(f,dir/("retry-"+mode+".journal")));recovered.recover();
     require(recovered.serve(f.tx,daa,providers_for(f),effects,daa+10,daa)==ServeResult::WaitingReconciliation&&calls==1,
             "restart retried an unresolved transaction");
+    // An ambiguous transport receipt is not an eternal service duty. Preserve
+    // its txid, reconcile positive evidence first, then expire by protocol DAA.
+    if(mode=="unknown") {
+      const auto original=dir/("retry-"+mode+".journal");
+      const auto known_path=dir/"retry-unknown-late-known.journal";
+      fs::copy_file(original,known_path);
+      AiResponseService known_late(config_for(f,known_path));known_late.recover();
+      auto late=effects;late.current_daa=[&]{return daa+11;};
+      late.reconcile=[](std::string_view){return true;};
+      late.request_admission=[](auto){return AiRequestAdmission{AiRequestAdmission::State::Closed,200000000,0};};
+      require(known_late.serve(f.tx,daa,providers_for(f),late,daa+10,daa)==ServeResult::Duplicate,
+          "late positive evidence lost to expiry");
+      require(known_late.journal().get(parsed->stable_id)->state==ResponseState::RpcAcknowledged,
+          "positive evidence not retained");
+      const auto periodic_path=dir/"retry-unknown-periodic-expiry.journal";
+      fs::copy_file(original,periodic_path);
+      late.reconcile=[](std::string_view){return false;};
+      late.request_admission={};
+      require(recovered.serve(f.tx,daa,providers_for(f),late,daa+10,daa)==ServeResult::Expired,
+          "expired ambiguous response blocked restart forever");
+      const auto expired=recovered.journal().get(parsed->stable_id);
+      require(expired->state==ResponseState::Expired&&expired->transaction_id==first_id&&calls==1&&inferences==1,
+          "expiry lost transaction evidence or resent a response");
+      require(recovered.serve(f.tx,daa,providers_for(f),late,daa+10,daa)==ServeResult::Expired,
+          "restart misreported expired duty as successful duplicate");
+      AiResponseService periodic(config_for(f,periodic_path));periodic.recover();
+      periodic.discover(f.tx,daa);
+      const auto reconciled=periodic.reconcile_ambiguous([](auto){return false;},
+          [](auto){return AiRequestAdmission{AiRequestAdmission::State::Closed,200000000,0};});
+      const auto closed=periodic.journal().get(parsed->stable_id);
+      require(reconciled==1 && closed->state==ResponseState::RequestClosed && closed->transaction_id==first_id,
+          "canonical closure did not release ambiguous duty with evidence intact");
+      require(periodic.serve(f.tx,daa,providers_for(f),late,daa+10,daa)==ServeResult::NotAwaited,
+          "closed request was re-inferred or called successful");
+    }
    } else {
     require(result==ServeResult::Failed&&calls==1&&waits==0&&state==ResponseState::RpcRejected,"unsafe RPC rejection retried");
     require(svc.serve(f.tx,daa,providers_for(f),effects,daa+10,daa)==ServeResult::Failed&&calls==1&&inferences==1,
@@ -1022,6 +1076,20 @@ int main(int argc,char **argv){
    }
    std::cout<<"PRIVATE_ADMISSION_RETRY="<<mode<<" PASS calls="<<calls<<" inference="<<inferences<<"\n";
   }
+  for(bool closed:{false,true}) {
+    const auto daa=mainnet_private_inference_gate_daa+100;
+    auto c=config_for(private_f,dir/(closed?"canonical-closed.journal":"canonical-window.journal"));
+    AiResponseService service_with_status(c);service_with_status.recover();
+    auto effects=effects_for(endpoint,{},service);unsigned inferences=0;
+    effects.infer=[&](auto,auto){++inferences;return std::string("canonical deadline fixture");};
+    effects.current_daa=[&]{return daa+11;};
+    effects.request_admission=[&](auto){return AiRequestAdmission{
+        closed?AiRequestAdmission::State::Closed:AiRequestAdmission::State::Awaiting,daa+11,daa+30};};
+    const auto result=service_with_status.serve(private_f.tx,daa,providers_for(private_f),effects,daa+10,daa);
+    require(closed?(result==ServeResult::NotAwaited&&inferences==0):(result==ServeResult::Submitted&&inferences==1),
+        "canonical closure/window was ignored or treated as ACK");
+  }
+
   {
    AiResponseService svc(config_for(public_f,dir/"ipfs-failure.journal"));svc.recover();
    auto effects=effects_for(endpoint,infer,service,ipfs_api);const auto before=service.count();

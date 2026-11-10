@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -43,6 +44,9 @@ struct ResidentTensor {
   bool device{};
 };
 
+// Borrowed engine allocation; valid only while the runtime model is alive.
+struct CanonicalWeightBlob {std::uintptr_t address{};std::size_t bytes{};};
+
 class StockLlamaRuntime final {
 public:
   StockLlamaRuntime(std::string library_path, std::string gguf_path);
@@ -54,6 +58,7 @@ public:
 
   // Borrowed immutable tensor views; valid only for this runtime lifetime.
   std::vector<ResidentTensor> resident_tensors() const;
+  std::optional<CanonicalWeightBlob> canonical_weights() const;
   std::string answer(const Challenge &challenge);
   // Stock llama ABI inference entrypoint for an assigned AiRequest. Prompt content is never
   // logged or persisted by this adapter. The caller must own CUDA and enforce request deadlines.
@@ -65,6 +70,7 @@ public:
       std::uint32_t n_recur,std::uint32_t heads,std::uint32_t interval);
   std::vector<SequenceCapture> replay_sequence(const TracedGeneration &,std::span<const SequenceSpan>,std::uint32_t max_chunks);
   int abi_version() const noexcept;
+  bool supports_length_aware_tracing() const noexcept;
   std::uint32_t trace_context_capacity() const noexcept;
   // ABI8/9. Caller must release/synchronize any PoM pad before switching
   // context; acquisition never resets the shared CUDA primary context.

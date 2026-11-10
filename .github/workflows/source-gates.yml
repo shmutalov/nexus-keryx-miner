@@ -46,3 +46,12 @@ jobs:
 
       - name: Distribution boundaries and explicit launch policies
         run: python3 -m unittest discover -s tests/distribution -v
+
+      - name: Length-aware prompts and safe pool connection probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .local/tmp
+          export TMPDIR="$PWD/.local/tmp" PYTHONDONTWRITEBYTECODE=1
+          python3 tests/runtime_length_aware_test.py
+          python3 tests/pool_connection_test.py

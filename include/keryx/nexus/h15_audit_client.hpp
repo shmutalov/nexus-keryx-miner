@@ -37,6 +37,13 @@ public:
                std::optional<std::uint64_t> next_request_work = {});
   void submit_due(std::uint64_t, bool authorized);
   std::array<std::uint32_t, 2> verify_capture(std::uint32_t seeds);
+  // Pool custody keeps unsigned captures separate from SOLO signed responses.
+  std::vector<std::uint8_t> export_pool_capture();
+  std::vector<std::uint8_t> open_pool_capture(std::span<const std::uint8_t>,
+      const std::array<std::uint8_t,32> &request,
+      const std::array<std::uint8_t,32> &response,
+      const std::array<std::uint8_t,32> &seed,
+      std::span<const std::uint64_t> path, std::span<const std::uint8_t> previous);
   std::array<std::uint32_t, 4> verify_lifecycle();
   bool ready() const noexcept;
   bool restoring() const;

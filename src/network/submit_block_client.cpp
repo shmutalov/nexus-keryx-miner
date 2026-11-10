@@ -1,3 +1,4 @@
+#include "keryx/nexus/submission_ledger.hpp"
 #include "keryx/nexus/network/submit_block_client.hpp"
 #include "keryx/nexus/grpc_header.hpp"
 #include "messages.grpc.pb.h"
@@ -192,8 +193,9 @@ struct SubmitBlockClient::PersistentStream {
 };
 SubmitBlockClient::~SubmitBlockClient() = default;
 
-SubmitBlockClient::SubmitBlockClient(std::string endpoint) : endpoint_(std::move(endpoint)) {
+SubmitBlockClient::SubmitBlockClient(std::string endpoint,std::filesystem::path journal) : endpoint_(std::move(endpoint)) {
   (void)endpoint_target(endpoint_); // validate transport policy before any request can be made
+  if(!journal.empty())submission_ledger_=std::make_unique<SubmissionLedger>(std::move(journal));
 }
 
 SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
@@ -219,11 +221,25 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
   transition(output, SubmissionState::CandidateValid);
   output.reservation = gate_.reserve(verified);
   const auto candidate_header = consensus::header_from_rpc(block.header());
-  output.block_hash = hash_hex(consensus::block_hash_for_daa(
-      candidate_header, block.header().nonce(),
-      static_cast<std::uint64_t>(block.header().timestamp())));
+  const auto ledger_id=consensus::block_hash_for_daa(candidate_header,block.header().nonce(),
+      static_cast<std::uint64_t>(block.header().timestamp()));
+  output.block_hash=hash_hex(ledger_id);
   output.timing.validation_ms=elapsed(phase);phase=std::chrono::steady_clock::now();
   const auto done=[&]{output.timing.total_ms=elapsed(begin);return output;};
+  if(submission_ledger_) {
+    const auto journal_started=std::chrono::steady_clock::now();
+    const auto bytes=block.SerializeAsString();
+    const auto digest=consensus::blake3_hash(std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()));
+    const bool reserved=submission_ledger_->reserve(ledger_id,digest);
+    output.timing.journal_intent_ms=elapsed(journal_started);
+    if(!reserved) {
+      // Preserve ambiguity after restart and permit read-only chain observation.
+      // A prior wire attempt, even a rejected one, never authorizes a blind replay.
+      output.node_error="DURABLE_INTENT_ALREADY_EXISTS; no retransmission";
+      transition(output,SubmissionState::UnknownOutcome);return done();
+    }
+  }
+  phase=std::chrono::steady_clock::now(); // Journal time is separate from connection time.
   const auto deadline = std::chrono::system_clock::now() + timeout;
   std::shared_ptr<grpc::Channel> channel;
   try {
@@ -285,15 +301,23 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
   if(!active->wire->Write(request)) {
     output.timing.write_ms=elapsed(phase);
     discard_stream();
+    if(submission_ledger_&&!submission_ledger_->observe(ledger_id,SubmissionLedger::State::Unknown))throw std::runtime_error("durable unknown block send failed");
     transition(output,timed_out.load()?SubmissionState::UnknownAfterTimeout:SubmissionState::UnknownOutcome);
     return done();
   }
   output.timing.write_ms=elapsed(phase);phase=std::chrono::steady_clock::now();
   transition(output,SubmissionState::SubmitSent);
+  if(submission_ledger_) {
+    const auto started=std::chrono::steady_clock::now();
+    if(!submission_ledger_->observe(ledger_id,SubmissionLedger::State::Sent))throw std::runtime_error("durable sent block receipt failed");
+    output.timing.journal_sent_ms=elapsed(started);
+  }
+  phase=std::chrono::steady_clock::now();
   protowire::KaspadResponse response;
   if(!active->wire->Read(&response)||response.id()!=request.id()||!response.has_submitblockresponse()) {
     output.timing.response_ms=elapsed(phase);phase=std::chrono::steady_clock::now();
     discard_stream();output.timing.finish_ms=elapsed(phase);
+    if(submission_ledger_&&!submission_ledger_->observe(ledger_id,SubmissionLedger::State::Unknown))throw std::runtime_error("durable unknown block response failed");
     transition(output,timed_out.load()?SubmissionState::UnknownAfterTimeout:SubmissionState::UnknownOutcome);
     return done();
   }
@@ -304,9 +328,18 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
   output.timing.finish_ms=0;
   const auto &result = response.submitblockresponse();
   output.reason = result.rejectreason();
-  if (result.has_error()) output.node_error = result.error().message();
+  if (result.has_error()) output.node_error = result.error().message().empty()?"node returned an empty RPC error":result.error().message();
+  if(submission_ledger_) {
+    const auto started=std::chrono::steady_clock::now();
+    const auto bytes=response.SerializeAsString();
+    const auto receipt=consensus::blake3_hash(std::span(reinterpret_cast<const std::uint8_t*>(bytes.data()),bytes.size()));
+    const auto state=output.reason==protowire::SubmitBlockResponseMessage::NONE && !result.has_error()?
+        SubmissionLedger::State::Acknowledged:SubmissionLedger::State::Rejected;
+    if(!submission_ledger_->observe(ledger_id,state,receipt))throw std::runtime_error("durable block receipt transition failed");
+    output.timing.journal_receipt_ms=elapsed(started);
+  }
   transition(output, output.reason == protowire::SubmitBlockResponseMessage::NONE &&
-                         output.node_error.empty()
+                         !result.has_error()
                      ? SubmissionState::RpcAcknowledged
                      : SubmissionState::RpcRejected);
   return done();
@@ -314,7 +347,8 @@ SubmitBlockResult SubmitBlockClient::submit(const protowire::RpcBlock &block,
 
 SubmitBlockResult SubmitBlockClient::observe_chain(
     SubmitBlockResult result, std::chrono::seconds timeout,
-    std::chrono::milliseconds poll_interval, std::uint64_t confirmation_depth) {
+    std::chrono::milliseconds poll_interval, std::uint64_t confirmation_depth,
+    const std::function<bool()> &cancelled) {
   if ((result.state != SubmissionState::RpcAcknowledged &&
        result.state != SubmissionState::ChainObserved &&
        result.state != SubmissionState::ChainConfirmed &&
@@ -325,21 +359,30 @@ SubmitBlockResult SubmitBlockClient::observe_chain(
     throw std::invalid_argument("chain observation timeout and interval must be positive");
 
   const auto deadline = std::chrono::steady_clock::now() + timeout;
-  bool ever_observed = false;
   bool previously_selected = false;
   auto observation_channel = make_channel(endpoint_);
-  while (std::chrono::steady_clock::now() < deadline) {
+  while (std::chrono::steady_clock::now() < deadline && !(cancelled && cancelled())) {
     try {
       const auto observation = observe_once(endpoint_, result.block_hash,
-          std::chrono::system_clock::now() + std::chrono::seconds(3),
+          std::chrono::system_clock::now() + std::min(std::chrono::steady_clock::duration(std::chrono::seconds(3)),
+              deadline-std::chrono::steady_clock::now()),
           observation_channel);
       if (observation.found) {
-        ever_observed = true;
         result.block_blue_score = observation.blue_score;
         result.selected_tip_blue_score = observation.selected_tip_blue_score;
         result.currently_selected_chain = observation.selected_chain;
         if (previously_selected && !observation.selected_chain) result.reorg_observed = true;
         previously_selected = observation.selected_chain;
+        if(submission_ledger_) {
+          consensus::Hash id{};
+          if(result.block_hash.size()!=64)throw std::runtime_error("invalid durable block hash");
+          for(std::size_t i=0;i<32;++i){auto n=[](char c){return c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:-1;};const int a=n(result.block_hash[2*i]),b=n(result.block_hash[2*i+1]);if(a<0||b<0)throw std::runtime_error("invalid durable block hash");id[i]=static_cast<std::uint8_t>(16*a+b);}
+          if(submission_ledger_->lookup(id)) {
+            const std::string data=result.block_hash+":"+std::to_string(observation.blue_score)+":"+std::to_string(observation.selected_tip_blue_score)+":"+(observation.selected_chain?"selected":"dag");
+            const auto receipt=consensus::blake3_hash(std::span(reinterpret_cast<const std::uint8_t*>(data.data()),data.size()));
+            if(!submission_ledger_->observe(id,SubmissionLedger::State::ChainObserved,receipt))throw std::runtime_error("durable chain observation transition failed");
+          }
+        }
         transition(result, SubmissionState::ChainObserved);
         const auto depth = observation.selected_tip_blue_score >= observation.blue_score
             ? observation.selected_tip_blue_score - observation.blue_score : 0;
@@ -352,9 +395,13 @@ SubmitBlockResult SubmitBlockClient::observe_chain(
       // Retain the last verified state and retry until the bounded observer
       // deadline. No resubmission is attempted here.
     }
-    std::this_thread::sleep_for(poll_interval);
+    const auto wake = std::min(deadline, std::chrono::steady_clock::now() + poll_interval);
+    while (std::chrono::steady_clock::now() < wake && !(cancelled && cancelled()))
+      std::this_thread::sleep_for(std::min(std::chrono::milliseconds(25),
+          std::chrono::duration_cast<std::chrono::milliseconds>(wake-std::chrono::steady_clock::now())));
   }
-  if (!ever_observed) result.state = SubmissionState::RpcAcknowledged;
+  // Absence of a chain observation supplies no transport acknowledgement.
+  // Preserve UNKNOWN (or the last actually observed state) at the deadline.
   return result;
 }
 

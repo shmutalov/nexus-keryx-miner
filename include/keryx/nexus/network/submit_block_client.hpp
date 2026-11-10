@@ -1,5 +1,6 @@
 #pragma once
 #include <functional>
+#include <filesystem>
 
 #include "keryx/nexus/network/submission_gate.hpp"
 #include "rpc.pb.h"
@@ -15,6 +16,7 @@
 namespace grpc { class Channel; }
 
 namespace keryx::nexus::network {
+class SubmissionLedger;
 
 enum class SubmissionState {
   CandidateValid,
@@ -33,6 +35,7 @@ struct SubmitBlockResult {
   struct Timing {
     std::optional<double> assembly_ms, validation_ms, connect_ms, stream_ms, prepare_ms,
                           write_ms, response_ms, finish_ms, total_ms;
+    std::optional<double> journal_intent_ms, journal_sent_ms, journal_receipt_ms;
     bool channel_reused{};
     bool stream_reused{};
   } timing;
@@ -52,7 +55,7 @@ struct SubmitBlockResult {
 // Live submission is opt-in per call and remains unused by the M2.8 shadow path.
 class SubmitBlockClient final {
 public:
-  explicit SubmitBlockClient(std::string endpoint);
+  explicit SubmitBlockClient(std::string endpoint, std::filesystem::path submission_journal = {});
   ~SubmitBlockClient();
   SubmitBlockResult submit(const protowire::RpcBlock &block,
                            const VerifiedSubmission &verified,
@@ -67,7 +70,8 @@ public:
   SubmitBlockResult observe_chain(SubmitBlockResult result,
                                   std::chrono::seconds timeout = std::chrono::seconds(30),
                                   std::chrono::milliseconds poll_interval = std::chrono::seconds(1),
-                                  std::uint64_t confirmation_blue_score_depth = 6);
+                                  std::uint64_t confirmation_blue_score_depth = 6,
+                                  const std::function<bool()> &cancelled = {});
 private:
   struct PersistentStream;
   std::unique_ptr<PersistentStream> stream_;
@@ -75,6 +79,7 @@ private:
   std::uint64_t next_request_id_{1};
   std::string endpoint_;
   SubmissionGate gate_;
+  std::unique_ptr<SubmissionLedger> submission_ledger_;
   // Only submit() accesses this channel; observers retain independent streams.
   std::shared_ptr<grpc::Channel> submit_channel_;
   std::mutex submit_channel_mutex_;

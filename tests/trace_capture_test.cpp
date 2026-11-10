@@ -14,6 +14,13 @@ int generate(void *, const char *, const std::int32_t *, int, int, const char *,
   *prompt = mode == 5 ? -1 : 1; *fed = mode == 6 ? 500 : 2;
   return mode == 3 ? -2 : mode == 4 ? 65536 : 2;
 }
+std::string seen_prompt,seen_rest;
+int generate_n(void *m,const char *p,std::size_t pn,const std::int32_t *ids,int count,int head,
+    const char *r,std::size_t rn,int max,char *out,int cap,std::int32_t *tokens,int tc,int *prompt,int *fed,int min,int bytes) {
+  seen_prompt.assign(p,pn);seen_rest.assign(r,rn);
+  const auto n=generate(m,p,ids,count,head,r,max,out,cap,tokens,tc,prompt,fed,min,bytes);
+  if(n==2){std::memcpy(out,"N\0Z",3);return 3;}return n;
+}
 int read(void *, std::uint8_t *, std::size_t, std::uint32_t *ubatch, std::size_t, std::uint32_t *pos) {
   ++calls; ubatch[0] = 1; ubatch[1] = mode == 9 ? 0 : 1; *pos = mode == 7 ? 1 : 2;
   return mode == 10 ? -6 : 0;
@@ -63,7 +70,20 @@ int main() {
     mode = 0; capture.configure(manifest, 128);
     std::array<std::int32_t,1> negative{-1}; TracePrefix prefix{negative, 1, "rest"};
     rejects([&] { capture.generate("hello", &prefix, 1, 0, 0); });
+    mode=0;
+    auto sized_api=api;sized_api.generate=nullptr;sized_api.generate_n=generate_n;
+    detail::TraceCapture sized(sized_api,&mode,8192);
+    check(sized.length_aware());sized.configure(manifest,128);
+    const std::string nul_prompt("ab\0cd\0",6),nul_rest("x\0y\0z",5);
+    auto exact=sized.generate(nul_prompt,nullptr,1,0,0);
+    check(seen_prompt==nul_prompt&&seen_rest.empty()&&exact.text==std::string("N\0Z",3));
+    std::array<std::int32_t,1> valid{1};TracePrefix exact_prefix{valid,1,nul_rest};
+    exact=sized.generate(nul_prompt,&exact_prefix,1,0,0);
+    check(seen_prompt==nul_prompt&&seen_rest==nul_rest);
+    const auto no_calls=calls;
+    rejects([&]{capture.generate("head",&exact_prefix,1,0,0);});
+    check(calls==no_calls);
     std::cout << "ABI6_TRACE_ADAPTER_CPU=PASS negative_cases=" << checks
-              << " capture_replay=MOCK gpu=NOT_USED\n";
+              << " capture_replay=MOCK nul_bytes=EXACT legacy_nul=REFUSED gpu=NOT_USED\n";
   } catch (const std::exception &e) { std::cerr << e.what() << '\n'; return 1; }
 }

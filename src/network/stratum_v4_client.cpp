@@ -1,10 +1,12 @@
 #include "keryx/nexus/stratum_v4_client.hpp"
+#include "keryx/nexus/submission_ledger.hpp"
 
 #include "keryx/nexus/grpc_header.hpp"
 #include "keryx/nexus/opoi.hpp"
 #include "keryx/nexus/protocol_rules.hpp"
 
 #include <cctype>
+#include <charconv>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -45,6 +47,8 @@ using ssize_t = SSIZE_T;
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <signal.h>
 using socket_t = int;
 using pollfd_t = pollfd;
 #endif
@@ -53,7 +57,31 @@ namespace keryx::nexus::stratum {
 
 namespace {
 
-constexpr std::size_t kMaxStratumLineBytes = 256 * 1024;
+// OpenSSL uses write(), which can raise SIGPIPE on a peer disconnect.
+// Mask only this calling thread and consume only a newly generated signal.
+class TlsSignalGuard {
+#ifndef _WIN32
+  sigset_t mask_{}, previous_{};
+  bool pending_{false};
+#endif
+public:
+  TlsSignalGuard() {
+#ifndef _WIN32
+    sigemptyset(&mask_); sigaddset(&mask_, SIGPIPE);
+    if (pthread_sigmask(SIG_BLOCK, &mask_, &previous_) != 0)
+      throw std::runtime_error("cannot mask TLS SIGPIPE");
+    sigset_t pending{}; sigpending(&pending); pending_=sigismember(&pending,SIGPIPE)==1;
+#endif
+  }
+  ~TlsSignalGuard() {
+#ifndef _WIN32
+    if (!pending_) {timespec zero{}; (void)sigtimedwait(&mask_,nullptr,&zero);}
+    (void)pthread_sigmask(SIG_SETMASK,&previous_,nullptr);
+#endif
+  }
+};
+
+constexpr std::size_t kMaxStratumLineBytes = 2 * 1024 * 1024;
 constexpr std::size_t kMaxWindowSeedCache = 16;
 constexpr std::size_t kMaxSeenJobs = 128;
 
@@ -219,32 +247,76 @@ std::optional<std::uint64_t>
 value_to_u64(const google::protobuf::Value &v) noexcept {
   if (v.kind_case() == google::protobuf::Value::kNumberValue) {
     const double d = v.number_value();
-    if (!std::isfinite(d) || d < 0.0 ||
-        d > static_cast<double>(std::numeric_limits<std::uint64_t>::max())) {
-      return std::nullopt;
-    }
+    // Protobuf stores JSON numbers as double. Beyond the exact integer range
+    // the original wire value cannot be recovered; require a decimal string.
+    if (!std::isfinite(d) || d < 0.0 || d > 9007199254740991.0 ||
+        std::floor(d) != d) return std::nullopt;
     const auto u = static_cast<std::uint64_t>(d);
-    if (static_cast<double>(u) != std::floor(d)) {
-      return std::nullopt;
-    }
     return u;
   }
   if (v.kind_case() == google::protobuf::Value::kStringValue) {
     const auto &s = v.string_value();
     if (s.empty())
       return std::nullopt;
-    char *end = nullptr;
-    errno = 0;
-    const unsigned long long parsed = std::strtoull(s.c_str(), &end, 10);
-    if (errno == 0 && end == s.c_str() + s.size()) {
-      return static_cast<std::uint64_t>(parsed);
-    }
+    if (s.find_first_not_of("0123456789") != std::string::npos)
+      return std::nullopt;
+    std::uint64_t parsed{};
+    const auto [end, error] = std::from_chars(s.data(), s.data() + s.size(), parsed);
+    if (error == std::errc{} && end == s.data() + s.size()) return parsed;
   }
   return std::nullopt;
 }
 
-bool upload_stratum_trace_record(std::string_view base_url, std::string_view task_id, std::span<const std::uint8_t> blob) {
-  if (base_url.empty() || task_id.empty() || blob.empty()) return false;
+bool public_trace_address(const sockaddr *address) {
+  if (address->sa_family == AF_INET) {
+    const auto ip=ntohl(reinterpret_cast<const sockaddr_in*>(address)->sin_addr.s_addr);
+    const auto first=ip>>24, second=(ip>>16)&255;
+    return first!=0 && first!=10 && first!=127 && first<224 &&
+      !(first==100 && second>=64 && second<=127) &&
+      !(first==169 && second==254) && !(first==172 && second>=16 && second<=31) &&
+      !(first==192 && (second==168 || (second==0 && (((ip>>8)&255)==0 || ((ip>>8)&255)==2)) ||
+                      (second==88 && ((ip>>8)&255)==99))) &&
+      !(first==198 && (second==18 || second==19 || (second==51 && ((ip>>8)&255)==100))) &&
+      !(first==203 && second==0 && ((ip>>8)&255)==113);
+  }
+  if (address->sa_family == AF_INET6) {
+    const auto *b=reinterpret_cast<const sockaddr_in6*>(address)->sin6_addr.s6_addr;
+    // Admit global unicast only. Exclude documentation and transition tunnels.
+    return (b[0]&0xe0)==0x20 &&
+      !(b[0]==0x20 && b[1]==0x01 && ((b[2]==0x0d && b[3]==0xb8) || b[2]==0)) &&
+      !(b[0]==0x20 && b[1]==0x02);
+  }
+  return false;
+}
+
+curl_socket_t open_trace_socket(void*, curlsocktype purpose, curl_sockaddr *address) {
+  // Validate the actual connection address, after DNS resolution. This also
+  // rejects private addresses returned by DNS rebinding and IPv4-mapped IPv6.
+  if (purpose!=CURLSOCKTYPE_IPCXN || !public_trace_address(&address->addr))
+    return CURL_SOCKET_BAD;
+  return ::socket(address->family,address->socktype,address->protocol);
+}
+
+std::string trace_url_host(std::string_view url) {
+  CURLU *parsed=curl_url(); if(!parsed) return {};
+  std::string result;
+  if(curl_url_set(parsed,CURLUPART_URL,std::string(url).c_str(),0)==CURLUE_OK) {
+    char *scheme=nullptr,*host=nullptr,*user=nullptr,*password=nullptr,*fragment=nullptr;
+    const bool valid=curl_url_get(parsed,CURLUPART_SCHEME,&scheme,0)==CURLUE_OK &&
+      std::string_view(scheme)=="https" && curl_url_get(parsed,CURLUPART_HOST,&host,0)==CURLUE_OK;
+    const bool credentials=curl_url_get(parsed,CURLUPART_USER,&user,0)==CURLUE_OK ||
+      curl_url_get(parsed,CURLUPART_PASSWORD,&password,0)==CURLUE_OK;
+    const bool has_fragment=curl_url_get(parsed,CURLUPART_FRAGMENT,&fragment,0)==CURLUE_OK;
+    if(valid && !credentials && !has_fragment) result=host;
+    curl_free(scheme);curl_free(host);curl_free(user);curl_free(password);curl_free(fragment);
+  }
+  curl_url_cleanup(parsed); return result;
+}
+
+bool upload_stratum_trace_record(std::string_view base_url, std::string_view task_id, std::span<const std::uint8_t> blob, const std::atomic<bool> &stop) {
+  if (trace_url_host(base_url).empty() || task_id.size()!=64 ||
+      task_id.find_first_not_of("0123456789abcdefABCDEF")!=std::string_view::npos ||
+      blob.empty() || blob.size()>64ULL*1024*1024) return false;
   std::string target(base_url);
   while (!target.empty() && target.back() == '/') target.pop_back();
   std::string hex_id(task_id);
@@ -262,8 +334,21 @@ bool upload_stratum_trace_record(std::string_view base_url, std::string_view tas
   curl_easy_setopt(curl, CURLOPT_POSTFIELDS, reinterpret_cast<const char*>(blob.data()));
   curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(blob.size()));
   curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 15000L);
-  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 300000L);
+  curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+  curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 15000L);
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
+  curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "https");
+  curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);
+  curl_easy_setopt(curl, CURLOPT_PROXY, "");
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(curl, CURLOPT_OPENSOCKETFUNCTION, open_trace_socket);
+  curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &stop);
+  curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, +[](void *p,curl_off_t,curl_off_t,curl_off_t,curl_off_t) -> int {
+    return static_cast<const std::atomic<bool>*>(p)->load(std::memory_order_acquire)?1:0;
+  });
+  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char*,std::size_t size,std::size_t count,void*) -> std::size_t {return size*count;});
   curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 
   const auto rc = curl_easy_perform(curl);
@@ -286,6 +371,17 @@ bool upload_stratum_trace_record(std::string_view base_url, std::string_view tas
 }
 
 } // namespace
+
+bool is_public_trace_ip(std::string_view address) {
+  sockaddr_in v4{};v4.sin_family=AF_INET;
+  const std::string text(address);
+  if(::inet_pton(AF_INET,text.c_str(),&v4.sin_addr)==1)
+    return public_trace_address(reinterpret_cast<const sockaddr*>(&v4));
+  sockaddr_in6 v6{};v6.sin6_family=AF_INET6;
+  if(::inet_pton(AF_INET6,text.c_str(),&v6.sin6_addr)==1)
+    return public_trace_address(reinterpret_cast<const sockaddr*>(&v6));
+  return false;
+}
 
 std::string_view to_string(ConnectionState state) noexcept {
   switch (state) {
@@ -492,6 +588,7 @@ struct StratumV4Client::SocketHandle {
 #else
   socket_t fd{-1};
 #endif
+  std::mutex io_mutex;
   SSL_CTX *ssl_ctx{nullptr};
   SSL *ssl{nullptr};
   std::string rx_buffer;
@@ -500,7 +597,6 @@ struct StratumV4Client::SocketHandle {
 
   void close() noexcept {
     if (ssl) {
-      SSL_shutdown(ssl);
       SSL_free(ssl);
       ssl = nullptr;
     }
@@ -516,11 +612,16 @@ struct StratumV4Client::SocketHandle {
 StratumV4Client::StratumV4Client(StratumClientConfig config)
     : config_(std::move(config)),
       endpoint_(parse_stratum_endpoint(config_.pool_url)),
-      socket_(std::make_unique<SocketHandle>()),
+      socket_(std::make_shared<SocketHandle>()),
       current_share_target_(difficulty_to_target(1.0)) {
 #ifdef _WIN32
   ensure_winsock_initialized();
 #endif
+  if(!config_.submission_journal.empty())submission_ledger_=std::make_unique<network::SubmissionLedger>(config_.submission_journal);
+  config_.pool_telemetry.interval_seconds=std::clamp(config_.pool_telemetry.interval_seconds,30U,3600U);
+  need(!config_.pool_telemetry.trace_ready, "Pool trace dispatcher has not been qualified");
+  hello_json_=pool_hello_json(config_.pool_telemetry);
+  pool_telemetry_state_=config_.pool_telemetry.enabled?"WAIT_AUTH":"DISABLED";
   endpoints_.push_back(endpoint_);
   for (const auto &backup_url : config_.backup_urls) {
     if (!backup_url.empty() && backup_url != config_.pool_url) {
@@ -579,18 +680,35 @@ void StratumV4Client::stop() {
   stop_requested_.store(true, std::memory_order_release);
   {
     std::lock_guard lock(mutex_);
-    close_socket_locked();
+    // Interrupt I/O without freeing SSL or reusing the descriptor while the
+    // reader holds it. The I/O thread exits before the final owner is released.
+    if (socket_ && is_socket_valid(socket_->fd)) {
+#ifdef _WIN32
+      ::shutdown(socket_->fd, SD_BOTH);
+#else
+      ::shutdown(socket_->fd, SHUT_RDWR);
+#endif
+    }
     cv_.notify_all();
   }
   if (io_thread_.joinable()) {
     io_thread_.join();
   }
+  {
+    std::lock_guard lock(mutex_);
+    close_socket_locked();
+  }
+  // An upload observes stop_requested_ through cURL's progress callback.
+  // Join its bounded synchronous attempt before destroying callback state.
+  std::lock_guard upload_lock(trace_upload_mutex_);
   running_.store(false, std::memory_order_release);
 }
 
 void StratumV4Client::close_socket_locked() {
+  pool_ai_queue_.clear();pool_ai_pending_.clear();
+  subscribed_=false;authorized_=false;
   if (socket_) {
-    socket_->close();
+    socket_ = std::make_shared<SocketHandle>();
   }
 }
 
@@ -603,6 +721,7 @@ void StratumV4Client::record_error_locked(std::string message) {
 }
 
 bool StratumV4Client::send_line_locked(const std::string &line) {
+  TlsSignalGuard signals;
   std::string framed = line;
   if (framed.empty() || framed.back() != '\n') {
     framed.push_back('\n');
@@ -614,12 +733,24 @@ bool StratumV4Client::send_line_locked(const std::string &line) {
   if (!socket_ || !is_socket_valid(socket_->fd)) {
     return false;
   }
+  std::lock_guard io_lock(socket_->io_mutex);
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.io_timeout_ms);
   const char *ptr = framed.data();
   std::size_t remaining = framed.size();
   while (remaining > 0) {
     ssize_t written = 0;
     if (socket_->ssl) {
       written = SSL_write(socket_->ssl, ptr, static_cast<int>(remaining));
+      if (written <= 0) {
+        const int error = SSL_get_error(socket_->ssl, static_cast<int>(written));
+        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE) {
+          if (stop_requested_.load(std::memory_order_acquire) || std::chrono::steady_clock::now() >= deadline) return false;
+          pollfd_t waiting{}; waiting.fd=socket_->fd;
+          waiting.events=error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
+          if (socket_poll(&waiting, 1, 100) < 0) return false;
+          continue;
+        }
+      }
     } else {
 #ifdef _WIN32
       written = ::send(socket_->fd, ptr, static_cast<int>(remaining), 0);
@@ -636,7 +767,147 @@ bool StratumV4Client::send_line_locked(const std::string &line) {
   return true;
 }
 
+StratumV4Client::MetadataWrite StratumV4Client::send_metadata_locked(const std::string &line) {
+  TlsSignalGuard signals;
+  if(line.size()>8192)return MetadataWrite::Skipped;
+  if(loopback_test_mode_){outbound_wire_log_.push_back(line);return MetadataWrite::Sent;}
+  auto connection=socket_;
+  if(!connection||!is_socket_valid(connection->fd))return MetadataWrite::Skipped;
+  std::unique_lock io_lock(connection->io_mutex,std::try_to_lock);
+  if(!io_lock.owns_lock())return MetadataWrite::Skipped;
+  pollfd_t ready{};ready.fd=connection->fd;ready.events=POLLOUT;
+  if(socket_poll(&ready,1,0)<=0)return MetadataWrite::Skipped;
+#ifdef _WIN32
+  const bool temporary_nonblocking=connection->ssl==nullptr;
+  if(temporary_nonblocking&&!set_socket_nonblocking(connection->fd,true))return MetadataWrite::Skipped;
+  struct RestoreSocket {socket_t fd;bool restore;~RestoreSocket(){if(restore)(void)set_socket_nonblocking(fd,false);}} restore{connection->fd,temporary_nonblocking};
+#endif
+  const auto frame=line+'\n';std::size_t at=0;bool tls_started=false;
+  const auto until=std::chrono::steady_clock::now()+std::chrono::milliseconds(50);
+  while(at<frame.size()&&!stop_requested_.load(std::memory_order_acquire)) {
+    if(std::chrono::steady_clock::now()>=until)break;
+    ssize_t n=0;short wait_for=POLLOUT;
+    if(connection->ssl) {
+      tls_started=true;
+      n=SSL_write(connection->ssl,frame.data()+at,static_cast<int>(frame.size()-at));
+      if(n<=0){const auto e=SSL_get_error(connection->ssl,static_cast<int>(n));
+        if(e!=SSL_ERROR_WANT_READ&&e!=SSL_ERROR_WANT_WRITE)return MetadataWrite::Broken;
+        wait_for=e==SSL_ERROR_WANT_READ?POLLIN:POLLOUT;
+      }
+    } else {
+#ifdef _WIN32
+      n=::send(connection->fd,frame.data()+at,static_cast<int>(frame.size()-at),0);
+      if(n<0&&WSAGetLastError()!=WSAEWOULDBLOCK&&WSAGetLastError()!=WSAEINTR)return MetadataWrite::Broken;
+#else
+      n=::send(connection->fd,frame.data()+at,frame.size()-at,MSG_DONTWAIT|MSG_NOSIGNAL);
+      if(n<0&&errno!=EAGAIN&&errno!=EWOULDBLOCK&&errno!=EINTR)return MetadataWrite::Broken;
+#endif
+      if(n==0)return MetadataWrite::Broken;
+    }
+    if(n>0){at+=static_cast<std::size_t>(n);continue;}
+    ready.events=wait_for;
+    if(socket_poll(&ready,1,5)<0)return MetadataWrite::Broken;
+  }
+  if(at==frame.size())return MetadataWrite::Sent;
+  // A partial frame or pending SSL_write cannot be interleaved with a proof.
+  return at||tls_started?MetadataWrite::Broken:MetadataWrite::Skipped;
+}
+
+void StratumV4Client::update_pool_work(std::uint64_t completed,std::chrono::steady_clock::time_point now) {
+  std::unique_lock lock(mutex_,std::try_to_lock);
+  if(!lock.owns_lock())return;
+  if(pool_work_&&(now<=pool_work_->at||completed<pool_work_->completed)) {
+    pool_work_.reset();pool_rate_base_.reset();return;
+  }
+  pool_work_=WorkSample{completed,now};
+  if(!pool_rate_base_)pool_rate_base_=pool_work_;
+}
+
+void StratumV4Client::poll_pool_extensions(std::chrono::steady_clock::time_point now) {
+  std::unique_lock lock(mutex_,std::try_to_lock);
+  if(!lock.owns_lock()||!subscribed_||!authorized_)return;
+  if(std::any_of(pending_shares_.begin(),pending_shares_.end(),[&](const auto &p){
+      return now>=p.second.sent_at&&now-p.second.sent_at<std::chrono::milliseconds(100);}))return;
+  if(now>=next_declare_) {
+    std::string models;
+    if(config_.pool_telemetry.trace_ready&&!config_.declared_model_id_hex.empty())
+      models='"'+json_escape(config_.declared_model_id_hex)+'"';
+    const auto written=send_metadata_locked("{\"method\":\"mining.declare_capabilities\",\"params\":["+models+"]}");
+    if(written==MetadataWrite::Broken){close_socket_locked();state_=ConnectionState::Reconnecting;return;}
+    next_declare_=now+std::chrono::seconds(written==MetadataWrite::Sent?90:1);
+  }
+  if(!metadata_session_enabled_)return;
+  for(auto i=metadata_pending_.begin();i!=metadata_pending_.end();) {
+    if(now-i->second>std::chrono::seconds(30))i=metadata_pending_.erase(i);else ++i;
+  }
+  if(now<next_metadata_||metadata_pending_.size()>=64)return;
+  std::string payload;std::string_view method;
+  if(!hello_sent_){payload=hello_json_;method="mining.hello";}
+  else {
+    std::optional<std::uint64_t> rate;
+    if(pool_work_&&pool_rate_base_&&pool_work_->at<=now&&now-pool_work_->at<=std::chrono::seconds(5)&&
+       pool_work_->at>pool_rate_base_->at&&pool_work_->completed>=pool_rate_base_->completed) {
+      const auto seconds=std::chrono::duration<long double>(pool_work_->at-pool_rate_base_->at).count();
+      const auto value=static_cast<long double>(pool_work_->completed-pool_rate_base_->completed)/seconds;
+      const auto rounded=std::floor(value+0.5L);
+      if(rounded>=0&&rounded<static_cast<long double>(std::numeric_limits<std::uint64_t>::max()))
+        rate=static_cast<std::uint64_t>(rounded);
+    }
+    const auto uptime=now>metadata_started_?std::chrono::duration_cast<std::chrono::seconds>(now-metadata_started_).count():0;
+    payload=pool_metrics_json(config_.pool_telemetry,uptime,rate,accepted_shares_,
+        rejected_shares_,stale_shares_,ai_inference_busy_.load(std::memory_order_acquire));
+    method="mining.telemetry";
+  }
+  const auto id=next_rpc_id_++;
+  const auto written=send_metadata_locked("{\"id\":"+std::to_string(id)+",\"method\":\""+
+      std::string(method)+"\",\"params\":["+payload+"]}");
+  if(written==MetadataWrite::Broken){pool_telemetry_state_="CONNECTION_LOST";close_socket_locked();state_=ConnectionState::Reconnecting;return;}
+  if(written==MetadataWrite::Skipped){next_metadata_=now+std::chrono::seconds(1);return;}
+  metadata_pending_.emplace(id,now);++pool_metadata_sent_;
+  const bool was_hello=!hello_sent_;hello_sent_=true;
+  pool_telemetry_state_=was_hello?"HELLO_SENT":(metadata_session_acked_?"ACTIVE":"ACK_UNKNOWN");
+  next_metadata_=now+std::chrono::seconds(config_.pool_telemetry.interval_seconds);
+  pool_rate_base_=pool_work_;
+  std::cout<<"{\"event\":\"POOL_METADATA_SENT\",\"method\":\""<<method<<"\",\"rpc_id\":"<<id
+           <<",\"trace\":"<<(config_.pool_telemetry.trace_ready?1:0)<<"}\n"<<std::flush;
+}
+
+void StratumV4Client::qualify_pool_ai() {
+  std::lock_guard lock(mutex_);
+  need(!config_.declared_model_id_hex.empty()&&config_.declared_model_id_hex==config_.pool_telemetry.model_id,"Pool AI loaded/declaration model mismatch");
+  config_.pool_telemetry.trace_ready=true;hello_json_=pool_hello_json(config_.pool_telemetry);
+  hello_sent_=false;next_metadata_={};next_declare_={};
+}
+std::optional<PoolAiMessage> StratumV4Client::take_pool_ai() {
+  std::lock_guard lock(mutex_);
+  if(!authorized_||!subscribed_)return {};
+  while(!pool_ai_queue_.empty()){
+    auto message=std::move(pool_ai_queue_.front());pool_ai_queue_.pop_front();
+    if(message.scope==endpoint_.raw_url&&std::chrono::steady_clock::now()-message.received_at<std::chrono::seconds(120))return message;
+  }
+  return {};
+}
+bool StratumV4Client::submit_pool_ai_result(std::string_view scope,std::string_view result) {
+  google::protobuf::Struct object;
+  need(result.size()<=2U<<20&&google::protobuf::util::JsonStringToMessage(std::string(result),&object).ok(),"Pool AI result frame invalid");
+  const auto &fields=object.fields();auto m=fields.find("method");
+  need(m!=fields.end()&&(m->second.string_value()=="mining.ai_response"||m->second.string_value()=="mining.ai_opening_result"),"Pool AI result method invalid");
+  std::lock_guard lock(mutex_);
+  if(scope!=endpoint_.raw_url||!authorized_||!subscribed_)return false;
+  const auto now=std::chrono::steady_clock::now();
+  for(auto it=pool_ai_pending_.begin();it!=pool_ai_pending_.end();)if(now-it->second>std::chrono::minutes(10))it=pool_ai_pending_.erase(it);else ++it;
+  if(pool_ai_pending_.size()>=64)return false;
+  need(!fields.contains("id"),"Pool AI result must not supply its own correlation ID");
+  auto id=next_rpc_id_++;
+  std::string wire;need(google::protobuf::util::MessageToJsonString(object,&wire).ok()&&!wire.empty()&&wire.front()=='{',"Pool AI result encoding failed");
+  wire="{\"id\":"+std::to_string(id)+","+wire.substr(1);
+  pool_ai_pending_.emplace(id,now);
+  if(!send_line_locked(wire)){pool_ai_pending_.erase(id);return false;}
+  return true;
+}
+
 bool StratumV4Client::connect_and_handshake_once() {
+  TlsSignalGuard signals;
   std::unique_lock lock(mutex_);
   if (loopback_test_mode_) {
     state_ = ConnectionState::Connecting;
@@ -763,11 +1034,24 @@ bool StratumV4Client::connect_and_handshake_once() {
       SSL_CTX_set_verify(ssl_ctx,
                          verify_peer ? SSL_VERIFY_PEER : SSL_VERIFY_NONE,
                          nullptr);
-      if (verify_peer) {
-        SSL_CTX_set_default_verify_paths(ssl_ctx);
-      }
+      bool tls_ready = !verify_peer || SSL_CTX_set_default_verify_paths(ssl_ctx) == 1;
       ssl = SSL_new(ssl_ctx);
-      SSL_set_tlsext_host_name(ssl, host.c_str());
+      tls_ready = tls_ready && ssl;
+      std::array<unsigned char, 16> ip{};
+      const bool ip_literal = ::inet_pton(AF_INET, host.c_str(), ip.data()) == 1 ||
+                              ::inet_pton(AF_INET6, host.c_str(), ip.data()) == 1;
+      if (ssl) {
+        if (!ip_literal) tls_ready = tls_ready && SSL_set_tlsext_host_name(ssl, host.c_str()) == 1;
+        if (verify_peer) tls_ready = tls_ready && (ip_literal
+            ? X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host.c_str()) == 1
+            : SSL_set1_host(ssl, host.c_str()) == 1);
+      }
+      if (!tls_ready) {
+        if (ssl) SSL_free(ssl);
+        SSL_CTX_free(ssl_ctx); close_socket_fd(connected_fd);
+        lock.lock(); state_ = ConnectionState::Error;
+        record_error_locked("TLS trust/hostname configuration failed"); return false;
+      }
 #ifdef _WIN32
       SSL_set_fd(ssl, static_cast<int>(connected_fd));
 #else
@@ -784,6 +1068,12 @@ bool StratumV4Client::connect_and_handshake_once() {
       }
     }
 
+    // Poll before reads and keep SSL operations nonblocking and serialized.
+    if (use_tls && !set_socket_nonblocking(connected_fd, true)) {
+      SSL_free(ssl); SSL_CTX_free(ssl_ctx); close_socket_fd(connected_fd);
+      lock.lock(); state_ = ConnectionState::Error;
+      record_error_locked("TLS nonblocking setup failed"); return false;
+    }
     lock.lock();
     if (stop_requested_.load(std::memory_order_acquire)) {
       if (ssl)
@@ -800,6 +1090,11 @@ bool StratumV4Client::connect_and_handshake_once() {
     state_ = ConnectionState::Connected;
   }
 
+  subscribed_=false;authorized_=false;hello_sent_=false;
+  metadata_session_enabled_=config_.pool_telemetry.enabled;metadata_session_acked_=false;
+  metadata_pending_.clear();next_metadata_={};next_declare_={};
+  pool_rate_base_=pool_work_;
+  pool_telemetry_state_=metadata_session_enabled_?"WAIT_AUTH":"DISABLED";
   active_job_.reset();
   pending_shares_.clear();
   submitted_nonces_by_job_.clear();
@@ -834,19 +1129,6 @@ bool StratumV4Client::connect_and_handshake_once() {
     return false;
   }
 
-  if (!config_.declared_model_id_hex.empty()) {
-    const std::uint64_t cap_id = next_rpc_id_++;
-    const std::string cap_msg =
-        "{\"id\":" + std::to_string(cap_id) +
-        ",\"method\":\"mining.declare_capabilities\",\"params\":[\"" +
-        json_escape(config_.declared_model_id_hex) + "\"]}";
-    if (!send_line_locked(cap_msg)) {
-      close_socket_locked();
-      state_ = ConnectionState::Reconnecting;
-      record_error_locked("Failed sending mining.declare_capabilities");
-      return false;
-    }
-  }
 
   std::cout << "{\"event\":\"STRATUM_CONNECTED\",\"endpoint\":\""
             << json_escape(endpoint_.raw_url) << "\",\"worker\":\""
@@ -857,6 +1139,7 @@ bool StratumV4Client::connect_and_handshake_once() {
 }
 
 bool StratumV4Client::read_line_once(std::string &out_line) {
+  TlsSignalGuard signals;
   {
     std::lock_guard lock(mutex_);
     if (!socket_ || !is_socket_valid(socket_->fd))
@@ -880,16 +1163,26 @@ bool StratumV4Client::read_line_once(std::string &out_line) {
 #else
       -1;
 #endif
-  SSL *ssl = nullptr;
+  std::shared_ptr<SocketHandle> connection;
   {
     std::lock_guard lock(mutex_);
-    if (!socket_ || !is_socket_valid(socket_->fd))
-      return false;
-    fd = socket_->fd;
-    ssl = socket_->ssl;
+    if (!socket_ || !is_socket_valid(socket_->fd)) return false;
+    connection = socket_;
+    fd = connection->fd;
+  }
+  std::unique_lock io_lock(connection->io_mutex,std::defer_lock);
+  SSL *ssl = connection->ssl;
+  bool pending=false;
+  if(ssl) {std::lock_guard lock(connection->io_mutex);pending=SSL_pending(ssl)>0;}
+  if (ssl && !pending) {
+    pollfd_t waiting{}; waiting.fd=fd; waiting.events=POLLIN;
+    const auto ready=socket_poll(&waiting, 1, 250);
+    if (ready == 0) {out_line.clear(); return true;}
+    if (ready < 0) return false;
   }
 
   if (ssl) {
+    io_lock.lock();
     n = SSL_read(ssl, chunk.data(), static_cast<int>(chunk.size()));
     if (n <= 0) {
       const int err = SSL_get_error(ssl, static_cast<int>(n));
@@ -943,9 +1236,9 @@ bool StratumV4Client::read_line_once(std::string &out_line) {
     }
   }
 
+  if(io_lock.owns_lock()) io_lock.unlock();
   std::lock_guard lock(mutex_);
-  if (!socket_ || !is_socket_valid(socket_->fd))
-    return false;
+  if (socket_ != connection || !is_socket_valid(socket_->fd)) return false;
   if (socket_->rx_buffer.size() + static_cast<std::size_t>(n) >
       kMaxStratumLineBytes) {
     record_error_locked("Oversized Stratum line received from pool");
@@ -999,6 +1292,7 @@ void StratumV4Client::io_loop() {
     backoff_ms = config_.reconnect_initial_ms;
 
     while (!stop_requested_.load(std::memory_order_acquire)) {
+      poll_pool_extensions();
       std::string line;
       if (!read_line_once(line)) {
         std::lock_guard lock(mutex_);
@@ -1092,20 +1386,11 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       current_difficulty_ = diff;
       current_share_target_ = target;
       last_error_.clear();
-      if (active_job_.has_value()) {
-        active_job_->difficulty = diff;
-        active_job_->share_target = target;
-        if (active_job_->has_bits &&
-            compare_target_u256(active_job_->network_target, target) > 0) {
-          active_job_->effective_target = active_job_->network_target;
-        } else {
-          active_job_->effective_target = target;
-        }
-        // Stratum difficulty retargeting updates the target threshold on the current job
-        // without invalidating the active job or resetting the nonce search cursor.
-      }
+      // The pinned stock client applies vardiff only when the next notify
+      // creates a job. Mutating the current job accepts too-weak candidates
+      // after an easier update, or invalidates valid work after a harder one.
       std::cout << "{\"event\":\"STRATUM_DIFFICULTY\",\"difficulty\":" << diff
-                << "}\n"
+                << ",\"scope\":\"NEXT_NOTIFY\"}\n"
                 << std::flush;
       return true;
     }
@@ -1320,46 +1605,30 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       return true;
     }
 
-    if (method == "mining.ai_request") {
+    if (method == "mining.ai_request" || method == "mining.ai_opening" ||
+        method == "mining.ai_draw") {
+      {
+        std::lock_guard lock(mutex_);
+        if(config_.pool_telemetry.trace_ready&&authorized_&&subscribed_&&
+            method!="mining.ai_draw"&&pool_ai_queue_.size()<8&&
+            (method=="mining.ai_opening"||!ai_inference_busy_.load(std::memory_order_acquire))) {
+          pool_ai_queue_.push_back({endpoint_.raw_url,std::string(line),std::chrono::steady_clock::now()});
+          return true;
+        }
+      }
+      // The SOLO dispatcher is not a qualified Stratum answer/opening route.
+      // Decline explicitly instead of silently accepting an unserved request.
       const auto id_it = fields.find("id");
-      std::optional<std::uint64_t> req_id;
-      if (id_it != fields.end() && id_it->second.kind_case() != google::protobuf::Value::kNullValue) {
-        req_id = value_to_u64(id_it->second);
-      }
-      std::string task_id;
-      std::string upload_url;
-      if (params.size() >= 1 && params[0].kind_case() == google::protobuf::Value::kStringValue) {
-        task_id = params[0].string_value();
-      }
-      if (params.size() >= 5 && params[4].kind_case() == google::protobuf::Value::kStructValue) {
-        const auto &ext = params[4].struct_value().fields();
-        const auto trace_it = ext.find("trace");
-        if (trace_it != ext.end() && trace_it->second.kind_case() == google::protobuf::Value::kStructValue) {
-          const auto &tr = trace_it->second.struct_value().fields();
-          const auto up_it = tr.find("upload");
-          if (up_it != tr.end() && up_it->second.kind_case() == google::protobuf::Value::kStringValue) {
-            upload_url = up_it->second.string_value();
-          }
-        }
-      }
-      if (ai_inference_busy_.load(std::memory_order_acquire)) {
-        if (req_id.has_value()) {
+      if (id_it != fields.end()) {
+        const auto request_id = value_to_u64(id_it->second);
+        if (request_id) {
           std::lock_guard lock(mutex_);
-          send_line_locked("{\"id\":" + std::to_string(*req_id) +
-                           ",\"result\":null,\"error\":[46,\"busy: all eligible GPUs are running inference\",null]}");
-          std::cout << "{\"event\":\"STRATUM_AI_REQUEST_BUSY\",\"id\":" << *req_id
-                    << ",\"action\":\"REPLIED_BUSY_46\"}\n"
-                    << std::flush;
+          send_line_locked("{\"id\":" + std::to_string(*request_id) +
+              ",\"result\":null,\"error\":[46,\"Nexus pool AI route not qualified\",null]}");
         }
-      } else {
-        if (!upload_url.empty() && !task_id.empty()) {
-          std::lock_guard lock(mutex_);
-          trace_upload_urls_[task_id] = upload_url;
-        }
-        std::cout << "{\"event\":\"STRATUM_AI_REQUEST_RECEIVED\",\"task_id\":\""
-                  << json_escape(task_id) << "\",\"has_upload\":"
-                  << (!upload_url.empty() ? "true" : "false") << "}\n" << std::flush;
       }
+      std::cout << "{\"event\":\"POOL_AI_NOT_READY\",\"trace\":0,"
+                   "\"response_accepted\":false}\n" << std::flush;
       return true;
     }
 
@@ -1385,6 +1654,27 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
   const auto res_it = fields.find("result");
 
   std::lock_guard lock(mutex_);
+  if(auto ai=pool_ai_pending_.find(rpc_id);ai!=pool_ai_pending_.end()) {
+    pool_ai_pending_.erase(ai);
+    std::cout<<"{\"event\":\"POOL_AI_RECEIPT\",\"rpc_id\":"<<rpc_id
+      <<",\"acknowledged\":"<<(!has_error&&res_it!=fields.end()&&res_it->second.kind_case()==google::protobuf::Value::kBoolValue&&res_it->second.bool_value()?"true":"false")<<"}\n"<<std::flush;
+    return true; // AI transport receipt is never a mining share receipt.
+  }
+  if (auto meta=metadata_pending_.find(rpc_id);meta!=metadata_pending_.end()) {
+    metadata_pending_.erase(meta);
+    const bool accepted=!has_error&&res_it!=fields.end()&&
+        res_it->second.kind_case()==google::protobuf::Value::kBoolValue&&res_it->second.bool_value();
+    if(accepted){++pool_metadata_acked_;metadata_session_acked_=true;pool_telemetry_state_="ACTIVE";}
+    else {
+      metadata_session_enabled_=false;
+      pool_telemetry_state_="REJECTED";
+      if(has_error&&err_it->second.kind_case()==google::protobuf::Value::kListValue) {
+        const auto &err=err_it->second.list_value().values();
+        if(!err.empty()&&value_to_u64(err[0])==std::optional<std::uint64_t>(20))pool_telemetry_state_="UNSUPPORTED";
+      }
+    }
+    return true; // Never a share receipt, rejection counter or fabricated ACK.
+  }
   if (rpc_id == subscribe_rpc_id_) {
     ping_ms_ = std::chrono::duration<double, std::milli>(now - subscribe_sent_at_)
                    .count();
@@ -1438,6 +1728,7 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
         }
       }
     }
+    subscribed_=res_it!=fields.end()&&res_it->second.kind_case()==google::protobuf::Value::kListValue;
     if (state_ == ConnectionState::Connected ||
         state_ == ConnectionState::Connecting) {
       state_ = ConnectionState::Subscribed;
@@ -1458,6 +1749,7 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
                           config_.worker);
       return true;
     }
+    authorized_=true;
     state_ = ConnectionState::Ready;
     last_error_.clear();
     std::cout << "{\"event\":\"STRATUM_AUTHORIZED\",\"worker\":\""
@@ -1470,7 +1762,6 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
   const auto pending_it = pending_shares_.find(rpc_id);
   if (pending_it != pending_shares_.end()) {
     const PendingShareRecord rec = pending_it->second;
-    pending_shares_.erase(pending_it);
     ping_ms_ =
         std::chrono::duration<double, std::milli>(now - rec.sent_at).count();
 
@@ -1478,6 +1769,20 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
         !has_error && res_it != fields.end() &&
         res_it->second.kind_case() == google::protobuf::Value::kBoolValue &&
         res_it->second.bool_value();
+    const bool explicit_rejection=has_error ||
+        (res_it!=fields.end() && res_it->second.kind_case()==google::protobuf::Value::kBoolValue && !res_it->second.bool_value());
+    if(submission_ledger_) {
+      const auto receipt=consensus::blake3_hash(std::span(reinterpret_cast<const std::uint8_t*>(line.data()),line.size()));
+      const auto state=accepted?network::SubmissionLedger::State::Acknowledged:
+          explicit_rejection?network::SubmissionLedger::State::Rejected:network::SubmissionLedger::State::Unknown;
+      need(submission_ledger_->observe(rec.ledger_id,state,receipt),"durable pool receipt transition failed");
+    }
+    pending_shares_.erase(pending_it);
+    if(!accepted && !explicit_rejection) {
+      last_share_status_="RPC_OUTCOME_UNKNOWN";
+      std::cout<<"{\"event\":\"STRATUM_SHARE_UNKNOWN\",\"reason\":\"MALFORMED_RECEIPT\",\"rpc_id\":"<<rpc_id<<"}\n"<<std::flush;
+      return true;
+    }
     const std::string block_hash_hex =
         hex_encode_bytes(std::span<const std::uint8_t>(rec.block_hash.data(), 32));
 
@@ -1589,6 +1894,7 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
 
 std::optional<StratumPoolJob> StratumV4Client::current_job() const {
   std::lock_guard lock(mutex_);
+  if(!loopback_test_mode_&&(!subscribed_||!authorized_))return std::nullopt;
   return active_job_;
 }
 
@@ -1702,6 +2008,23 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
     return std::nullopt;
   }
 
+  // Difficulty updates preserve the job generation and nonce cursor. A proof
+  // built against its previous threshold can become ineligible while packing.
+  // This is a stale target snapshot, not an invalid locally verified proof.
+  if(share.effective_target!=active_job_->effective_target &&
+      compare_target_u256(share.pow_value,active_job_->effective_target)>0) {
+    ++stale_shares_;
+    last_share_status_="STALE_TARGET_BEFORE_SUBMIT";
+    std::cout<<"{\"event\":\"STRATUM_STALE_DROP\",\"job_id\":\""
+             <<json_escape(share.job_id)<<"\",\"nonce\":\""<<share.nonce
+             <<"\",\"stage\":\"TARGET_RETARGET\"}\n"<<std::flush;
+    return std::nullopt;
+  }
+
+  if(pending_shares_.size()>=1024) {
+    last_share_status_="PENDING_SHARE_CAPACITY";
+    return std::nullopt;
+  }
   auto &seen_nonces = submitted_nonces_by_job_[share.job_id];
   if (seen_nonces.find(share.nonce) != seen_nonces.end()) {
     ++duplicate_shares_;
@@ -1712,8 +2035,6 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
               << std::flush;
     return std::nullopt;
   }
-  seen_nonces.insert(share.nonce);
-
   need((share.nonce & ~active_job_->nonce_mask) == active_job_->nonce_fixed,
        "Share nonce violates extranonce assignment");
   need(compare_target_u256(share.pow_value, active_job_->effective_target) <= 0,
@@ -1764,10 +2085,44 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
   }
   oss << "]}";
 
+  Hash ledger_id{};
+  if(submission_ledger_) {
+    // Pool job IDs and RPC IDs are session-local. Bind the reservation to the
+    // actual PoM input and nonce, independent of reconnects and cosmetic job IDs.
+    std::vector<std::uint8_t> identity{'N','X','P','S',1};
+    auto text=[&](std::string_view v){for(unsigned i=0;i<8;++i)identity.push_back(static_cast<std::uint8_t>(std::uint64_t(v.size())>>(8*i)));identity.insert(identity.end(),v.begin(),v.end());};
+    text(endpoint_.host);text(std::to_string(endpoint_.port));
+    identity.insert(identity.end(),share.pre_pow.begin(),share.pre_pow.end());
+    for(auto v:{share.timestamp,share.daa_score,share.nonce})for(unsigned i=0;i<8;++i)identity.push_back(static_cast<std::uint8_t>(v>>(8*i)));
+    ledger_id=consensus::blake3_hash(identity);
+    const auto payload=consensus::blake3_hash(share.pom_proof_borsh);
+    if(!submission_ledger_->reserve(ledger_id,payload)) {
+      ++duplicate_shares_;last_share_status_="DUPLICATE_DROPPED_DURABLE";
+      std::cout<<"{\"event\":\"STRATUM_DUPLICATE_DROP\",\"stage\":\"DURABLE_INTENT\",\"nonce\":\""<<share.nonce<<"\"}\n"<<std::flush;
+      return std::nullopt;
+    }
+  }
+  // Validation and serialization must finish before poisoning local dedup.
+  // A failed/partial send remains reserved: its delivery is ambiguous.
+  seen_nonces.insert(share.nonce);
   if (!send_line_locked(oss.str())) {
+    if(submission_ledger_)need(submission_ledger_->observe(ledger_id,network::SubmissionLedger::State::Unknown),"durable ambiguous pool send failed");
     record_error_locked("Failed transmitting mining.submit to pool");
     return std::nullopt;
   }
+
+  if(submission_ledger_)need(submission_ledger_->observe(ledger_id,network::SubmissionLedger::State::Sent),"durable sent receipt failed");
+
+  // Emit the exact locked target snapshot after the wire write, outside its critical latency.
+  std::cout<<"{\"event\":\"POOL_SHARE_CONTEXT\",\"schema_version\":1,\"rpc_id\":"<<rpc_id
+           <<",\"job_id\":\""<<json_escape(share.job_id)<<"\",\"nonce\":\""<<share.nonce
+           <<"\",\"daa\":"<<share.daa_score<<",\"timestamp\":"<<share.timestamp
+           <<",\"pre_pow\":\""<<hex_encode_bytes(share.pre_pow)
+           <<"\",\"pow_value\":\""<<hex_encode_bytes(share.pow_value)
+           <<"\",\"proof_target\":\""<<hex_encode_bytes(share.effective_target)
+           <<"\",\"active_target\":\""<<hex_encode_bytes(active_job_->effective_target)
+           <<"\",\"network_target\":\""<<hex_encode_bytes(active_job_->network_target)
+           <<"\",\"proof_bytes\":"<<share.pom_proof_borsh.size()<<"}\n"<<std::flush;
 
   const bool satisfies_net =
       active_job_->has_bits &&
@@ -1775,6 +2130,7 @@ StratumV4Client::submit_share(const VerifiedPoolShare &share) {
 
   PendingShareRecord rec{};
   rec.rpc_id = rpc_id;
+  rec.ledger_id=ledger_id;
   rec.job_generation = share.job_generation;
   rec.job_id = share.job_id;
   rec.nonce = share.nonce;
@@ -1811,7 +2167,7 @@ StratumTelemetrySnapshot StratumV4Client::telemetry_snapshot() const {
   snap.endpoint = endpoint_.raw_url;
   snap.worker = config_.worker;
   snap.ping_ms = ping_ms_;
-  snap.difficulty = current_difficulty_;
+  snap.difficulty = active_job_?active_job_->difficulty:current_difficulty_;
   snap.accepted_shares = accepted_shares_;
   snap.rejected_shares = rejected_shares_;
   snap.stale_shares = stale_shares_;
@@ -1836,30 +2192,38 @@ StratumTelemetrySnapshot StratumV4Client::telemetry_snapshot() const {
   }
   snap.last_error = last_error_;
   snap.last_share_status = last_share_status_;
+  snap.pool_telemetry_state=pool_telemetry_state_;
+  snap.pool_metadata_sent=pool_metadata_sent_;snap.pool_metadata_acked=pool_metadata_acked_;
+  snap.pool_trace_ready=config_.pool_telemetry.trace_ready;
   return snap;
 }
 
 void StratumV4Client::register_trace_upload_url(std::string_view task_id, std::string_view upload_url) {
-  if (task_id.empty() || upload_url.empty()) return;
+  if(task_id.size()!=64 || task_id.find_first_not_of("0123456789abcdefABCDEF")!=std::string_view::npos) return;
+  const auto host=trace_url_host(upload_url);
+  if(host.empty()) return;
   std::lock_guard lock(mutex_);
-  trace_upload_urls_[std::string(task_id)] = std::string(upload_url);
+  if(host!=endpoint_.host && std::find(config_.trace_upload_hosts.begin(),config_.trace_upload_hosts.end(),host)==config_.trace_upload_hosts.end()) return;
+  if(trace_upload_urls_.size()>=64 && !trace_upload_urls_.contains(std::string(task_id))) return;
+  trace_upload_urls_[std::string(task_id)]=std::string(upload_url);
 }
 
 bool StratumV4Client::upload_trace_record(std::string_view task_id, std::span<const std::uint8_t> blob) {
-  std::string upload_url;
+  // One bounded synchronous attempt: true is a received 2xx, never a detached
+  // thread launch. Retain the URL on failure so the caller can retry by deadline.
+  std::unique_lock upload_lock(trace_upload_mutex_,std::try_to_lock);
+  if(!upload_lock.owns_lock() || stop_requested_.load(std::memory_order_acquire)) return false;
+  std::string url;
   {
     std::lock_guard lock(mutex_);
-    auto it = trace_upload_urls_.find(std::string(task_id));
-    if (it != trace_upload_urls_.end()) {
-      upload_url = it->second;
-      trace_upload_urls_.erase(it);
-    }
+    auto it=trace_upload_urls_.find(std::string(task_id));
+    if(it==trace_upload_urls_.end()) return false;
+    url=it->second;
   }
-  if (upload_url.empty()) return false;
-  std::vector<std::uint8_t> copy(blob.begin(), blob.end());
-  std::thread([url = std::move(upload_url), id = std::string(task_id), b = std::move(copy)]() {
-    upload_stratum_trace_record(url, id, b);
-  }).detach();
+  if(!upload_stratum_trace_record(url,task_id,blob,stop_requested_)) return false;
+  std::lock_guard lock(mutex_);
+  auto it=trace_upload_urls_.find(std::string(task_id));
+  if(it!=trace_upload_urls_.end() && it->second==url) trace_upload_urls_.erase(it);
   return true;
 }
 

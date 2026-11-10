@@ -1119,17 +1119,12 @@ impl Service {
             let parts =
                 attn_blocks::decode_partials(&op.partials, d.dv).ok_or("stored partials")?;
             let weights = attn_blocks::child_weights(&parts).ok_or("stored partial weights")?;
-            let mut path = last.path.clone();
-            path.push(
-                p::draw_attention_child(&child, id, last.path.len() as u8, &weights)
-                    .ok_or("child draw")?,
-            );
-            if s.policy
-                .node
-                .as_ref()
-                .is_some_and(|o| !o.path.is_empty() && o.path != path)
-            {
-                continue;
+            let local_child=p::draw_attention_child(&child, id, last.path.len() as u8, &weights)
+                .ok_or("child draw")?;
+            let Some(path)=recovery::attention_child_path(&last.path,local_child,&weights,
+                s.policy.node.as_ref().map(|o|o.path.as_slice())) else { continue; };
+            if path.last()!=Some(&local_child) {
+                log::warn!("H15 attention child follows verified node ledger; local draw differed, phase={}",last.path.len());
             }
             let deadline = child_daa.saturating_add(p::attn_phase_window_daa(
                 pending.capture.tier,

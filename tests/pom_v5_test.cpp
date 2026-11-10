@@ -8,6 +8,7 @@
 #include <cuda.h>
 #endif
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -117,19 +118,36 @@ void gpu(const fs::path&dir,const fs::path&model_path,const fs::path&tree_path,c
     merkle=std::make_unique<model::SparseMerkleIndex>(model,tree_path,false);
   } else root=all.back()[0];
   std::vector<DeviceBuffer>buffers;std::vector<opoi::ResidentTensor>tensors;
+  std::optional<opoi::CanonicalWeightBlob> canonical_view;
+  std::vector<std::uint8_t> host_slot_bytes;
   const auto before=free_memory();
   {
     platform::ReadOnlyFile file(model_path);std::vector<std::uint8_t>staging(4*1024*1024);
+    const bool canonical=std::getenv("NEXUS_TEST_CANONICAL_WEIGHTS")!=nullptr;
+    std::uint64_t canonical_bytes=0,canonical_offset=0;
+    if(canonical) {
+      for(const auto&t:model.canonical_tensors()) canonical_bytes+=t.bytes;
+      buffers.emplace_back(canonical_bytes);
+      canonical_view=opoi::CanonicalWeightBlob{static_cast<std::uintptr_t>(buffers.back().p),static_cast<std::size_t>(canonical_bytes)};
+    }
     for(const auto&t:model.canonical_tensors()) {
-      buffers.emplace_back(static_cast<std::size_t>(t.bytes));
+      if(!canonical) buffers.emplace_back(static_cast<std::size_t>(t.bytes));
+      const auto base=buffers.back().p+(canonical?canonical_offset:0);
+      if(canonical && std::getenv("NEXUS_TEST_CANONICAL_HOLE") && t.name==model.canonical_tensors().back().name) {
+        host_slot_bytes.resize(t.bytes);
+        file.read_at_streaming(host_slot_bytes.data(),t.bytes,model.tensor_data_offset()+t.data_offset);
+        tensors.push_back({t.name,reinterpret_cast<std::uintptr_t>(host_slot_bytes.data()),static_cast<std::size_t>(t.bytes),false});
+        canonical_offset+=t.bytes;continue;
+      }
       for(std::uint64_t off=0;off<t.bytes;off+=staging.size()) {
         const auto n=static_cast<std::size_t>(std::min<std::uint64_t>(staging.size(),t.bytes-off));
-        file.read_at_streaming(staging.data(),n,model.tensor_data_offset()+t.data_offset+off);cu(cuMemcpyHtoD(buffers.back().p+off,staging.data(),n),"bounded model upload");
+        file.read_at_streaming(staging.data(),n,model.tensor_data_offset()+t.data_offset+off);cu(cuMemcpyHtoD(base+off,staging.data(),n),"bounded model upload");
       }
-      tensors.push_back({t.name,static_cast<std::uintptr_t>(buffers.back().p),static_cast<std::size_t>(t.bytes),true});
+      tensors.push_back({t.name,static_cast<std::uintptr_t>(base),static_cast<std::size_t>(t.bytes),true});
+      canonical_offset+=t.bytes;
     }
   }
-  CudaResidentSearch engine(primary_gpu_uuid(),model,tensors);
+  CudaResidentSearch engine(primary_gpu_uuid(),model,tensors,canonical_view);
   auto pad=official_v5_pad(0,id,root);if(!real)pad.tiles=61;
   require(engine.prepare_v5(pad),"v5 preparation failed");
   const auto bytes=engine.v5_pad_bytes();require(bytes==pad.tiles*1024,"v5 resident pad bytes wrong");
@@ -142,6 +160,14 @@ void gpu(const fs::path&dir,const fs::path&model_path,const fs::path&tree_path,c
     const auto cpu=prove_v5_from_model(seed,0,model.chunk_count()/32,pad,read,[&](auto t){return real?merkle->tile_path(t):path(all,t);});
     const auto gpu=engine.diagnose_v5(pph,timestamp,pom_v5_activation_daa,nonce);
     require(gpu.offsets==cpu.walk.offsets&&gpu.states==cpu.walk.states,"CUDA v5 full state/offset parity failure");
+    // Exercise the actual search route too. Equality at target and rejection
+    // at target-1 pin its complete 256-bit output for every sampled nonce.
+    const auto exact=pom_pow_value_h3(final_state(cpu.walk),pph);
+    require(engine.run(pph,timestamp,pom_v5_activation_daa,exact,nonce,1).winner==nonce,
+        "selected kernel rejected the exact CPU pow");
+    auto below_exact=exact;for(auto &v:below_exact){if(v-- !=0)break;}
+    require(!engine.run(pph,timestamp,pom_v5_activation_daa,below_exact,nonce,1).winner,
+        "selected kernel accepted pow below CPU output");
     artifact(dir/(std::string(real?"real-":"gpu-")+std::to_string(i)+".bin"),0,id,root,model.chunk_count(),pad,pph,timestamp,nonce,gpu,cpu.proof);
   }
   // Exercise target screening and partial final blocks against independently computed CPU walks.
