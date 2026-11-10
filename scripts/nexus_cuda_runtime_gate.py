@@ -59,6 +59,10 @@ def main() -> int:
         if "libcuda.so.1 => " not in worker_closure:
             raise RuntimeError("CUDA Driver API library is not resolved")
 
+        exports = {line.split()[-1] for line in run("nm", "-D", "--defined-only", str(llama)).splitlines() if line.split()}
+        required = {"keryx_llama_generate_n", "keryx_llama_generate_traced_n"}
+        if not required.issubset(exports):
+            raise RuntimeError("inference wrapper lacks exact-byte prompt generation exports")
         _, llama_needed = dynamic_needed(llama)
         if "libcudart.so.12" not in llama_needed:
             raise RuntimeError("stock llama does not declare CUDA Runtime 12")
@@ -76,7 +80,7 @@ def main() -> int:
     except (OSError, RuntimeError) as exc:
         print(f"CUDA_RUNTIME_GATE=BLOCKED detail={exc}", file=sys.stderr)
         return 13
-    print("CUDA_RUNTIME_GATE=PASS worker=CUDA_DRIVER_API llama=CUDA_RUNTIME_12 mixed_runtime=NONE")
+    print("CUDA_RUNTIME_GATE=PASS worker=CUDA_DRIVER_API llama=CUDA_RUNTIME_12 mixed_runtime=NONE prompt_bytes=EXACT")
     return 0
 
 

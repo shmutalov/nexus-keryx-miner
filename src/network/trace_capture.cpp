@@ -18,7 +18,7 @@ void text_bound(std::string_view text) {
 TraceCapture::TraceCapture(TraceApi api, void *model, std::uint32_t context, std::uint32_t context_floor)
     : api_(api), model_(model), context_(context), allocated_context_(context), context_floor_(context_floor) {
   require(model && context && context <= 32768 && api.configure && api.leaf_count &&
-          api.generate && api.read && api.replay && context_floor<=context, "Incomplete ABI6 trace runtime");
+          (api.generate || api.generate_n) && api.read && api.replay && context_floor<=context, "Incomplete ABI6 trace runtime");
 }
 void TraceCapture::use_task_context() {
   require((api_.abi==8 || api_.abi==9) && api_.context_acquire,"Task context requires ABI8/9 context acquisition");
@@ -94,22 +94,30 @@ TracedGeneration TraceCapture::generate(std::string_view prompt, const TracePref
             "Invalid request-bound prefix");
   }
   const std::string owned(prompt), rest(prefix ? prefix->rest : std::string_view{});
+  if(!api_.generate_n)
+    require(owned.find('\0')==std::string::npos&&rest.find('\0')==std::string::npos,
+            "NUL prompt requires a length-aware inference runtime");
   ensure_full_context();
   std::vector<char> output(64U << 10);
   TracedGeneration result;
   result.tokens.resize(context_);
   int n_prompt = 0, n_fed = 0;
-  const int n = api_.generate(model_, owned.c_str(), prefix ? prefix->tokens.data() : nullptr,
-      prefix ? static_cast<int>(prefix->tokens.size()) : 0, prefix ? static_cast<int>(prefix->head_tokens) : 0,
-      rest.c_str(), static_cast<int>(max_tokens), output.data(), static_cast<int>(output.size()),
-      result.tokens.data(), static_cast<int>(result.tokens.size()), &n_prompt, &n_fed,
-      static_cast<int>(min_prompt), static_cast<int>(answer_bytes_per_position));
+  const auto *ids=prefix?prefix->tokens.data():nullptr;
+  const auto count=prefix?static_cast<int>(prefix->tokens.size()):0;
+  const auto head=prefix?static_cast<int>(prefix->head_tokens):0;
+  const int n=api_.generate_n ?
+      api_.generate_n(model_,owned.data(),owned.size(),ids,count,head,rest.data(),rest.size(),
+          static_cast<int>(max_tokens),output.data(),static_cast<int>(output.size()),result.tokens.data(),
+          static_cast<int>(result.tokens.size()),&n_prompt,&n_fed,static_cast<int>(min_prompt),
+          static_cast<int>(answer_bytes_per_position)) :
+      api_.generate(model_,owned.c_str(),ids,count,head,rest.c_str(),static_cast<int>(max_tokens),
+          output.data(),static_cast<int>(output.size()),result.tokens.data(),static_cast<int>(result.tokens.size()),
+          &n_prompt,&n_fed,static_cast<int>(min_prompt),static_cast<int>(answer_bytes_per_position));
   if (n < 0) fail("generate", n);
   require(n > 0 && static_cast<std::size_t>(n) < output.size() && n_prompt > 0 && n_fed >= n_prompt &&
           static_cast<std::uint32_t>(n_fed) <= positions_ && static_cast<std::uint32_t>(n_fed) <= allocated_context_,
           "Invalid ABI6 generation dimensions");
   result.text.assign(output.data(), static_cast<std::size_t>(n));
-  result.text.erase(std::remove(result.text.begin(), result.text.end(), '\0'), result.text.end());
   result.tokens.resize(static_cast<std::size_t>(n_fed));
   require(std::all_of(result.tokens.begin(), result.tokens.end(), [](auto n) { return n >= 0; }),
           "Invalid captured token");

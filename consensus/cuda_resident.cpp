@@ -1,6 +1,8 @@
 #include "keryx/nexus/developer_config.hpp"
 #include "keryx/nexus/consensus/cuda_resident.hpp"
 #include <cuda.h>
+#include <chrono>
+#include "keryx/nexus/consensus/resident_route.hpp"
 #include "keryx/nexus/pom_vram_admission.hpp"
 #include "keryx/nexus/gpu_device_policy.hpp"
 #include <algorithm>
@@ -61,6 +63,9 @@ struct CudaResidentSearch::Impl {
   CUfunction v5_kernel{},pad_fill_kernel{},v5_lockstep2_kernel{},v5_lockstep_kernel{};
   CUfunction kernel{},seed_kernel{},fold_kernel{},witness_offsets_kernel{},witness_pairs_kernel{};
   bool contiguous_weights{false};
+  std::string last_route;
+  std::uint64_t x2_batches{}, fallback_batches{}, trace_batches{}, completed_nonces{};
+  std::chrono::steady_clock::time_point route_report{};
   std::uint64_t contiguous_wbase{0};
   std::uint32_t tensor_count{},shift{12};
   std::uint64_t tiles{},reciprocal{};
@@ -73,7 +78,7 @@ struct CudaResidentSearch::Impl {
 #ifdef NEXUS_TEST_POM_ALLOCATOR
   Impl(){tiles=1048576;canonical_bases={4096};canonical_prefix={0,tiles*32};}
 #endif
-  Impl(const std::string &uuid,const model::ReadOnlyGguf &gguf,const std::vector<opoi::ResidentTensor>&tensors){
+  Impl(const std::string &uuid,const model::ReadOnlyGguf &gguf,const std::vector<opoi::ResidentTensor>&tensors,std::optional<opoi::CanonicalWeightBlob> canonical_blob){
     const char *visible=std::getenv("CUDA_VISIBLE_DEVICES");
     if(uuid!=primary_gpu_uuid()||!visible||uuid!=visible)throw std::runtime_error("resident solver requires exclusive authorized GPU UUID");
     check(cuInit(0),"cuInit");int count=0;check(cuDeviceGetCount(&count),"visible device count");
@@ -90,6 +95,17 @@ struct CudaResidentSearch::Impl {
     if(tensors.size()!=canonical.size()||tensors.empty()||tensors.size()>65535)throw std::runtime_error("canonical resident tensor count mismatch");
     std::vector<std::uint64_t> host_bases,host_offsets,host_prefix{0};
     std::size_t host_uploaded=0,borrowed=0;
+    if(canonical_blob) {
+      std::vector<CanonicalTensorSlot> slots;slots.reserve(tensors.size());
+      for(const auto &t:tensors)slots.push_back({t.address,t.bytes,t.device});
+      if(!canonical_blob_matches(slots,canonical_blob->address,canonical_blob->bytes) ||
+          canonical_blob->bytes!=gguf.chunk_count()*32)
+        throw std::runtime_error("engine canonical blob does not match the GGUF layout");
+      CUcontext owner{};int ordinal=-1;
+      check(cuPointerGetAttribute(&owner,CU_POINTER_ATTRIBUTE_CONTEXT,canonical_blob->address),"canonical blob context");
+      check(cuPointerGetAttribute(&ordinal,CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,canonical_blob->address),"canonical blob device");
+      if(owner!=ctx.value || ordinal!=0)throw std::runtime_error("canonical blob belongs to another device/context");
+    }
     for(std::size_t i=0;i<tensors.size();++i){const auto &t=tensors[i];const auto &g=canonical[i];
       if(t.name!=g.name||t.bytes!=g.bytes||!t.address)throw std::runtime_error("resident tensor name/size mismatch");
       const auto chunks=t.bytes/32;if(!chunks)continue;
@@ -98,13 +114,22 @@ struct CudaResidentSearch::Impl {
         check(cuPointerGetAttribute(&owner,CU_POINTER_ATTRIBUTE_CONTEXT,ptr),"tensor context");
         check(cuPointerGetAttribute(&ordinal,CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,ptr),"tensor device");
         if(owner!=ctx.value||ordinal!=0)throw std::runtime_error("resident tensor belongs to an unauthorized context/device");++borrowed;
+        if(canonical_blob) {
+          const auto at=canonical_blob->address+host_prefix.back()*32;
+          if(at!=ptr)check(cuMemcpyDtoD(at,ptr,chunks*32),"fill engine canonical device slot");
+          ptr=at;
+        }
       }else{
         // Official Qwen model has exactly one CPU embedding tensor; no full GGUF duplication.
-        if(host_uploaded||t.name!="token_embd.weight"||t.bytes!=699269120)
+        if(!canonical_blob && (host_uploaded||t.name!="token_embd.weight"||t.bytes!=699269120))
           throw std::runtime_error("unexpected host resident tensor: "+t.name+" bytes="+std::to_string(t.bytes));
-        std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"resident upload VRAM budget");
-        require_pom_vram({t.bytes,0,free});
-        uploads.emplace_back();uploads.back().allocate(t.bytes);ptr=uploads.back().ptr;
+        if(canonical_blob) {
+          ptr=canonical_blob->address+host_prefix.back()*32;
+        } else {
+          std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"resident upload VRAM budget");
+          require_pom_vram({t.bytes,0,free});
+          uploads.emplace_back();uploads.back().allocate(t.bytes);ptr=uploads.back().ptr;
+        }
         check(cuMemcpyHtoD(ptr,reinterpret_cast<const void*>(t.address),t.bytes),"upload CPU resident tensor");host_uploaded+=t.bytes;
       }
       host_bases.push_back(ptr);host_offsets.push_back(gguf.tensor_data_offset()+g.data_offset);host_prefix.push_back(host_prefix.back()+chunks);
@@ -131,17 +156,15 @@ struct CudaResidentSearch::Impl {
     bases.allocate(host_bases.size()*8);prefix.allocate(host_prefix.size()*8);lut.allocate(host_lut.size()*2);winner.allocate(8);sponge.allocate(25*8);h10_seeds.allocate(18432*8);
     check(cuMemcpyHtoD(bases.ptr,host_bases.data(),host_bases.size()*8),"copy tensor descriptors");check(cuMemcpyHtoD(prefix.ptr,host_prefix.data(),host_prefix.size()*8),"copy canonical prefix");check(cuMemcpyHtoD(lut.ptr,host_lut.data(),host_lut.size()*2),"copy chunk LUT");
     {
-      bool is_contig = !host_bases.empty();
-      const auto b0 = host_bases.empty() ? 0 : host_bases[0];
-      for (std::size_t j = 0; j < host_bases.size(); ++j) {
-        if (host_bases[j] != b0 + host_prefix[j] * 32ULL) {
-          is_contig = false;
-          break;
-        }
-      }
-      if (b0 % 16 != 0) is_contig = false;
-      contiguous_weights = is_contig;
-      contiguous_wbase = b0;
+      const auto layout=inspect_canonical_layout(host_bases,host_prefix);
+      contiguous_weights=layout.contiguous;
+      contiguous_wbase=host_bases.empty()?0:host_bases.front();
+      std::size_t free=0,total=0;check(cuMemGetInfo(&free,&total),"layout VRAM inspection");
+      std::cout<<"POM_WEIGHT_LAYOUT contiguous="<<(layout.contiguous?"true":"false")
+               <<" tensors="<<host_bases.size()<<" first_mismatch="<<layout.first_mismatch
+               <<" model_bytes="<<host_prefix.back()*32<<" host_uploaded_bytes="<<host_uploaded
+               <<" free_vram_bytes="<<free<<" borrowed_canonical="<<(canonical_blob?"true":"false")
+               <<" extra_weight_allocations="<<uploads.size()<<"\n"<<std::flush;
     }
     check(cuModuleLoadData(&resources.module,_binary_nexus_resident_cubin_start),"load resident multi-architecture image");check(cuModuleGetFunction(&kernel,resources.module,"nexus_resident_search_preseeded"),"resident kernel entry point");
     check(cuModuleGetFunction(&v5_kernel,resources.module,"nexus_resident_search_v5"),"v5 resident kernel entry point");
@@ -185,7 +208,7 @@ struct CudaResidentSearch::Impl {
     std::cout<<"RESIDENT_MODEL=PASS tensors="<<tensor_count<<" borrowed_device_tensors="<<borrowed<<" host_uploaded_bytes="<<host_uploaded<<" byte_gate=all_tensor_boundaries_plus_129 primary_context=shared kernel=CUDA_INT8_NCF seed=H10_PRECOMPUTED scratch_bytes=147456 tile_fold_bytes="<<fold_bytes<<" fold_gate=all_tensor_boundaries_plus_129\n"<<std::flush;
   }
 };
-CudaResidentSearch::CudaResidentSearch(const std::string &u,const model::ReadOnlyGguf &g,const std::vector<opoi::ResidentTensor>&t):impl_(std::make_unique<Impl>(u,g,t)){}
+CudaResidentSearch::CudaResidentSearch(const std::string &u,const model::ReadOnlyGguf &g,const std::vector<opoi::ResidentTensor>&t,std::optional<opoi::CanonicalWeightBlob> b):impl_(std::make_unique<Impl>(u,g,t,b)){}
 CudaResidentSearch::~CudaResidentSearch()=default;
 std::array<std::uint8_t,tile_bytes> CudaResidentSearch::read_tile(std::uint64_t tile) {
   auto &p=*impl_;
@@ -401,7 +424,8 @@ ResidentSearchResult CudaResidentSearch::run_impl(const Hash &pph,std::uint64_t 
     launch_params[28]=&p.path_metadata.ptr;
     launch_params[29]=&p.path_addresses.ptr;
   }
-  if(p.v5 && p.contiguous_weights && p.v5_lockstep2_kernel && !trace) {
+  const auto route=resident_route(bool(p.v5),p.contiguous_weights,bool(p.v5_lockstep2_kernel),bool(trace));
+  if(route.lockstep2) {
     void *ls_params[] = {
       &p.contiguous_wbase, &p.tiles,
       &p.v5->pad.ptr, &p.v5->spec.tiles,
@@ -428,6 +452,20 @@ ResidentSearchResult CudaResidentSearch::run_impl(const Hash &pph,std::uint64_t 
   if(trace){trace->offsets.resize(walk_steps);trace->states.resize(walk_steps+1);
     check(cuMemcpyDtoH(trace->offsets.data(),trace_offsets.ptr,walk_steps*8),"read v5 diagnostic offsets");
     check(cuMemcpyDtoH(trace->states.data(),trace_states.ptr,(walk_steps+1)*tile_bytes),"read v5 diagnostic states");}
+  // Count only completed launches. Availability never implies selection.
+  if(trace) ++p.trace_batches;
+  else {if(route.lockstep2) ++p.x2_batches; else ++p.fallback_batches; p.completed_nonces+=count;}
+  const auto now=std::chrono::steady_clock::now();
+  const std::string route_key=std::string(route.kernel)+":"+std::string(route.reason);
+  if(p.last_route!=route_key || now-p.route_report>=std::chrono::seconds(5)) {
+    std::cout<<"POM_KERNEL_ROUTE kernel="<<route.kernel<<" reason="<<route.reason
+             <<" contiguous_weights="<<(p.contiguous_weights?"true":"false")
+             <<" batch="<<count<<" kernel_ms="<<elapsed
+             <<" completed_x2_batches="<<p.x2_batches<<" completed_fallback_batches="<<p.fallback_batches
+             <<" completed_trace_batches="<<p.trace_batches<<" completed_search_nonces="<<p.completed_nonces
+             <<" scope=solver_instance\n"<<std::flush;
+    p.last_route=route_key;p.route_report=now;
+  }
   return {found==none?std::nullopt:std::optional(found),count,elapsed};
 }
 }

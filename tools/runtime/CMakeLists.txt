@@ -68,6 +68,21 @@ execute_process(COMMAND "${CMAKE_COMMAND}" "-DNEXUS_LLAMA_SOURCE=${nexus_llama_S
 if(NOT nexus_patch_result EQUAL 0)
   message(FATAL_ERROR "Canonical trace source verification failed")
 endif()
+# Add independent byte-length entry points without altering pinned upstream inputs.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(NEXUS_BASE_RUNTIME_WRAPPER "${NEXUS_RUNTIME_WRAPPER}")
+file(SHA256 "${NEXUS_BASE_RUNTIME_WRAPPER}" NEXUS_BASE_WRAPPER_SHA256)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${NEXUS_BASE_RUNTIME_WRAPPER}" "${NEXUS_SOURCE}/tools/runtime/add_length_aware_wrapper.py")
+set(NEXUS_RUNTIME_WRAPPER "${CMAKE_CURRENT_BINARY_DIR}/keryx_llama_length_aware.cpp")
+execute_process(COMMAND "${Python3_EXECUTABLE}" "${NEXUS_SOURCE}/tools/runtime/add_length_aware_wrapper.py"
+  --input "${NEXUS_BASE_RUNTIME_WRAPPER}" --output "${NEXUS_RUNTIME_WRAPPER}"
+  --expected-sha256 "${NEXUS_BASE_WRAPPER_SHA256}"
+  RESULT_VARIABLE nexus_prompt_patch_result)
+if(NOT nexus_prompt_patch_result EQUAL 0)
+  message(FATAL_ERROR "Length-aware wrapper generation failed")
+endif()
+file(SHA256 "${NEXUS_SOURCE}/tools/runtime/add_length_aware_wrapper.py" NEXUS_PROMPT_TRANSFORM_SHA256)
 add_library(nexus_inference_runtime SHARED
   "${NEXUS_RUNTIME_WRAPPER}")
 set_target_properties(nexus_inference_runtime PROPERTIES
@@ -93,6 +108,9 @@ set(nexus_runtime_metadata [=[{
   "force_mmq": true,
   "build_policy_miner_commit": "7a9a39355a298250de28ce823a749a30e6f3405f",
   "wrapper_sha256": "@NEXUS_WRAPPER_SHA256@",
+  "base_wrapper_sha256": "@NEXUS_BASE_WRAPPER_SHA256@",
+  "length_aware_prompts": true,
+  "prompt_transform_sha256": "@NEXUS_PROMPT_TRANSFORM_SHA256@",
   "patch_set_sha256": "@NEXUS_PATCH_SET_SHA256@",
   "miner_commit": "@NEXUS_RUNTIME_MINER_COMMIT@",
   "llama_commit": "12127defda4f41b7679cb2477a4b0d65ee6a0c8f"

@@ -72,6 +72,9 @@ class NativePomTelemetry final {
     std::string task_root_hex;
     std::string last_error;
     std::string last_share_status{"NONE"};
+    std::string pool_telemetry_state{"N/A"};
+    std::uint64_t pool_metadata_sent{},pool_metadata_acked{};
+    bool pool_trace_ready{};
   };
 
   explicit NativePomTelemetry(std::uint64_t start_monotonic_ns)
@@ -317,7 +320,10 @@ class NativePomTelemetry final {
         << "\",\"window_seed\":\"" << escape_json(stratum.window_seed_hex)
         << "\",\"task_root\":\"" << escape_json(stratum.task_root_hex)
         << "\",\"last_error\":\"" << escape_json(stratum.last_error)
-        << "\",\"last_share_status\":\"" << escape_json(stratum.last_share_status)
+        << "\",\"pool_telemetry_state\":\""<<escape_json(stratum.pool_telemetry_state)
+        << "\",\"pool_metadata_sent\":"<<stratum.pool_metadata_sent<<",\"pool_metadata_acked\":"<<stratum.pool_metadata_acked
+        << ",\"pool_trace_ready\":"<<(stratum.pool_trace_ready?"true":"false")
+        << ",\"last_share_status\":\"" << escape_json(stratum.last_share_status)
         << "\"}}";
     return out.str();
   }

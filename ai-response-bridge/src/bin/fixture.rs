@@ -14,9 +14,9 @@ fn hex32(value: &str) -> Result<[u8; 32], String> {
 
 fn main() -> Result<(), String> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 5 { return Err("usage: fixture public|private MODEL_ID_HEX PROMPT OUTPUT".into()); }
+    if args.len() != 5 { return Err("usage: fixture public|private|private-nul MODEL_ID_HEX PROMPT OUTPUT".into()); }
     let model = hex32(&args[2])?;
-    let prompt = args[3].as_bytes();
+    let prompt = if args[1] == "private-nul" { b"before\0middle\0after".as_slice() } else { args[3].as_bytes() };
     let mut requester_secret = Vec::new();
     let escrow_secret = [0x22u8; 32];
     let escrow_pubkey = escrow_pubkey_of(&escrow_secret).map_err(|_| "test escrow key invalid")?;
@@ -30,7 +30,7 @@ fn main() -> Result<(), String> {
     let cert = Secp256k1::new().sign_schnorr_no_aux_rand(&cert_msg, &payout_keypair);
     let payload = match args[1].as_str() {
         "public" => AiRequestPayload::new(model, 16, 20_000_000, 30_000_000, prompt.to_vec()).serialize(),
-        "private" => {
+        "private" | "private-nul" => {
             let (request, secret) = seal_request(model, 16, 20_000_000, 30_000_000, prompt, &[escrow_pubkey])
                 .map_err(|_| "official private fixture creation failed")?;
             requester_secret = hex::decode(secret.to_hex()).map_err(|_| "fixture secret encoding")?;

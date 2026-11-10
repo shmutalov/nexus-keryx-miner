@@ -10,7 +10,7 @@
 #include <iostream>
 #include <sstream>
 #include <atomic>
-#include <unistd.h>
+#include "keryx/nexus/platform/io.hpp"
 using namespace keryx::nexus::ai;
 std::string hex(const std::array<std::uint8_t,32>& x){std::ostringstream s;for(auto b:x)s<<std::hex<<std::setw(2)<<std::setfill('0')<<unsigned(b);return s.str();}
 void require(bool b,const char *why){if(!b)throw std::runtime_error(why);}
@@ -59,11 +59,14 @@ int main(int argc,char**argv){try{
   return 0;
  }
 
- require(argc==2,"persistent fixture directory required");std::filesystem::path root=std::filesystem::path(argv[1])/std::to_string(getpid());
+ require(argc==2,"persistent fixture directory required");std::filesystem::path root=std::filesystem::path(argv[1])/std::to_string(keryx::nexus::platform::io::getpid());
  require(!root.string().starts_with("/tmp"),"temporary path forbidden");std::filesystem::create_directories(root);
  require(!escrow_claim_check_due(5,6,5000,0),"monotonic boundary lost");
  require(!escrow_claim_check_due(6,6,2799,1000)&&escrow_claim_check_due(6,6,2800,1000),"30 minute cadence broken");
  require(!escrow_claim_check_due(6,6,999,1000),"clock rollback permitted claim");
+ require(!escrow_claim_cycle_due(6,6,1059,1000,true)&&escrow_claim_cycle_due(6,6,1060,1000,true),"burn repair minute cadence broken");
+ require(!escrow_claim_cycle_due(6,6,1060,1000,false),"normal cadence accelerated");
+ require(!escrow_claim_cycle_due(6,7,1060,1000,true)&&!escrow_claim_cycle_due(6,6,999,1000,true),"repair ignored monotonic/clock rollback gate");
  const auto state=root/"escrow.json";
  std::ofstream f(state);f<<"{\"entries\":[";
  for(unsigned i=0;i<87;++i){if(i)f<<',';std::ostringstream id;id<<std::hex<<std::setw(64)<<std::setfill('0')<<i+1;
@@ -170,6 +173,35 @@ int main(int argc,char**argv){try{
   pruned_watcher.set_claim_construction_enabled(false);
   require(pruned_watcher.verified_claim(block,live).has_value(),"live verified UTXO blocked by pruned history");
  }
+ {
+  auto expanded=initial;
+  std::string extra;
+  for(unsigned i=88;i<=174;++i){std::ostringstream id;id<<std::hex<<std::setw(64)<<std::setfill('0')<<i;
+   extra+=",{\"coinbase_txid\":\""+id.str()+"\",\"block_hash\":\"\",\"confirm_daa\":100000000,\"amount_sompi\":100000000,\"output_index\":1,\"claimed\":false,\"slashed\":false,\"csv_window\":792000}";}
+  expanded.insert(expanded.find("],\"journal_seq\""),extra);
+  const auto path=root/"burn-repair.json";std::ofstream(path)<<expanded;
+  EscrowWatcher checked(secret,"keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr",path);
+  auto all=live;
+  for(unsigned i=88;i<=174;++i){auto *e=all.add_entries();*e=live.entries(0);std::ostringstream id;id<<std::hex<<std::setw(64)<<std::setfill('0')<<i;e->mutable_outpoint()->set_transactionid(id.str());}
+  auto first=checked.verified_claim(block,all);require(first.has_value(),"burn fixture missing first batch");
+  const auto burned=first->inputs(0).previousoutpoint();
+  const auto detail="Rejected transaction "+hex(*consensus_transaction_id(*first))+": transaction spends burned escrow outpoints: "+burned.transactionid()+":"+std::to_string(burned.index());
+  std::string encoded;for(unsigned char c:detail){encoded+="0123456789abcdef"[c>>4];encoded+="0123456789abcdef"[c&15];}
+  const auto receipt="{\"state\":\"RPC_REJECTED\",\"detail_hex\":\""+encoded+"\"}";
+  require(escrow_burn_receipt_backlog(receipt),"persisted burn receipt lost repair schedule");
+  require(!escrow_burn_receipt_backlog("{\"state\":\"RPC_UNKNOWN\",\"detail_hex\":\""+encoded+"\"}"),"unknown scheduled repair");
+  require(!escrow_burn_receipt_backlog("{\"state\":\"RPC_REJECTED\",\"detail_hex\":\"zz\"}"),"malformed receipt scheduled repair");
+  require(escrow_named_burn_rejection(detail,*first),"explicit member burn did not allow repair");
+  require(!escrow_named_burn_rejection("timeout",*first),"unknown allowed immediate repair");
+  require(!escrow_named_burn_rejection("burned escrow outpoints: "+std::string(64,'f')+":1",*first),"foreign burn allowed repair");
+  require(!escrow_named_burn_rejection(detail+" garbage",*first),"malformed burn allowed repair");
+  require(checked.submit_result(hex(*consensus_transaction_id(*first)),detail)==1,"burn receipt uncorrelated");checked.flush();
+  auto next=checked.verified_claim(block,all);require(next&&next->inputs_size()==87,"valid survivors failed immediate re-batch");
+  for(const auto &i:next->inputs())require(i.previousoutpoint().transactionid()!=burned.transactionid()||i.previousoutpoint().index()!=burned.index(),"burned member reselected");
+  require(checked.submit_result(hex(*consensus_transaction_id(*next)),std::nullopt)==2,"repaired claim ACK failed");checked.flush();
+  EscrowWatcher restarted(secret,"keryx:qp8n2k7uklxq4aegau7vawtptkgxsja4kt99lpv6krctwpq8tpc65uyeddvzr",path);
+  auto ops=restarted.claim_outpoints(block.header().daascore());require(ops.size()==86,"burn/ACK persistence lost survivors");
+ }
  mock.live=live;
  std::vector<protowire::RpcOutpoint> ops;for(const auto &e:live.entries())ops.push_back(e.outpoint());
  auto fetched=query_escrow_utxos("grpc://127.0.0.1:"+std::to_string(port),ops);
@@ -178,6 +210,6 @@ int main(int argc,char**argv){try{
  try{(void)query_escrow_utxos("grpc://127.0.0.1:"+std::to_string(port),ops);}catch(const std::exception&){denied=true;}
  require(denied,"duplicate UTXO response accepted");
  server->Shutdown();
- std::cout<<"ESCROW_CLAIM_MOCK=PASS signed_stock_batch=87 fee_sompi=30000000 csv_blocks=792000 cadence_sec=1800 default_deny=true premature_denied=true duplicate_denied=true rust_txid_match=true mainnet_transactions=0\n";
+ std::cout<<"ESCROW_CLAIM_MOCK=PASS signed_stock_batch=87 fee_sompi=30000000 csv_blocks=792000 cadence_sec=1800 default_deny=true premature_denied=true duplicate_denied=true rust_txid_match=true burned_member_repair=true surviving_outputs_preserved=true mainnet_transactions=0\n";
  return 0;
 }catch(const std::exception&e){std::cerr<<"ESCROW_CLAIM_MOCK=FAIL "<<e.what()<<'\n';return 1;}}

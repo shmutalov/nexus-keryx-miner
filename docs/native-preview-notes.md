@@ -1,16 +1,21 @@
-Experimental native CLI for Windows x64 and Linux x86-64 (Ubuntu 24.04 baseline),
-NVIDIA SM 8.6. WSL is not required for Windows.
+Nexus v0.0.5 — experimental native CLI refresh for Windows x64 and Linux x86-64
+(Ubuntu 24.04 baseline), NVIDIA SM 8.6. WSL is not required for Windows.
 
-Packages include the worker, independent verifier, explicitly selected ABI9
-inference runtime, CUDA redistributables, licenses, exact source and checksums.
-ABI9 retains experimental candidate metadata; mismatched ABI caches fail closed.
-Models, trees, keys, node/IPFS data and existing journals are external inputs.
+This refresh adds length-aware NUL-safe prompt handling, native NVIDIA tier-0
+pool AI response/opening recovery, truthful pool telemetry, escrow claim
+reconciliation, durable submission journals and authenticated TLS checks.
 
-Native H15 tier-0 CUDA paths have local GPU/mock validation; live H15 chain
-acceptance and real nonempty node 1.6.6 audit-ledger validation remain separate.
-Windows GPU execution and GPU execution of these exact CI archives are not
-validated by CPU compilation/tests. The desktop and AMD/Vulkan backends are
-not included in these CLI packages. See the 0.0.4 release notes for full scope.
+Packages include the NVIDIA worker, independent verifier, explicitly selected
+ABI9 inference runtime, CUDA redistributables, licenses, exact source and
+checksums. ABI9 retains experimental candidate metadata. Models, trees, keys,
+node/IPFS data and journals are external inputs. Desktop and AMD/Vulkan workers
+are not included in these CLI archives.
 
-Unsigned experimental binaries. Original source GPL-3.0-only; third-party
-notices and runtime licenses included. Automatic updates remain disabled.
+Local CPU/mock and NVIDIA GPU/mock results are distinct from execution of these
+exact CI archives. Windows GPU execution, public-pool AI acceptance, payment and
+escrow approval remain unvalidated. KeryxPool approval must explicitly cover
+Nexus; telemetry or a connection probe alone does not grant escrow access.
+
+Unsigned experimental binaries. Source GPL-3.0-only with third-party notices.
+Automatic updates remain disabled. Detailed changes and limits:
+https://github.com/tonythewizard/nexus-keryx-miner/blob/v0.0.5/docs/release-0.0.5.md

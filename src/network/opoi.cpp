@@ -183,7 +183,7 @@ std::string official_qwen35_prompt(const std::string &nonce_hex) {
 }
 
 std::string official_qwen35_ai_prompt(std::string_view user_prompt) {
-  const std::string clean = sanitize_nul_bytes(user_prompt);
+  const std::string clean(user_prompt);
   if (clean.empty())
     throw std::invalid_argument("AiRequest prompt is empty");
   return std::string("<|im_start|>system\n") + std::string(stock_system_prompt) + "<|im_end|>\n" +
@@ -255,6 +255,8 @@ struct StockLlamaRuntime::Impl {
   void *model{};
   ErrorFn last_error{};
   GenerateFn generate{};
+  using GenerateNFn=int(*)(void *,const char *,std::size_t,int,char *,int);
+  GenerateNFn generate_n{};
   FreeFn free_model{};
   using PomReadyFn = bool (*)(void *);
   using PomChunksFn = std::uint64_t (*)(void *);
@@ -317,6 +319,7 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
   const auto vk_abi = symbol_optional<AbiFn>(impl_->library, "keryx_llama_vk_abi");
   const auto load = symbol<LoadFn>(impl_->library, "keryx_llama_load");
   impl_->generate = symbol<GenerateFn>(impl_->library, "keryx_llama_generate");
+  impl_->generate_n=symbol_optional<Impl::GenerateNFn>(impl_->library,"keryx_llama_generate_n");
   impl_->free_model = symbol<FreeFn>(impl_->library, "keryx_llama_free");
   impl_->last_error = symbol<ErrorFn>(impl_->library, "keryx_llama_last_error");
   impl_->pom_ready = symbol_optional<Impl::PomReadyFn>(impl_->library, "keryx_llama_pom_ready");
@@ -333,6 +336,7 @@ StockLlamaRuntime::StockLlamaRuntime(std::string library_path, std::string gguf_
     api.configure = symbol<decltype(api.configure)>(impl_->library, "keryx_llama_trace_configure");
     api.leaf_count = symbol<decltype(api.leaf_count)>(impl_->library, "keryx_llama_trace_leaf_count");
     api.generate = symbol<decltype(api.generate)>(impl_->library, "keryx_llama_generate_traced");
+    api.generate_n=symbol_optional<decltype(api.generate_n)>(impl_->library,"keryx_llama_generate_traced_n");
     api.read = symbol<decltype(api.read)>(impl_->library, "keryx_llama_trace_read");
     api.replay = symbol_optional<decltype(api.replay)>(impl_->library, "keryx_llama_replay");
     api.replay_multi = symbol_optional<decltype(api.replay_multi)>(impl_->library, "keryx_llama_replay_multi");
@@ -388,6 +392,19 @@ StockLlamaRuntime::~StockLlamaRuntime() = default;
 StockLlamaRuntime::StockLlamaRuntime(StockLlamaRuntime &&) noexcept = default;
 StockLlamaRuntime &StockLlamaRuntime::operator=(StockLlamaRuntime &&) noexcept = default;
 
+std::optional<CanonicalWeightBlob> StockLlamaRuntime::canonical_weights() const {
+  if(!impl_ || !impl_->model)throw std::logic_error("resident model is not loaded");
+  const std::lock_guard lock(impl_->mutex);
+  // Optional ABI9 extension from official miner 4167e409; older runtimes keep
+  // their existing segmented allocation. The caller validates order and bytes.
+  using Blob=std::size_t (*)(void*,void**);
+  const auto blob=symbol_optional<Blob>(impl_->library,"keryx_llama_canonical_blob");
+  if(!blob)return std::nullopt;
+  void *base=nullptr;const auto bytes=blob(impl_->model,&base);
+  if(!bytes || !base)return std::nullopt;
+  return CanonicalWeightBlob{reinterpret_cast<std::uintptr_t>(base),bytes};
+}
+
 std::vector<ResidentTensor> StockLlamaRuntime::resident_tensors() const {
   if (!impl_ || !impl_->model) throw std::logic_error("resident model is not loaded");
   const std::lock_guard lock(impl_->mutex);
@@ -422,7 +439,9 @@ std::string StockLlamaRuntime::answer(const Challenge &challenge) {
 std::string StockLlamaRuntime::infer(std::string_view prompt, std::uint32_t max_tokens) {
   if (!impl_ || !impl_->model || !impl_->generate) throw std::logic_error("inference runtime is not loaded");
   const std::lock_guard lock(impl_->mutex);
-  std::string sanitized = sanitize_nul_bytes(prompt);
+  std::string sanitized(prompt);
+  if(!impl_->generate_n&&prompt.find('\0')!=std::string_view::npos)
+    throw std::invalid_argument("NUL prompt requires a length-aware inference runtime");
   if (sanitized.empty() || max_tokens == 0 || max_tokens > 4096)
     throw std::invalid_argument("AiRequest prompt or max_tokens outside stock protocol bounds");
 
@@ -438,14 +457,15 @@ std::string StockLlamaRuntime::infer(std::string_view prompt, std::uint32_t max_
   impl_->scratch_active = true;
   if (impl_->trace) impl_->trace->ensure_full_context();
   std::vector<char> output(64 * 1024, '\0');
-  int length = impl_->generate(impl_->model, sanitized.c_str(), static_cast<int>(max_tokens), output.data(),
-                               static_cast<int>(output.size()));
+  const auto generate=[&]{return impl_->generate_n ?
+      impl_->generate_n(impl_->model,sanitized.data(),sanitized.size(),static_cast<int>(max_tokens),output.data(),static_cast<int>(output.size())) :
+      impl_->generate(impl_->model,sanitized.c_str(),static_cast<int>(max_tokens),output.data(),static_cast<int>(output.size()));};
+  int length=generate();
   if (length <= 0) {
     // Retry once with aggressive head_tail_cut if length indicates prompt too long
     if (auto cut = head_tail_cut(sanitized, budget > 256 ? budget / 2 : 256)) {
       sanitized = std::move(*cut);
-      length = impl_->generate(impl_->model, sanitized.c_str(), static_cast<int>(max_tokens), output.data(),
-                               static_cast<int>(output.size()));
+      length=generate();
     }
   }
   if (length <= 0 || static_cast<std::size_t>(length) > output.size())
@@ -578,8 +598,14 @@ void StockLlamaRuntime::pom_release_pad() {
 }
 
 std::pair<std::string,std::string> official_qwen35_trace_prompt(std::string_view user){
-  const std::string clean = sanitize_nul_bytes(user);
+  const std::string clean(user);
   if(clean.empty()) throw std::invalid_argument("Invalid trace prompt");
   return {"<|im_start|>system\nRequest id:","\n"+std::string(stock_system_prompt)+"<|im_end|>\n<|im_start|>user\n"+clean+"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"};
+}
+}
+
+namespace keryx::nexus::opoi {
+bool StockLlamaRuntime::supports_length_aware_tracing() const noexcept {
+  return impl_&&impl_->trace_api.generate_n;
 }
 }

@@ -94,7 +94,7 @@ std::string state_field(const ResponseJournalRecord &record) {
 
 std::optional<ResponseState> parse_state(std::string_view value) {
   for (int i = static_cast<int>(ResponseState::Discovered);
-       i <= static_cast<int>(ResponseState::ResponseReorged); ++i) {
+       i <= static_cast<int>(ResponseState::RequestClosed); ++i) {
     const auto candidate = static_cast<ResponseState>(i);
     if (value == response_state_name(candidate)) return candidate;
   }
@@ -104,11 +104,11 @@ std::optional<ResponseState> parse_state(std::string_view value) {
 bool terminal(ResponseState state) {
   return state == ResponseState::RpcAcknowledged || state == ResponseState::RpcRejected ||
          state == ResponseState::Finalized || state == ResponseState::Expired ||
-         state == ResponseState::Failed || state == ResponseState::NotAssigned;
+         state == ResponseState::Failed || state == ResponseState::NotAssigned || state == ResponseState::RequestClosed;
 }
 
 bool allowed_transition(ResponseState from, ResponseState to) {
-  if (to == ResponseState::Failed || to == ResponseState::Expired) return !terminal(from);
+  if (to == ResponseState::Failed || to == ResponseState::Expired || to == ResponseState::RequestClosed) return !terminal(from);
   switch (from) {
     case ResponseState::Discovered: return to == ResponseState::Assigned || to == ResponseState::NotAssigned;
     case ResponseState::Assigned: return to == ResponseState::RequestValidated;
@@ -123,6 +123,7 @@ bool allowed_transition(ResponseState from, ResponseState to) {
     case ResponseState::RpcAcknowledged: return to == ResponseState::ChainObserved || to == ResponseState::Finalized;
     case ResponseState::ChainObserved: return to == ResponseState::Finalized || to == ResponseState::ResponseReorged;
     case ResponseState::ResponseReorged: return to == ResponseState::ChainObserved;
+    case ResponseState::RequestClosed: return to == ResponseState::ChainObserved;
     case ResponseState::RpcRejected: case ResponseState::Finalized: case ResponseState::Expired:
     case ResponseState::Failed: case ResponseState::NotAssigned: return false;
   }
@@ -230,6 +231,7 @@ const char *response_state_name(ResponseState state) noexcept {
     case ResponseState::ChainObserved: return "CHAIN_OBSERVED"; case ResponseState::Finalized: return "FINALIZED";
     case ResponseState::Expired: return "EXPIRED"; case ResponseState::Failed: return "FAILED"; case ResponseState::NotAssigned: return "NOT_ASSIGNED";
     case ResponseState::ResponseReorged: return "RESPONSE_REORGED";
+    case ResponseState::RequestClosed: return "REQUEST_CLOSED";
   }
   return "UNKNOWN";
 }
@@ -485,8 +487,10 @@ bool AiResponseService::discover(const protowire::RpcTransaction &transaction,
       containing_daa >= mainnet_signed_response_activation_daa)
       .value_or(containing_daa + stock_response_window_daa);
 
+  bool first_observation=false;
   {
     std::lock_guard lock(discovered_mutex_);
+    first_observation=!discovered_requests_.contains(id);
     discovered_requests_[id] = DiscoveredRequestInfo{
         id, containing_daa, request->model_id, request->is_private,
         request->prompt_or_private_envelope, request->max_tokens, deadline};
@@ -510,9 +514,9 @@ bool AiResponseService::discover(const protowire::RpcTransaction &transaction,
       return false;
     }
     (void)journal_.transition(id, ResponseState::Assigned);
-    return true;
+    return first_observation;
   }
-  return true;
+  return first_observation;
 }
 
 ReconciliationResult AiResponseService::reconcile_discovered(
@@ -618,7 +622,8 @@ ReconciliationResult AiResponseService::reconcile_discovered(
 }
 
 std::size_t AiResponseService::reconcile_ambiguous(
-    const std::function<bool(std::string_view txid)> &known) {
+    const std::function<bool(std::string_view txid)> &known,
+    const std::function<AiRequestAdmission(std::string_view)> &admission) {
   if (!known) return 0;
   std::size_t reconciled = 0;
   for (const auto &record : journal_.unresolved()) {
@@ -629,6 +634,14 @@ std::size_t AiResponseService::reconcile_ambiguous(
       try { is_known = known(record.transaction_id); } catch (...) { is_known = false; }
       if (is_known && journal_.transition(record.request_id, ResponseState::RpcAcknowledged)) {
         ++reconciled;
+      } else if(!is_known && admission) {
+        // Canonical closure ends the duty, not the historical unknown delivery.
+        // Keep its txid and every prior journal entry; never fabricate an ACK.
+        try {
+          const auto status=admission(record.request_id);
+          if(status.state==AiRequestAdmission::State::Closed &&
+              journal_.transition(record.request_id,ResponseState::RequestClosed))++reconciled;
+        } catch(...) { /* unavailable evidence cannot clear recovery */ }
       }
     }
   }
@@ -746,6 +759,38 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
                                       config_.delegation_signature)) return ServeResult::Failed;
   if (parsed->model_id != config_.model_id) return ServeResult::NotAssigned;
   const auto id = parsed->stable_id;
+  auto expiry = deadline.value_or(parsed->observed_daa > UINT64_MAX - stock_response_window_daa
+      ? UINT64_MAX : parsed->observed_daa + stock_response_window_daa);
+  // With a canonical admission source, a legacy estimate cannot expire an H15 duty.
+  if(effects.request_admission)expiry=UINT64_MAX;
+  auto now_daa=[&] {
+    auto value=effects.current_daa?effects.current_daa():current_daa.value_or(daa);
+    return std::max(value,daa);
+  };
+  const auto refresh_admission=[&]() {
+    if(!effects.request_admission)return false;
+    const auto status=effects.request_admission(id);
+    if(status.state==AiRequestAdmission::State::Awaiting)
+      expiry=status.deadline_daa?status.deadline_daa:UINT64_MAX;
+    if(status.state!=AiRequestAdmission::State::Closed)return false;
+    (void)journal_.begin(id);
+    if(!journal_.transition(id,ResponseState::RequestClosed)) {
+      const auto old=journal_.get(id);
+      return old && old->state==ResponseState::RequestClosed;
+    }
+    return true;
+  };
+  if(const auto old=journal_.get(id)) {
+    if(old->state==ResponseState::RpcAcknowledged || old->state==ResponseState::ChainObserved || old->state==ResponseState::Finalized)
+      return ServeResult::Duplicate;
+    if(old->state==ResponseState::RequestClosed)return ServeResult::NotAwaited;
+    if(old->state==ResponseState::Expired)return ServeResult::Expired;
+    if((old->state==ResponseState::Submitting || old->state==ResponseState::UnknownAfterTimeout) &&
+        !old->transaction_id.empty() && effects.reconcile(old->transaction_id)) {
+      (void)journal_.transition(id,ResponseState::RpcAcknowledged);return ServeResult::Duplicate;
+    }
+  }
+  if(refresh_admission())return ServeResult::NotAwaited;
   const auto assignment = classify_assignment(*parsed, config_.service_identity,
       hex_encode(config_.escrow_pubkey.data(), config_.escrow_pubkey.size()), config_.tier, providers);
   if(config_.native_h15&&parsed->is_private&&effects.recover_traced){
@@ -754,6 +799,9 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
       if(old&&(old->state==ResponseState::RpcAcknowledged||old->state==ResponseState::ChainObserved||old->state==ResponseState::Finalized))return ServeResult::Duplicate;
       if(!journal_.recover_persisted_response(id,*saved))return ServeResult::Failed;
       if(effects.reconcile(*saved)){(void)journal_.transition(id,ResponseState::RpcAcknowledged);return ServeResult::Duplicate;}
+      if(!effects.request_admission && now_daa()>expiry) {
+        (void)journal_.transition(id,ResponseState::Expired);return ServeResult::Expired;
+      }
       return ServeResult::WaitingReconciliation;
     }
   }
@@ -766,6 +814,9 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
       if (effects.reconcile(old->transaction_id)) {
         (void)journal_.transition(id, ResponseState::RpcAcknowledged);
         return ServeResult::Duplicate;
+      }
+      if(!effects.request_admission && now_daa()>expiry) {
+        (void)journal_.transition(id,ResponseState::Expired);return ServeResult::Expired;
       }
       return ServeResult::WaitingReconciliation;
     }
@@ -795,12 +846,6 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
     (void)journal_.transition(id, ResponseState::Failed); return ServeResult::Failed;
   }
   if (effects.assigned) effects.assigned(id);
-  const auto expiry = deadline.value_or(parsed->observed_daa > UINT64_MAX - stock_response_window_daa
-      ? UINT64_MAX : parsed->observed_daa + stock_response_window_daa);
-  auto now_daa=[&] {
-    auto value=effects.current_daa?effects.current_daa():current_daa.value_or(daa);
-    return std::max(value,daa);
-  };
   if (now_daa() > expiry) { (void)journal_.transition(id, ResponseState::Expired); return ServeResult::Expired; }
   auto payload = decode_hex(tx.payload());
   if (!payload || !journal_.transition(id, ResponseState::RequestValidated)) {
@@ -820,9 +865,6 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
   std::string prompt;
   try {
     prompt = is_private ? prompt_from_private(prompt_bytes) : std::string(prompt_bytes.begin(), prompt_bytes.end());
-    if (prompt.find('\0') != std::string::npos) {
-      prompt.erase(std::remove(prompt.begin(), prompt.end(), '\0'), prompt.end());
-    }
   }
   catch (const std::exception &e) {
     if (effects.submission_diagnostic) effects.submission_diagnostic("", 0, std::string("prompt_exception: ") + e.what(), "");
@@ -921,6 +963,7 @@ ServeResult AiResponseService::serve(const protowire::RpcTransaction &tx, std::u
         " carries an inline body, but that is not a pending private request naming this responder";
     constexpr std::uint32_t max_attempts = 100;
     for (std::uint32_t attempt = 1; attempt <= max_attempts; ++attempt) {
+      if(refresh_admission())return ServeResult::NotAwaited;
       if (now_daa() > expiry) {
         (void)journal_.transition(id, ResponseState::Expired); return ServeResult::Expired;
       }
@@ -1109,6 +1152,51 @@ AiResponseEffects::SubmitResult AiResponseTransport::submit(
 bool ai_response_transaction_known(std::string_view endpoint,std::string_view txid) {
   return AiResponseTransport(endpoint).known(txid);
 }
+AiRequestAdmission AiResponseTransport::request_admission(std::string_view id,
+    std::string_view escrow,std::string_view identity) {
+  using State=AiRequestAdmission::State;
+  const auto valid=[](std::string_view x){return x.size()==64 && x.find_first_not_of("0123456789abcdef")==std::string_view::npos;};
+  if(!valid(id)||!valid(escrow)||!valid(identity))return {};
+  try {
+    const auto deadline=std::chrono::system_clock::now()+std::chrono::seconds(3);
+    if(!impl_->channel->WaitForConnected(deadline))return {};
+    auto stub=protowire::RPC::NewStub(impl_->channel);grpc::ClientContext context;context.set_deadline(deadline);
+    auto stream=stub->MessageStream(&context);if(!stream)return {};
+    auto close=[&](int*){stream->WritesDone();context.TryCancel();(void)stream->Finish();};
+    int marker{};std::unique_ptr<int,decltype(close)> cleanup(&marker,close);
+    protowire::KaspadRequest request;request.set_id(1);
+    request.mutable_getawaitedopeningsrequest()->set_escrowpubkey(std::string(escrow));
+    request.mutable_getawaitedopeningsrequest()->add_requesthashes(std::string(id));
+    protowire::KaspadResponse reply;
+    if(!stream->Write(request)||!stream->Read(&reply)||reply.id()!=1||!reply.has_getawaitedopeningsresponse())return {};
+    const auto &response=reply.getawaitedopeningsresponse();
+    if(response.has_error()||!response.requestschecked()||response.virtualdaascore()==0 ||
+        response.awaitedrequests_size()>1 || response.closedrequests_size()>1)return {};
+    AiRequestAdmission result{State::NotYetKnown,response.virtualdaascore(),0};
+    if(response.awaitedrequests_size()) {
+      const auto &row=response.awaitedrequests(0);
+      if(row.requesthash()!=id || response.closedrequests_size())return {};
+      return {State::Awaiting,result.virtual_daa,row.windowenddaa()};
+    }
+    if(response.closedrequests_size()) {
+      if(response.closedrequests(0)!=id)return {};
+      return {State::Closed,result.virtual_daa,0};
+    }
+    // Absence alone is not closure: DAG discovery can precede ledger admission.
+    // An identity/request-specific canonical missed-duty receipt is conclusive.
+    request.Clear();request.set_id(2);request.mutable_getservicestrikesrequest();reply.Clear();
+    if(!stream->Write(request)||!stream->Read(&reply)||reply.id()!=2||!reply.has_getservicestrikesresponse())return {};
+    const auto &strikes=reply.getservicestrikesresponse();
+    if(strikes.has_error()||strikes.pendingburns_size()>100000)return {};
+    result.virtual_daa=std::max(result.virtual_daa,strikes.virtualdaascore());
+    for(const auto &burn:strikes.pendingburns()) {
+      if(burn.miner()==identity && burn.requesthash()==id && burn.missdaascore()>0 &&
+          result.virtual_daa>=burn.missdaascore())return {State::Closed,result.virtual_daa,0};
+    }
+    return result;
+  } catch(...) {return {};}
+}
+
 bool AiResponseTransport::known(std::string_view txid) {
   if (txid.size()!=64 || !decode_hex(txid))return false;
   const auto &channel=impl_->channel;

@@ -40,6 +40,24 @@ pub fn place_chain_after(log: &mut Vec<ChainEntry>, start: Hash, added: &[Hash])
     Ok(missing)
 }
 
+/// Advance one attention phase from an accepted parent. A successfully queried,
+/// signer/seed-bound node ledger is authoritative for its next child; local
+/// acceptance DAA estimates can select a different draw block. Never jump a
+/// phase or accept a path unrelated to the parent. This plans work only: the
+/// complete native proof/signature and submission gates remain mandatory.
+pub fn attention_child_path(parent: &[u64], local_child: u64, weights: &[u16],
+                            node_path: Option<&[u64]>) -> Option<Vec<u64>> {
+    if parent.len() >= 16 || weights.is_empty() || weights.len() > 4096 || weights.contains(&0) {
+        return None;
+    }
+    let child = if let Some(path) = node_path {
+        if path.len() != parent.len()+1 || !path.starts_with(parent) { return None; }
+        *path.last()?
+    } else { local_child };
+    if child >= weights.len() as u64 { return None; }
+    let mut path=parent.to_vec();path.push(child);Some(path)
+}
+
 /// Transient restore failures keep obligations and retry with capped backoff.
 #[derive(Default)]
 pub struct ChainRestoreRetries { failures: BTreeMap<Hash,u32> }
@@ -130,6 +148,19 @@ pub fn retain_pending_trace(daa:u64,draw_deadline:u64,attention:Option<PendingAt
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_child_path_does_not_stall_on_local_draw_disagreement() {
+        use super::attention_child_path as path;
+        assert_eq!(path(&[],0,&[1,2],Some(&[1])),Some(vec![1]));
+        assert_eq!(path(&[1],0,&[1,2],Some(&[1,1])),Some(vec![1,1]));
+        assert_eq!(path(&[],0,&[1,2],None),Some(vec![0]));
+        assert_eq!(path(&[],0,&[1,2],Some(&[])),None);
+        assert_eq!(path(&[1],0,&[1,2],Some(&[0,1])),None);
+        assert_eq!(path(&[],0,&[1,2],Some(&[0,1])),None);
+        assert_eq!(path(&[],0,&[1,2],Some(&[2])),None);
+        assert_eq!(path(&[],0,&[1,0],Some(&[0])),None);
+    }
+
     use super::*;
     fn body(path:Vec<u64>,partials:usize)->Vec<u8> {
         keryx_verifiable_inference::opening::AttnOpening{path,partials:vec![7;partials],..Default::default()}.encode()

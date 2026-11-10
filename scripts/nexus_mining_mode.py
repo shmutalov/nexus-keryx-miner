@@ -144,30 +144,91 @@ def validate_pool_password(password: str) -> str:
     return password
 
 
+def pool_requirements(url: str) -> dict:
+    """Local policy catalogue; no entry grants access or operator approval."""
+    host = (parse_endpoint_parts(url).get("host") or "").lower()
+    if host in ("keryxpool.com", "s1.keryxpool.com"):
+        return {"pool": "keryxpool", "telemetry_required": True,
+                "escrow_approval_required": True, "escrow_approved": None,
+                "escrow_vendor": "NVIDIA", "announced_miner": "keryx-miner-supr/0.16.3",
+                "escrow_miner_percent": 70, "escrow_pool_percent": 30,
+                "escrow_release_hours": 22,
+                "escrow_note": "Operator approval must explicitly cover Nexus; telemetry alone does not grant access"}
+    if host == "krx.suprnova.cc" or host.endswith(".suprnova.cc"):
+        return {"pool": "suprnova", "telemetry_required": False,
+                "escrow_approval_required": None, "escrow_approved": None,
+                "announced_miner": "keryx-miner-supr/0.16.3",
+                "nul_prompt_support_required": True,
+                "escrow_note": "Pool payout policy; Nexus qualification is separate from the connection test"}
+    return {"pool": "custom", "telemetry_required": False,
+            "escrow_approval_required": None, "escrow_approved": None,
+            "escrow_note": "Pool escrow policy unknown"}
+
+
 def test_connection(url: str, timeout: float = 3.0) -> dict:
+    """Bounded subscribe/hello probe; never authorize, declare models or submit."""
     url = (url or "").strip()
     if not url:
         return {"ok": False, "ping_ms": 0.0, "error": "URL not configured"}
+    result = {"ok": False, "ping_ms": 0.0, "error": None,
+              "scope": "subscribe_hello_only", "authorization_tested": False,
+              "mining_validated": False, "escrow_approved": None}
     try:
         parts = parse_endpoint_parts(url)
         if not parts["host"] or not parts["port"]:
-            return {"ok": False, "ping_ms": 0.0, "error": "Invalid host or port"}
-        t0 = time.perf_counter()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((parts["host"], parts["port"]))
-        if parts["tls"]:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            ss = ctx.wrap_socket(sock, server_hostname=parts["host"])
-            ss.close()
-        else:
-            sock.close()
-        ping_ms = round((time.perf_counter() - t0) * 1000.0, 1)
-        return {"ok": True, "ping_ms": ping_ms, "error": None}
+            raise ValueError("Invalid host or port")
+        timeout = max(.1, min(float(timeout), 10.0))
+        started = time.monotonic()
+        deadline = started + timeout
+        with socket.create_connection((parts["host"], parts["port"]), timeout=timeout) as raw:
+            # Same authentication policy as the native worker; no TLS downgrade.
+            conn = ssl.create_default_context().wrap_socket(raw, server_hostname=parts["host"]) if parts["tls"] else raw
+            with conn:
+                result["ping_ms"] = round((time.monotonic() - started) * 1000, 1)
+                pending = bytearray()
+                def call(request):
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Pool protocol probe timed out")
+                    conn.settimeout(max(.001, deadline-time.monotonic()))
+                    conn.sendall((json.dumps(request, separators=(",", ":"))+"\n").encode())
+                    for _ in range(128):
+                        while b"\n" not in pending:
+                            if time.monotonic() >= deadline:
+                                raise TimeoutError("Pool protocol probe timed out")
+                            conn.settimeout(max(.001, deadline-time.monotonic()))
+                            data = conn.recv(8192)
+                            if not data:
+                                raise ConnectionError("Pool closed protocol probe")
+                            pending.extend(data)
+                            if len(pending) > 1_000_000:
+                                raise ValueError("Pool probe frame limit")
+                        line, _, tail = pending.partition(b"\n")
+                        pending[:] = tail
+                        reply = json.loads(line)
+                        if isinstance(reply, dict) and type(reply.get("id")) is int and reply["id"] == request["id"]:
+                            return reply
+                    raise ValueError("Pool probe notification limit")
+                sub = call({"id": 1, "method": "mining.subscribe",
+                            "params": ["nexus-keryx-miner/0.0.5-dev", "keryx-stratum-v3"]})
+                result["stratum_accepted"] = sub.get("error") is None and isinstance(sub.get("result"), list)
+                if not result["stratum_accepted"]:
+                    raise ValueError("Pool rejected Nexus subscription")
+                hello = {"v": 1, "miner": {"name": "nexus-keryx-miner", "version": "0.0.5-dev",
+                         "build": "protocol-probe", "features": []}, "trace": 0, "model": {"loaded": False}}
+                response = call({"id": 2, "method": "mining.hello", "params": [hello]})
+                supported = response.get("error") is None and response.get("result") is True
+                result["telemetry_supported"] = supported
+                result["requirements"] = pool_requirements(url)
+                result["telemetry_required"] = result["requirements"]["telemetry_required"]
+                result["ok"] = supported or not result["telemetry_required"]
+                if not supported:
+                    result["error"] = "Pool telemetry extension rejected" if result["telemetry_required"] else None
+                    result["notice"] = "Telemetry not accepted; mining authorization and escrow access remain untested"
+                else:
+                    result["notice"] = "Nexus subscribe/hello accepted; share acceptance and escrow approval are not tested"
     except Exception as exc:
-        return {"ok": False, "ping_ms": 0.0, "error": str(exc)}
+        result.update(ok=False, error=str(exc))
+    return result
 
 
 def load() -> dict:
@@ -397,6 +458,7 @@ def public_view() -> dict:
             "configured": p.get("configured", False),
             "note": p.get("note", ""),
             "active": (p["id"] == active_id),
+            "requirements": pool_requirements(p["url"]),
         }
         public_pools.append(pub)
         if p["id"] != active_id and p.get("configured") and p.get("url"):
@@ -415,6 +477,7 @@ def public_view() -> dict:
             "priority": active_pool["priority"],
             "configured": active_pool["configured"],
             "note": active_pool.get("note", ""),
+            "requirements": pool_requirements(active_pool["url"]),
         } if active_pool else {},
         "pools": public_pools,
         "backup_urls": backups,

@@ -47,7 +47,8 @@ inline bool ai_journal_selected_response_verified(const ai::ResponseJournalRecor
        record.state != ai::ResponseState::UnknownAfterTimeout &&
        record.state != ai::ResponseState::Submitting &&
        record.state != ai::ResponseState::ChainObserved &&
-       record.state != ai::ResponseState::ResponseReorged) ||
+       record.state != ai::ResponseState::ResponseReorged &&
+       record.state != ai::ResponseState::RequestClosed) ||
       tx.subnetworkid() != "0400000000000000000000000000000000000000" ||
       tx.payload().size() > 1024 * 1024)
     return false;

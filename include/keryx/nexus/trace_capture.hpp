@@ -51,6 +51,9 @@ struct TraceApi {
   int (*seq_roots)(void *,std::uint8_t *,std::size_t,std::uint32_t *){};
   int (*seq_replay)(void *,const std::int32_t *,int,int,const std::uint32_t *,const std::uint64_t *,const std::uint64_t *,
                     std::uint32_t,std::uint32_t,std::uint8_t *,std::size_t,std::uint64_t *,std::uint8_t *,std::size_t,std::uint32_t *){};
+  int (*generate_n)(void *,const char *,std::size_t,const std::int32_t *,int,int,
+      const char *,std::size_t,int,char *,int,std::int32_t *,int,int *,int *,int,int){};
+
 };
 class TraceCapture final {
 public:
@@ -67,6 +70,7 @@ public:
   std::uint32_t configure_sequence(std::span<const SequenceLayer> layers,std::uint32_t n_attn,
       std::uint32_t n_recur,std::uint32_t heads,std::uint32_t interval);
   std::vector<SequenceCapture> replay_sequence(const TracedGeneration &,std::span<const SequenceSpan>,std::uint32_t max_chunks);
+  bool length_aware() const noexcept { return api_.generate_n != nullptr; }
   void use_task_context();
   void ensure_full_context();
 private:

@@ -1,4 +1,5 @@
 #include "keryx/nexus/h15_audit_client.hpp"
+#include "keryx/nexus/h15_chain_restore.hpp"
 #include "keryx/nexus/h15_bridge.h"
 #include "keryx/nexus/trace_manifest_bridge.h"
 #include "messages.grpc.pb.h"
@@ -117,20 +118,15 @@ struct H15AuditClient::Impl {
   Hash anchor{};
   std::chrono::steady_clock::time_point next_poll{};
   unsigned poll_failures{};
+  H15PollAdmission poll_admission;
   std::chrono::steady_clock::time_point next_health{};
   std::optional<bool> awaited_supported;
   bool awaited_probed{};
   std::chrono::steady_clock::time_point next_awaited{};
   std::uint32_t next_prompt{}, next_tokens{};
 
-  struct ChainPage {
-    Hash start;
-    std::uint64_t daa;
-    protowire::GetVirtualChainFromBlockResponseMessage page;
-    int at{};
-    int accepted_cursor{};
-  };
-  std::optional<ChainPage> pending_page;
+  H15ChainRefresh chain_refresh;
+  std::optional<H15ChainRestorePage> pending_page;
   std::optional<std::uint64_t> cached_tile_index;
   std::array<std::uint8_t, 1024> cached_tile_bytes{};
   bool cached_tile_tree_ready{};
@@ -174,8 +170,7 @@ struct H15AuditClient::Impl {
                   std::chrono::steady_clock::duration(std::chrono::seconds(8)),
                   *rpc_budget - std::chrono::steady_clock::now())
             : std::chrono::steady_clock::duration(std::chrono::seconds(8));
-    need(remaining > std::chrono::steady_clock::duration::zero(),
-         "Audit polling budget exhausted");
+    if(remaining<=std::chrono::steady_clock::duration::zero())throw H15PollBudgetExhausted();
     // MSVC's system clock uses 100 ns ticks; gRPC accepts its exact time_point.
     const auto deadline = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
         std::chrono::system_clock::now() + remaining);
@@ -197,14 +192,13 @@ struct H15AuditClient::Impl {
     }
     ctx.TryCancel();
     (void)stream->Finish();
+    if(!got && rpc_budget && std::chrono::steady_clock::now()>=*rpc_budget)throw H15PollBudgetExhausted();
     need(got, "Audit RPC response timeout");
     return response;
   }
   void poll_awaited() {
     const auto now = std::chrono::steady_clock::now();
-    if (now < next_awaited)
-      return;
-    next_awaited = now + std::chrono::seconds(10);
+    h15_success_throttled_poll(next_awaited,now,[&] {
     if (!awaited_supported) {
       protowire::KaspadRequest req;
       req.mutable_getinforequest();
@@ -285,6 +279,7 @@ struct H15AuditClient::Impl {
     awaited_probed = true;
     std::cout << "H15_NODE_LEDGER reconciled=" << response.openings_size()
               << " queried=" << queried.size() << "\n";
+    });
   }
   protowire::RpcBlock get_block(const Hash &h, bool selected = true) {
     protowire::KaspadRequest req;
@@ -296,9 +291,10 @@ struct H15AuditClient::Impl {
          "Audit GetBlock failed");
     auto b = r.getblockresponse().block();
     need(b.has_header() && b.has_verbosedata() &&
-             (!selected || b.verbosedata().ischainblock()) &&
              unhex(b.verbosedata().hash()) == h,
          "Audit header is not selected chain");
+    if (selected && !b.verbosedata().ischainblock())
+      throw H15ChainChanged();
     return b;
   }
   Hash sink() {
@@ -386,8 +382,11 @@ struct H15AuditClient::Impl {
                out && n,
            "Audit replay bounds");
       need(bool(p.with_gpu), "Audit replay requires exclusive GPU owner");
+      const auto replay_started=std::chrono::steady_clock::now();
+      auto acquired=replay_started,configured=replay_started,replayed=replay_started;
       std::vector<std::uint8_t> b;
       p.with_gpu([&] {
+        acquired=std::chrono::steady_clock::now();
         struct ScratchRelease {
           opoi::StockLlamaRuntime &rt;
           ~ScratchRelease() noexcept {
@@ -395,6 +394,7 @@ struct H15AuditClient::Impl {
           }
         } scratch_release{p.runtime};
         p.configure();
+        configured=std::chrono::steady_clock::now();
         opoi::TracedGeneration g;
         g.tokens.assign(raw->tokens, raw->tokens + raw->positions);
         g.ubatch.assign(raw->ubatch, raw->ubatch + raw->positions);
@@ -431,7 +431,15 @@ struct H15AuditClient::Impl {
           }
         } else
           throw std::runtime_error("Unknown audit replay kind");
+        replayed=std::chrono::steady_clock::now();
       });
+      const auto finished=std::chrono::steady_clock::now();
+      const auto ms=[](auto a,auto b){return std::chrono::duration<double,std::milli>(b-a).count();};
+      std::cout<<"{\"event\":\"H15_REPLAY_PROFILE\",\"schema_version\":1,\"kind\":"<<kind
+        <<",\"plans\":"<<count<<",\"positions\":"<<raw->positions
+        <<",\"owner_wait_ms\":"<<ms(replay_started,acquired)<<",\"configure_ms\":"<<ms(acquired,configured)
+        <<",\"replay_pack_ms\":"<<ms(configured,replayed)<<",\"release_ms\":"<<ms(replayed,finished)
+        <<",\"total_ms\":"<<ms(replay_started,finished)<<"}\n"<<std::flush;
       need(b.size() <= cap, "Audit replay memory bound");
       std::memcpy(out, b.data(), b.size());
       *n = b.size();
@@ -468,7 +476,9 @@ H15AuditClient::H15AuditClient(opoi::StockLlamaRuntime &r,
            reinterpret_cast<const std::uint8_t *>(path.data()), path.size(),
            secret.data(), 0, &p.api, model_id.data(), &p.service) == 0,
        "H15 audit recovery blocked; original records preserved");
-  p.anchor = p.sink();
+  // Unsigned pool capture/replay has no local selected-chain authority.
+  // SOLO keeps its mandatory node anchor; offline adapters perform no RPC.
+  if(!offline_diagnostics)p.anchor = p.sink();
 }
 H15AuditClient::~H15AuditClient() = default;
 void H15AuditClient::set_gpu_owner(
@@ -477,7 +487,7 @@ void H15AuditClient::set_gpu_owner(
 }
 bool H15AuditClient::restoring() const {
   std::lock_guard lock(impl_->mutex);
-  return impl_->poll_failures ||
+  return impl_->poll_admission.blocked() || impl_->poll_failures ||
          nexus_h15_service_restoring(impl_->service) != 0;
 }
 std::array<std::uint32_t, 2>
@@ -503,6 +513,29 @@ std::array<std::uint32_t, 4> H15AuditClient::verify_lifecycle() {
 }
 bool H15AuditClient::ready() const noexcept {
   return impl_ && impl_->service && impl_->runtime.abi_version() == 9;
+}
+std::vector<std::uint8_t> H15AuditClient::export_pool_capture() {
+  auto &p=*impl_;std::lock_guard lock(p.mutex);Buffer out;
+  need(p.capture&&nexus_h15_encode_capture(p.capture,&out.b)==0,"Pool capture encoding failed");
+  need(out.b.length<=64U<<20,"Pool capture storage bound exceeded");
+  return buffer_bytes(out.b);
+}
+std::vector<std::uint8_t> H15AuditClient::open_pool_capture(std::span<const std::uint8_t> bytes,
+    const Hash &request,const Hash &response,const Hash &seed,
+    std::span<const std::uint64_t> path,std::span<const std::uint8_t> previous) {
+  auto &p=*impl_;std::lock_guard lock(p.mutex);
+  // Borsh Capture starts with tier then the exact request hash. Never replay a
+  // persisted capture for a different request, even if its file was misbound.
+  need(bytes.size()>=33&&bytes[0]==0&&std::equal(request.begin(),request.end(),bytes.begin()+1),
+       "Pool capture request binding mismatch");
+  struct CaptureOwner {void *ptr{};~CaptureOwner(){if(ptr)nexus_h15_capture_free(ptr);}} capture;
+  need(nexus_h15_decode_capture(bytes.data(),bytes.size(),&capture.ptr)==0,"Pool capture decoding failed");
+  Buffer out;
+  need(nexus_h15_open(capture.ptr,&p.api,seed.data(),response.data(),path.data(),path.size(),
+       previous.data(),previous.size(),&out.b)==0,"Pool opening replay/verification failed");
+  auto pieces=unbundle(std::span(out.b.data,out.b.length));
+  if(!path.empty()){need(pieces.size()==1,"Pool attention phase cardinality mismatch");return std::move(pieces[0]);}
+  return buffer_bytes(out.b);
 }
 AiTracedAnswer H15AuditClient::infer(std::string_view prompt,
                                      std::uint32_t max_tokens,
@@ -611,6 +644,7 @@ void H15AuditClient::poll() {
   if (std::chrono::steady_clock::now() < p.next_poll)
     return;
   p.rpc_budget = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  auto cycle=p.poll_admission.begin();
   try {
     if (!p.pending_page) {
       Buffer anchors;
@@ -621,6 +655,7 @@ void H15AuditClient::poll() {
         p.anchor = p.sink();
         p.poll_awaited();
         p.poll_failures = 0;
+        cycle.complete();
         p.rpc_budget.reset();
         p.next_poll =
             std::chrono::steady_clock::now() + std::chrono::seconds(1);
@@ -642,81 +677,44 @@ void H15AuditClient::poll() {
       need(page.addedchainblockhashes_size() <= 10000 &&
                page.removedchainblockhashes_size() <= 72000,
            "H15 chain page bounds");
-      p.pending_page = Impl::ChainPage{start, start_block.header().daascore(),
-                                       std::move(page)};
+      p.pending_page.emplace(start,start_block.header().daascore(),std::move(page));
     }
-    auto &work = *p.pending_page;
-    const auto &page = work.page;
-    const int end = std::min(work.at + 8, page.addedchainblockhashes_size());
-    std::vector<std::uint8_t> b;
-    hash(b, work.start);
-    put(b, work.daa, 8);
-    put(b, 0, 4);
-    put(b,
-        static_cast<std::uint64_t>(
-            work.at == 0 ? page.removedchainblockhashes_size() : 0),
-        4);
-    if (work.at == 0)
-      for (const auto &h : page.removedchainblockhashes())
-        hash(b, unhex(h));
-    put(b, static_cast<std::uint64_t>(end - work.at), 4);
-    Hash last = work.start;
-    auto last_daa = work.daa;
-    for (int i = work.at; i < end; ++i) {
-      const auto &h = page.addedchainblockhashes(i);
-      const auto raw_hash = unhex(h);
-      const auto block = p.get_block(raw_hash);
-      hash(b, raw_hash);
-      put(b, block.header().daascore(), 8);
-      const protowire::RpcAcceptedTransactionIds *accepted = nullptr;
-      const int accepted_total = page.acceptedtransactionids_size();
-      if (work.accepted_cursor < accepted_total &&
-          page.acceptedtransactionids(work.accepted_cursor).acceptingblockhash() == h) {
-        accepted = &page.acceptedtransactionids(work.accepted_cursor++);
-      } else {
-        for (int idx = 0; idx < accepted_total; ++idx) {
-          const auto &ids = page.acceptedtransactionids(idx);
-          if (ids.acceptingblockhash() == h) {
-            accepted = &ids;
-            work.accepted_cursor = idx + 1;
-            break;
-          }
-        }
-      }
-      need(!accepted || accepted->acceptedtransactionids_size() <= 50000,
-           "H15 accepted transaction bounds");
-      put(b,
-          static_cast<std::uint64_t>(
-              accepted ? accepted->acceptedtransactionids_size() : 0),
-          4);
-      if (accepted)
-        for (const auto &id : accepted->acceptedtransactionids())
-          hash(b, unhex(id));
-      last = raw_hash;
-      last_daa = block.header().daascore();
-    }
-    const bool consumed = end == page.addedchainblockhashes_size();
-    put(b, consumed && page.addedchainblockhashes_size() < 100, 1);
-    need(nexus_h15_service_chain(p.service, b.data(), b.size()) == 0,
-         "H15 canonical restore reconciliation failed");
-    p.anchor = last;
-    work.start = last;
-    work.daa = last_daa;
-    work.at = end;
+    auto &work=*p.pending_page;
+    const int completed=work.advance([&](const Hash &h){return p.get_block(h);},
+        [&](std::span<const std::uint8_t> frame){
+          need(nexus_h15_service_chain(p.service,frame.data(),frame.size())==0,
+               "H15 canonical restore reconciliation failed");
+        },[&]{return std::chrono::steady_clock::now()<*p.rpc_budget;});
+    const bool consumed=work.consumed();p.anchor=work.anchor();
+    if(!consumed)std::cout<<"H15_RESTORE=PROGRESS blocks="<<completed
+                         <<" committed="<<work.committed_blocks()<<" coverage=INCOMPLETE\n"<<std::flush;
     if (consumed)
       p.pending_page.reset();
     if (consumed)
       p.poll_awaited();
+    if(consumed){cycle.complete();p.chain_refresh.complete();}
     p.poll_failures = 0;
     p.next_poll = std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(consumed ? 1000 : 20);
-  } catch (...) {
+  } catch (const H15ChainChanged &) {
+    p.pending_page.reset();
+    const auto delay=p.chain_refresh.retry();
+    p.next_poll=std::chrono::steady_clock::now()+delay;
+    std::cout<<"H15_RESTORE=REFRESH reason=SELECTED_CHAIN_CHANGED retry_ms="
+             <<delay.count()<<" obligations=PRESERVED replay=BLOCKED\n"<<std::flush;
+  } catch (const H15PollBudgetExhausted &) {
+    // Retain the page and native committed prefix. Yield to requests and resume
+    // promptly; a local scheduling budget must not cause 5-60 s failure backoff.
+    p.next_poll=std::chrono::steady_clock::now()+std::chrono::milliseconds(20);
+    std::cout<<"H15_RESTORE=YIELD reason=POLL_BUDGET obligations=PRESERVED\n"<<std::flush;
+  } catch (const std::exception &error) {
     p.pending_page.reset();
     p.poll_failures = std::min(p.poll_failures + 1, 5U);
     p.next_poll =
         std::chrono::steady_clock::now() +
         std::chrono::seconds(std::min(60U, 5U << (p.poll_failures - 1)));
-    std::cout << "H15_RESTORE=RETRY obligations=PRESERVED gpu=NOT_USED\n";
+    std::cout << "H15_RESTORE=RETRY obligations=PRESERVED gpu=NOT_USED detail="
+              << error.what() << "\n" << std::flush;
   }
   p.rpc_budget.reset();
 }
@@ -732,7 +730,7 @@ void H15AuditClient::advance(std::uint64_t daa,
                              std::optional<std::uint64_t> next) {
   auto &p = *impl_;
   std::lock_guard lock(p.mutex);
-  if (p.poll_failures || p.pending_page)
+  if (p.poll_admission.blocked() || p.poll_failures || p.pending_page)
     return; // Hold draws behind incomplete canonical coverage.
   if (next)
     need(nexus_h15_service_next_span(p.service, p.next_prompt, p.next_tokens) ==
@@ -795,7 +793,7 @@ void H15AuditClient::report_exit_health(std::uint64_t daa) {
 void H15AuditClient::submit_due(std::uint64_t daa, bool authorized) {
   auto &p = *impl_;
   std::lock_guard lock(p.mutex);
-  if (!authorized || p.poll_failures || p.pending_page)
+  if (!authorized || p.poll_admission.blocked() || p.poll_failures || p.pending_page)
     return;
   const auto ms = static_cast<std::uint64_t>(std::max<std::int64_t>(
       0, std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -871,6 +869,7 @@ H15AuditClient::H15ObligationStatus H15AuditClient::check_obligations(std::uint6
   if (p.poll_failures > 0) {
     return {false, "H15_RPC_POLL_FAILURES_DETECTED: " + std::to_string(p.poll_failures)};
   }
+  if(p.poll_admission.blocked())return {false,"H15_CANONICAL_POLL_PENDING"};
   if (p.pending_page.has_value()) {
     return {false, "H15_CANONICAL_PAGE_PENDING"};
   }

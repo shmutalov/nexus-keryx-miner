@@ -4,20 +4,20 @@
 
 Nexus brings Keryx mining, AI service status, wallet authorization, escrow monitoring and GPU telemetry into a unified desktop application and cross-platform native CLI. The mining engine is primarily C++20 with CUDA and Vulkan support; Rust components handle independent verification and signing-related work, while Python provides local control and presentation services. The desktop is built with Tauri 2.
 
-> **Project status — 0.0.5 beta.** Linux x86-64 (Ubuntu 24.04 baseline) and **native Windows x64 CUDA CLI** (MSVC, no WSL required) are fully integrated with automated CI/CD builds and releases. Release v0.0.5 introduces **Dual Independent Multi-GPU architecture** (NVIDIA CUDA SM 8.6, 8.9, 12.0 + AMD Vulkan 1.3 / BDA / Polaris & RDNA3), **Hardfork 16 (H16) consensus readiness**, **Stratum v4 multipool failover engine** with upstream v0.6.0 verifiable inference and cryptographic audit openings (`mining.ai_draw` and `mining.ai_opening`), and standard **2-decimal power efficiency telemetry** (`kH/W`, `MH/W`, `H/W`). Models, Merkle trees, keys and private installation state remain external inputs.
+> **Project status — experimental 0.0.5 source.** Native Linux and Windows CLI build workflows are available. CUDA/Vulkan execution, H16 parameters, multipool transport and AI components are implemented to different validation levels. Pool AI draw/opening interoperability, restart recovery and sustained hardware performance require additional acceptance tests; do not treat protocol names or successful compilation as certification. Models, trees, keys and installation state remain external inputs. See the [validation scope](docs/validation-scope.md).
 
 ![Nexus desktop overview](docs/screenshots/hero-overview.png)
 
 *The screenshots below are from a local development installation. Wallet identifiers, key paths, key identifiers, balances and identifying session details have been obscured. Values visible in the screenshots are illustrative observations from that installation, not reproducible benchmarks or claims of general hardware support.*
 
-See the [0.0.5 release notes](docs/release-0.0.5.md) (and previous [0.0.4 notes](docs/release-0.0.4.md)) for the complete changelog covering Dual GPU independence, H16 readiness, Stratum v4 multipool inference/audits, 2-decimal efficiency and desktop UI parity.
+See the [0.0.5 release notes](docs/release-0.0.5.md) (and previous [0.0.4 notes](docs/release-0.0.4.md)) for changes and validation limits. The current [validation scope](docs/validation-scope.md) takes precedence over those notes for assurance claims.
 
 ## What Nexus does
 
-- **Dual Independent Multi-GPU architecture:** simultaneous, independent mining and inference on NVIDIA GPUs (CUDA SM 8.6, 8.9, 12.0) and AMD GPUs (Vulkan 1.3 / BDA / Polaris & RDNA3), with zero cross-inference interference and dynamic single/dual device toggling.
-- **Hardfork 16 (H16) ready:** pre-configured DAA `147_000_000` consensus activation, dynamic context pad reduction (-204,800 tiles/tier), and adaptive context sizing with VRAM safety headroom preventing Out-Of-Memory exceptions on 8 GB cards.
-- **Stratum v4 Multipool engine:** robust multi-pool support with automatic failover (Suprnova, KeryxPool, and custom endpoints) and 100% standalone pool operation without requiring local nodes or Kubo IPFS.
-- **Stratum Verifiable Inference & Audit Openings:** upstream protocol v0.6.0 compliance (`mining.ai_request`, `mining.ai_response` with trace commitments, `mining.ai_draw` 7-param relay, and `mining.ai_opening` proof generation across `PIECE_TRACE | PIECE_ATTN | PIECE_RECUR | PIECE_RESID`).
+- **GPU lanes:** separate NVIDIA CUDA and AMD Vulkan workers with device controls. They share host, thermal and power resources; hardware admission and validation are device specific.
+- **H16 parameters:** DAA-dependent pad sizing is implemented. VRAM admission can reject workloads; it does not guarantee freedom from memory exhaustion.
+- **Stratum multipool transport:** direct pool connections and failover are implemented. A durable receipt journal suppresses uncertain resends; live alias/failover reconciliation remains separate.
+- **Pool AI integration:** native NVIDIA H15 traced responses and durable openings are exercised with a real GPU against a pool simulator, including worker restart. Public pool escrow approval and acceptance remain separate. See the [method matrix](docs/validation-scope.md).
 - **Standard 2-decimal Power Efficiency:** real-time telemetric reporting of individual GPU and rig-wide power draw and efficiency (`kH/W`, `MH/W`, `H/W`) aligned with upstream standards.
 - **Native Cross-Platform CLI:** automated GitHub Actions matrix compiling native Linux x86-64 and Windows x64 (MSVC) binaries, Rust verifier, and matching inference runtime without WSL dependencies.
 - **Desktop UI v0.0.5 parity (100% English):** clean, English interface with responsive 4-column tables for Single GPU, Dual GPU, and Rig Fleet views with unblocked vertical scrolling (`overflow-y: auto !important`).
@@ -38,13 +38,13 @@ See the [0.0.5 release notes](docs/release-0.0.5.md) (and previous [0.0.4 notes]
 
 ## Mining Workflows: Stratum Pool vs Solo Node
 
-Nexus supports two distinct, production-ready operational workflows:
+Nexus implements two experimental operational workflows:
 
 1. **Standalone Stratum v4 Pool Mining (Zero Node / Zero IPFS):**
    - Connects directly to community stratum pools such as **Suprnova** (`stratum+tcp://...`) or **KeryxPool**.
-   - Operates in 100% standalone mode without needing a local `keryxd` node, RocksDB chain data, or local Kubo IPFS daemon.
+   - Operates directly in pool mode without needing a local `keryxd` node, RocksDB chain data, or local Kubo IPFS daemon.
    - Built-in multi-pool failover: automatically re-subscribes, negotiates extranonce/target difficulty, and redirects work if a primary pool becomes unreachable.
-   - Full upstream v0.6.0 support for verifiable AI inference tasks and audit proof generation (`mining.ai_draw` and `mining.ai_opening`).
+   - Pool AI draw/opening interoperability and durable reconnect recovery require further implementation and acceptance tests.
 
 2. **Decentralized Solo Mining (Local Node & gRPC):**
    - Connects directly to a local or remote `keryxd` node via gRPC (`127.0.0.1:22110`).

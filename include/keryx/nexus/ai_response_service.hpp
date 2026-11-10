@@ -23,7 +23,7 @@ enum class ResponseState {
   Discovered, Assigned, RequestValidated, Inferencing, ResponsePrepared,
   ResponseSigned, ResponsePublished, TransactionPrepared, Submitting,
   RpcAcknowledged, RpcRejected, UnknownAfterTimeout, ChainObserved,
-  Finalized, Expired, Failed, NotAssigned, ResponseReorged
+  Finalized, Expired, Failed, NotAssigned, ResponseReorged, RequestClosed
 };
 
 const char *response_state_name(ResponseState state) noexcept;
@@ -87,6 +87,12 @@ struct AiTracedAnswer {
  std::array<std::uint8_t,73> commitment{};
 };
 
+struct AiRequestAdmission {
+  // Missing/not-yet-indexed is distinct from an explicit closed/missed duty.
+  enum class State { Unavailable, NotYetKnown, Awaiting, Closed } state{State::Unavailable};
+  std::uint64_t virtual_daa{}, deadline_daa{};
+};
+
 struct AiResponseEffects {
   // These functions are injected by production adapters or isolated protocol mocks.
   std::function<void(std::string_view request_id)> assigned;
@@ -106,6 +112,7 @@ struct AiResponseEffects {
   std::function<SubmitResult(const protowire::RpcTransaction &, std::string_view txid)> submit;
   std::function<bool(std::string_view txid)> reconcile;
   std::function<std::uint64_t()> current_daa;
+  std::function<AiRequestAdmission(std::string_view request_id)> request_admission;
   // Return false to cancel. Production waits cooperatively; fixtures inject a clock.
   // Never retry an unknown transport outcome or regenerate a signed response.
   std::function<bool(std::uint32_t milliseconds)> wait_before_retry;
@@ -129,7 +136,7 @@ struct AiResponseConfig {
   std::filesystem::path journal_path;
 };
 
-enum class ServeResult { Submitted, Duplicate, NotAssigned, Expired, WaitingReconciliation, Failed };
+enum class ServeResult { Submitted, Duplicate, NotAssigned, Expired, WaitingReconciliation, Failed, NotAwaited };
 
 struct DiscoveredRequestInfo {
   std::string request_id;
@@ -171,7 +178,8 @@ public:
       std::uint64_t current_daa,
       bool providers_available,
       const std::function<bool(std::string_view request_id)> &has_audit_obligation = {});
-  std::size_t reconcile_ambiguous(const std::function<bool(std::string_view txid)> &known);
+  std::size_t reconcile_ambiguous(const std::function<bool(std::string_view txid)> &known,
+      const std::function<AiRequestAdmission(std::string_view)> &admission = {});
   std::optional<DiscoveredRequestInfo> get_discovered_info(std::string_view request_id) const;
   ServeResult serve(const protowire::RpcTransaction &transaction,
                     std::uint64_t containing_daa,
@@ -246,6 +254,8 @@ public:
   AiResponseTransport& operator=(const AiResponseTransport&)=delete;
   AiResponseEffects::SubmitResult submit(const protowire::RpcTransaction &, std::string_view expected_txid);
   bool known(std::string_view txid);
+  AiRequestAdmission request_admission(std::string_view request_id,
+      std::string_view escrow_pubkey, std::string_view service_identity);
 private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

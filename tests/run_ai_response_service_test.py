@@ -47,7 +47,7 @@ if '--pom-cuda' in extra:
     proof_dir.mkdir()
     extra[pom_index + 6] = str(proof_dir)
 model = 'bd34568cd89f5f19c6c3a6e1a61b929bc868709409eaad8e672d85f3c1eb5710'
-for kind, name in [('public', 'public.req'), ('private', 'private.req')]:
+for kind, name in [('public', 'public.req'), ('private', 'private.req'), ('private-nul', 'private-nul.req')]:
     generator = ([str(fixture_tool)] if fixture_tool else
                  [cargo, 'run', '--quiet', '--release', '--locked', '--manifest-path', manifest,
                   '--bin', 'fixture', '--'])
