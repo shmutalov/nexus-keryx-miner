@@ -4,6 +4,8 @@ Nexus v0.0.5 — experimental native CLI refresh for Windows x64 and Linux x86-6
 This refresh adds length-aware NUL-safe prompt handling, native NVIDIA tier-0
 pool AI response/opening recovery, truthful pool telemetry, escrow claim
 reconciliation, durable submission journals and authenticated TLS checks.
+Suprnova login has an explicit H16 compatibility token with the Nexus identity;
+authorization rejections retain the pool error instead of showing ready work.
 
 Packages include the NVIDIA worker, independent verifier, explicitly selected
 ABI9 inference runtime, CUDA redistributables, licenses, exact source and

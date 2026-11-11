@@ -1086,6 +1086,7 @@ int main(int argc,char **argv) {
       scfg.password = pool_password;
       scfg.submission_journal=developer_data_root()/"state"/"submissions"/"pool-shares.journal";
       scfg.user_agent = stratum::nexus_pool_agent;
+      scfg.h16_protocol_compatible = true;
     const auto disabled=[](const char *name){const char *v=std::getenv(name);return v&&(std::string_view(v)=="1"||std::string_view(v)=="true");};
     scfg.pool_telemetry.enabled=!disabled("NEXUS_POOL_TELEMETRY_DISABLE")&&!disabled("KERYX_TELEMETRY_DISABLE");
     scfg.pool_telemetry.build="cuda";

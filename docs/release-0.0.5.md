@@ -18,6 +18,10 @@ compatibility and durable submission tracking to the H16 source baseline.
 - Pool metadata and periodic telemetry identify Nexus truthfully. Telemetry and
   AI acknowledgements remain separate from share receipts. The UI connection
   probe checks subscribe/hello and TLS identity without authorizing a wallet.
+- Suprnova login uses an explicit H16 compatibility token for admitted NVIDIA
+  workers while metadata retains the Nexus identity. Real native NVIDIA mining
+  received accepted shares; public-pool AI completion and payment remain separate.
+  Pool authorization errors remain visible across job/difficulty notifications.
 - Escrow claim policy reconciles current spendability and maturity, while
   retaining ownership, signing and duplicate-spend checks.
 - Fsynced submission intent/receipt journals preserve uncertain sends across

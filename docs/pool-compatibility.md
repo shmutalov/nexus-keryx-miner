@@ -2,8 +2,23 @@
 
 Nexus keeps its own worker, GPU scheduler, inference engine and recovery journals.
 Pool interoperability does not require advertising another miner's name. The
-implementation sends `nexus-keryx-miner/0.0.5-dev` and implements the public wire
-contract independently; no Supr implementation is incorporated.
+implementation normally sends `nexus-keryx-miner/0.0.5-dev` and implements the public
+wire contract independently; no Supr implementation is incorporated.
+
+Suprnova's H16 login gate also parses a legacy protocol-version prefix. An
+H16-capable NVIDIA worker opts into the explicit compatibility token
+`keryx-miner/0.6.1-compatible (Nexus/0.0.5-dev; native-H16)` on the three published
+Suprnova hosts only. This names protocol compatibility, not an official-miner or
+Supr executable version. `mining.hello` continues to identify Nexus. Other pools,
+unqualified clients and explicit custom agents retain their native identity.
+A live subscribe/authorize probe accepted this token. The updated native NVIDIA
+worker then received real Suprnova share acknowledgements with Rust verification
+before submission and active metadata acknowledgements. This does not certify
+public-pool AI completion, payments, escrow eligibility or another CI archive.
+
+An authorization refusal retains `AUTH_REJECTED` and the pool's bounded error
+message. Subsequent job/difficulty notifications cannot grant authorization or
+erase the refusal. No capabilities or telemetry are sent before authorization.
 
 The protocol comparison uses Supr v0.16.3, commit
 `cd49fbdd745fbc53d6e35475ded3a955f740945a`:

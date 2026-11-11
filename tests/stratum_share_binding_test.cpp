@@ -3,6 +3,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <google/protobuf/util/json_util.h>
+#include <google/protobuf/struct.pb.h>
 #include <stdexcept>
 using namespace keryx::nexus::stratum;
 void check(bool b, const char *s) {
@@ -37,6 +39,37 @@ int main(int argc, char **argv) {
     h.set_pomtier(0);
     h.add_parents()->add_parenthashes(std::string(64, 'e'));
     h.set_taskroot(std::string(64, 'f'));
+    {
+      StratumV4Client rejected(cfg);
+      rejected.enable_loopback_test_mode(true);
+      check(rejected.connect_and_handshake_once(), "auth fixture handshake failed");
+      const auto frames = rejected.take_outbound_wire_log();
+      check(frames.size() == 2, "auth fixture frame count");
+      google::protobuf::Struct auth;
+      check(google::protobuf::util::JsonStringToMessage(frames[1], &auth).ok(), "auth JSON");
+      const auto auth_id = static_cast<std::uint64_t>(auth.fields().at("id").number_value());
+      check(rejected.process_inbound_line("{\"id\":" + std::to_string(auth_id) +
+          ",\"result\":null,\"error\":[24,\"H16 compatibility gate: synthetic miner not approved\",null]}"), "auth rejection failed");
+      check(rejected.process_inbound_line(
+          "{\"method\":\"mining.notify\",\"params\":[\"rejected-job\",\"" + hex(h.SerializeAsString()) +
+          "\",\"1700000123\",\"148950000\",16842752,\"\"]}"), "post-rejection notify failed");
+      check(rejected.process_inbound_line("{\"method\":\"mining.set_difficulty\",\"params\":[2]}"), "post-rejection difficulty failed");
+      const auto status = rejected.telemetry_snapshot();
+      check(!status.connected && status.state == "AUTH_REJECTED", "notify erased authorization rejection");
+      check(status.last_error.find("code 24") != std::string::npos &&
+          status.last_error.find("H16 compatibility gate") != std::string::npos,
+          "pool authorization error detail lost");
+      check(status.pool_telemetry_state == "AUTH_REJECTED" && status.rejected_shares == 0,
+          "authorization rejection changed share receipts");
+      rejected.poll_pool_extensions();
+      check(rejected.take_outbound_wire_log().empty(), "rejected session sent pool capabilities");
+      rejected.enable_loopback_test_mode(false);
+      check(!rejected.current_job(), "rejected session offered mining work");
+      check(rejected.process_inbound_line("{\"id\":" + std::to_string(auth_id) +
+          ",\"result\":true,\"error\":null}"), "positive authorization failed");
+      check(rejected.telemetry_snapshot().connected && rejected.telemetry_snapshot().last_error.empty(),
+          "positive authorization did not recover rejection");
+    }
     check(c.process_inbound_line(
               "{\"method\":\"mining.set_difficulty\",\"params\":[1]}"),
           "initial difficulty failed");
