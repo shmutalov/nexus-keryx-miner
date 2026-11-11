@@ -1,3 +1,4 @@
+#include "keryx/nexus/json_integer_wire.hpp"
 #include "keryx/nexus/pool_ai_service.hpp"
 #include "keryx/nexus/platform/io.hpp"
 #include "keryx/nexus/stratum_v4_client.hpp"
@@ -54,7 +55,7 @@ std::string json(const Obj &o) {
 }
 Obj parse(std::string_view s) {
   Obj o;
-  need(google::protobuf::util::JsonStringToMessage(std::string(s), &o).ok(),
+  need(google::protobuf::util::JsonStringToMessage(preserve_json_integers(s), &o).ok(),
        "Pool AI JSON parse");
   return o;
 }

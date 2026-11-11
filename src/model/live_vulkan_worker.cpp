@@ -703,6 +703,7 @@ int main(int argc, char **argv) {
     scfg.backup_urls = backup_pool_urls;
     scfg.worker = pool_worker;
     scfg.password = pool_password;
+    if (const char *ca = std::getenv("NEXUS_POOL_CA_FILE"); ca && *ca) scfg.tls_ca_file = ca;
     scfg.submission_journal=developer_data_root()/"state"/"submissions"/"pool-shares.journal";
     scfg.user_agent = stratum::nexus_pool_agent;
     const auto disabled=[](const char *name){const char *v=std::getenv(name);return v&&(std::string_view(v)=="1"||std::string_view(v)=="true");};

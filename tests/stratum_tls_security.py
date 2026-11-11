@@ -13,7 +13,7 @@ root.mkdir(parents=True, exist_ok=True)
 
 def cert(name, san):
     key, pem = root / (name + '.key'), root / (name + '.pem')
-    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=synthetic-test', '-addext', 'subjectAltName=' + san, '-keyout', str(key), '-out', str(pem)], check=True, capture_output=True)
+    subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=synthetic-' + name, '-addext', 'subjectAltName=' + san, '-keyout', str(key), '-out', str(pem)], check=True, capture_output=True)
     return key, pem
 
 valid = cert('valid', 'DNS:localhost,IP:127.0.0.1')
@@ -33,7 +33,7 @@ subprocess.run(['openssl', 'req', '-new', '-key', str(expired[0]), '-subj', '/CN
     + '[fixture_policy]\ncommonName=supplied\n[fixture_ext]\nsubjectAltName=DNS:localhost\n')
 subprocess.run(['openssl', 'ca', '-selfsign', '-batch', '-notext', '-config', str(root / 'expiry.cnf'), '-cert', str(expiry_ca[1]), '-keyfile', str(expired[0]), '-in', str(root / 'expired.csr'), '-startdate', '20200101000000Z', '-enddate', '20200102000000Z', '-out', str(expired[1])], check=True, capture_output=True)
 
-def run(pair, host, expected, mode='tls_probe'):
+def run(pair, host, expected, mode='tls_probe', ca_file=None, system_ca=None):
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(str(pair[1]), str(pair[0]))
     listener = socket.socket()
@@ -62,6 +62,9 @@ def run(pair, host, expected, mode='tls_probe'):
     thread = threading.Thread(target=accept)
     thread.start()
     env = dict(os.environ, SSL_CERT_FILE=str(valid[1] if pair == untrusted else pair[1]))
+    if system_ca is not None: env['SSL_CERT_FILE'] = str(system_ca)
+    if ca_file is not None: env['NEXUS_POOL_CA_FILE'] = str(ca_file)
+    else: env.pop('NEXUS_POOL_CA_FILE', None)
     url = 'stratum+ssl://' + host + ':' + str(listener.getsockname()[1])
     try:
         args = [binary, mode, url] + ([expected] if mode == 'tls_probe' else [os.environ.get('NEXUS_TLS_STOP_ITERATIONS', '100')])
@@ -86,3 +89,10 @@ run(wrong, '127.0.0.1', 'reject')
 run(untrusted, 'localhost', 'reject')
 run(expired, 'localhost', 'reject')
 run(valid, 'localhost', 'accept', 'tls_stop')
+
+# Extra roots supplement system roots without weakening hostname checks.
+run(valid, 'localhost', 'accept', ca_file=valid[1], system_ca=untrusted[1])
+run(wrong, 'localhost', 'reject', ca_file=wrong[1], system_ca=untrusted[1])
+run(valid, 'localhost', 'reject', ca_file=root/'missing.pem')
+(root/'malformed.pem').write_text('not a certificate')
+run(valid, 'localhost', 'reject', ca_file=root/'malformed.pem')

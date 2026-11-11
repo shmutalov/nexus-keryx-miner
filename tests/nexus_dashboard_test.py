@@ -247,7 +247,8 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(model.status, "DEGRADED")
 
     def test_only_authorized_gpu_uuid_is_queried(self):
-        with mock.patch.object(dashboard.subprocess, "run") as runner:
+        with mock.patch('nexus_gpu_selection.configuration', return_value={'nvidia_pom': True}), \
+             mock.patch.object(dashboard.subprocess, "run") as runner:
             runner.return_value = subprocess.CompletedProcess([], 0, "3, 800, 8192, 45, 90, 1800\n", "")
             self.assertIn("3, 800", dashboard.gpu_sample())
             command = runner.call_args.args[0]
@@ -414,6 +415,48 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(model.ai_metrics["requests_assigned"], 1)
         self.assertEqual(model.ai_metrics["responses_sent"], 1)
         self.assertIsNone(model.ai_metrics["responses_confirmed"])
+
+    def test_pool_name_follows_actual_endpoint_after_failover(self):
+        config = {"active_pool_id": "cryo", "pools": [
+            {"id": "cryo", "name": "Cryo Pool", "url": "stratum+ssl://krx.cryo-pool.com:5555"},
+            {"id": "supr", "name": "Suprnova", "url": "stratum+tcp://krx.suprnova.cc:4404"}]}
+        self.assertEqual(dashboard.pool_display_name(config, {"endpoint": "stratum+tcp://krx.suprnova.cc:4404"}), "Suprnova")
+        self.assertEqual(dashboard.pool_display_name(config, {"endpoint": "stratum+ssl://krx.cryo-pool.com:5555"}), "Cryo Pool")
+        self.assertEqual(dashboard.pool_display_name(config, {"endpoint": "stratum+ssl://stratum-eu2.suprnova.cc:4405"}), "Suprnova")
+        self.assertEqual(dashboard.pool_display_name(config, {"endpoint": "stratum+tcp://custom.invalid:1234"}), "custom.invalid")
+        self.assertEqual(dashboard.pool_display_name(config, {}), "Cryo Pool")
+        self.assertEqual(config["active_pool_id"], "cryo")
+
+    def test_pool_receipts_do_not_count_as_block_acknowledgements(self):
+        model = dashboard.DashboardModel()
+        for nonce in range(30):
+            for state in ("SUBMIT_SENT", "RPC_ACKNOWLEDGED"):
+                model.ingest(json.dumps({"event": "LIVE_SUBMIT_RESULT", "mode": "POOL",
+                                         "state": state, "hash": "0" * 64,
+                                         "job_id": "synthetic", "nonce": str(nonce)}))
+        self.assertEqual(model.stats["submit_sent"], 0)
+        self.assertEqual(model.stats["rpc_ack"], 0)
+        self.assertEqual(model.unresolved_block_submissions, set())
+        snapshot = self.native_snapshot()
+        snapshot["counters"]["targets_satisfied"] = 31
+        snapshot["stratum"] = {"mode": "pool", "accepted_shares": 30,
+                               "rejected_shares": 2, "stale_shares": 1, "pending_shares": 3}
+        model.ingest(json.dumps(snapshot))
+        rows = dict(dashboard.pool_pipeline_rows(model.stratum, model.native["counters"]))
+        self.assertEqual(rows["Pool accepted"], "30")
+        self.assertEqual(rows["Pool rejected"], "2")
+        self.assertEqual(rows["Stale · included in rejected"], "1")
+        self.assertEqual(rows["Pending share replies"], "3")
+        self.assertTrue(rows["Block confirmations"].startswith("N/A"))
+        from nexus_presenter import build_presenter_frame
+        for view in ("single", "dual", "rig"):
+            frame = build_presenter_frame(46, 160, model, "", 0, preferences={"gpu_view": view})
+            panel = next(p for p in frame.panels if p["title"].startswith("POOL SHARE"))
+            displayed = {r[0]: r[1] for r in panel["rows"]}
+            self.assertEqual(displayed["Pool accepted"], "30")
+            self.assertNotIn("RPC acknowledged", displayed)
+            self.assertNotIn("DAG observed", displayed)
+            self.assertNotIn("GPU load", displayed)
 
     def test_live_template_sync_and_confirmed_block_are_deduplicated(self):
         m = dashboard.DashboardModel()

@@ -892,6 +892,9 @@ endif()
 nexus_configure_test_drivers()
 
 if(NEXUS_ENABLE_GRPC)
+  add_executable(nexus-stratum-compact-job-test tests/stratum_compact_job_test.cpp)
+  target_link_libraries(nexus-stratum-compact-job-test PRIVATE nexus_grpc)
+  add_test(NAME stratum_compact_u64_jobs_lossless COMMAND nexus-stratum-compact-job-test)
   add_executable(nexus-network-security-test tests/network_security_test.cpp)
   target_link_libraries(nexus-network-security-test PRIVATE nexus_grpc)
   nexus_warnings(nexus-network-security-test -Wall -Wextra -Wpedantic)
@@ -1007,3 +1010,7 @@ if(NEXUS_ENABLE_GRPC AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_test(NAME stratum_socket_ack_loss_restart_does_not_retransmit
     COMMAND nexus-stratum-ledger-socket-test "${CMAKE_BINARY_DIR}/test-data/stratum-ledger-socket")
 endif()
+
+add_executable(nexus-upstream-policy-test tests/upstream_policy_test.cpp)
+target_include_directories(nexus-upstream-policy-test PRIVATE include)
+add_test(NAME upstream_sibling_wait_and_sticky_oom_tier_policy COMMAND nexus-upstream-policy-test)

@@ -719,6 +719,10 @@ void H15AuditClient::poll() {
   p.rpc_budget.reset();
 }
 
+std::uint64_t H15AuditClient::estimate_request_work(std::uint32_t prompt, std::uint32_t tokens) const {
+  std::lock_guard lock(impl_->mutex);
+  return nexus_h15_service_request_work(impl_->service, prompt, tokens);
+}
 std::uint64_t H15AuditClient::estimate_next_work(std::uint32_t prompt,
                                                  std::uint32_t tokens) const {
   std::lock_guard lock(impl_->mutex);
