@@ -363,10 +363,15 @@ SubmitBlockResult SubmitBlockClient::observe_chain(
   auto observation_channel = make_channel(endpoint_);
   while (std::chrono::steady_clock::now() < deadline && !(cancelled && cancelled())) {
     try {
+      const auto rpc_budget = std::min(
+          std::chrono::steady_clock::duration(std::chrono::seconds(3)),
+          deadline - std::chrono::steady_clock::now());
+      // Windows system_clock uses 100 ns ticks while steady_clock uses ns.
+      // Convert the relative budget explicitly before forming a wall-clock deadline.
+      const auto rpc_deadline = std::chrono::system_clock::now() +
+          std::chrono::duration_cast<std::chrono::system_clock::duration>(rpc_budget);
       const auto observation = observe_once(endpoint_, result.block_hash,
-          std::chrono::system_clock::now() + std::min(std::chrono::steady_clock::duration(std::chrono::seconds(3)),
-              deadline-std::chrono::steady_clock::now()),
-          observation_channel);
+          rpc_deadline, observation_channel);
       if (observation.found) {
         result.block_blue_score = observation.blue_score;
         result.selected_tip_blue_score = observation.selected_tip_blue_score;
