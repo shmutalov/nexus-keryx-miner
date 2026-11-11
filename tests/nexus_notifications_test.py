@@ -26,6 +26,25 @@ class NotificationTests(unittest.TestCase):
             self.assertEqual(transitions(row, state), ([(expected, block)] if expected else []))
             self.assertEqual(transitions(row, state), [])
 
+    def test_pool_receipts_use_job_nonce_instead_of_missing_block_hash(self):
+        state = {}
+        row = {'event': 'LIVE_SUBMIT_RESULT', 'mode': 'POOL', 'state': 'RPC_ACKNOWLEDGED',
+               'hash': '0' * 64, 'job_id': 'synthetic', 'nonce': '1'}
+        first = transitions(row, state)
+        self.assertEqual(first[0][0], 'POOL_SHARE_ACK')
+        self.assertEqual(transitions(row, state), [])
+        row['nonce'] = '2'
+        second = transitions(row, state)
+        self.assertEqual(second[0][0], 'POOL_SHARE_ACK')
+        self.assertNotEqual(first[0][1], second[0][1])
+        row['job_id'] = ''
+        self.assertEqual(transitions(row, state), [])
+
+    def test_h15_solo_ack_is_supported(self):
+        self.assertEqual(transitions({'event': 'LIVE_H15_SUBMIT_RESULT',
+                                     'state': 'RPC_ACKNOWLEDGED', 'hash': 'b' * 64}, {}),
+                         [('SUBMIT_ACK', 'b' * 64)])
+
     def test_invalid_hash_never_notifies(self):
         self.assertEqual(transitions({'event': 'LIVE_SUBMIT_RESULT', 'state': 'RPC_ACKNOWLEDGED', 'hash': 'bad'}, {}), [])
 

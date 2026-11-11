@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded read-only desktop notifications from NEXUS worker event logs."""
 import datetime
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,6 +16,7 @@ SETTINGS = ROOT / 'state/observability/notification-settings.json'
 
 ICON = Path(__file__).resolve().parent / 'assets/nexus-tray.svg'
 MESSAGES = {
+    'POOL_SHARE_ACK': ('Pool share accepted!', 'The pool accepted a verified mining share.'),
     'SUBMIT_ACK': ('Block submitted!', 'Block submission acknowledged by the node!'),
     'AI_REQUEST_ASSIGNED': ('AI request received!', 'An assigned AI request is being handled with priority!'),
     'AI_RESPONSE_ACK': ('AI response submitted!', 'AI response submission acknowledged by the node!'),
@@ -46,8 +48,17 @@ def transitions(worker, state):
     event = worker.get('event')
     stage = None
     identity = None
-    if event == 'LIVE_SUBMIT_RESULT' and worker.get('state') == 'RPC_ACKNOWLEDGED':
-        stage, identity = 'SUBMIT_ACK', worker.get('hash')
+    if event in ('LIVE_SUBMIT_RESULT', 'LIVE_H15_SUBMIT_RESULT') and worker.get('state') == 'RPC_ACKNOWLEDGED':
+        if str(worker.get('mode', '')).upper() == 'POOL':
+            job = worker.get('job_id')
+            nonce = str(worker.get('nonce', ''))
+            if (not isinstance(job, str) or not job or len(job) > 512 or
+                    not nonce.isascii() or not nonce.isdecimal() or len(nonce) > 20 or int(nonce) >= 2**64):
+                return []
+            receipt = json.dumps([worker.get('endpoint', ''), job, str(int(nonce))], separators=(',', ':'))
+            stage, identity = 'POOL_SHARE_ACK', hashlib.sha256(receipt.encode()).hexdigest()
+        else:
+            stage, identity = 'SUBMIT_ACK', worker.get('hash')
     elif event == 'AI_REQUEST_ASSIGNED':
         stage, identity = event, worker.get('request_id')
     elif event == 'AI_RESPONSE_LIFECYCLE' and worker.get('state') in ('RPC_ACKNOWLEDGED', 'CHAIN_OBSERVED', 'FINALIZED'):
@@ -130,7 +141,7 @@ def main():
                         break
                     if len(line) > 1024 * 1024:
                         raise ValueError('oversized event')
-                    if not any(marker in line for marker in (b'LIVE_SUBMIT_RESULT', b'AI_REQUEST_ASSIGNED', b'AI_RESPONSE_LIFECYCLE')):
+                    if not any(marker in line for marker in (b'LIVE_SUBMIT_RESULT', b'LIVE_H15_SUBMIT_RESULT', b'AI_REQUEST_ASSIGNED', b'AI_RESPONSE_LIFECYCLE')):
                         continue
                     try:
                         obj = json.loads(line)
