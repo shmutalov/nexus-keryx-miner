@@ -401,6 +401,8 @@ std::string_view to_string(ConnectionState state) noexcept {
     return "RECONNECTING";
   case ConnectionState::Error:
     return "ERROR";
+  case ConnectionState::AuthorizationRejected:
+    return "AUTH_REJECTED";
   }
   return "DISCONNECTED";
 }
@@ -1103,10 +1105,16 @@ bool StratumV4Client::connect_and_handshake_once() {
   const auto now = std::chrono::steady_clock::now();
   subscribe_rpc_id_ = next_rpc_id_++;
   subscribe_sent_at_ = now;
+  std::string subscribe_agent = config_.user_agent;
+  const bool suprnova = endpoint_.host == "krx.suprnova.cc" ||
+      endpoint_.host == "stratum-eu2.suprnova.cc" ||
+      endpoint_.host == "stratum-us.suprnova.cc";
+  if (suprnova && config_.h16_protocol_compatible && subscribe_agent == nexus_pool_agent)
+    subscribe_agent = "keryx-miner/0.6.1-compatible (Nexus/0.0.5-dev; native-H16)";
   const std::string sub_msg =
       "{\"id\":" + std::to_string(subscribe_rpc_id_) +
       ",\"method\":\"mining.subscribe\",\"params\":[\"" +
-      json_escape(config_.user_agent) + "\",\"" +
+      json_escape(subscribe_agent) + "\",\"" +
       json_escape(config_.protocol_tag) + "\"]}";
   if (!send_line_locked(sub_msg)) {
     close_socket_locked();
@@ -1385,7 +1393,7 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       std::lock_guard lock(mutex_);
       current_difficulty_ = diff;
       current_share_target_ = target;
-      last_error_.clear();
+      if (state_ != ConnectionState::AuthorizationRejected) last_error_.clear();
       // The pinned stock client applies vardiff only when the next notify
       // creates a job. Mutating the current job accepts too-weak candidates
       // after an easier update, or invalidates valid work after a harder one.
@@ -1585,8 +1593,13 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
           job_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
       active_job_ = job;
       ++jobs_received_;
-      state_ = ConnectionState::Ready;
-      last_error_.clear();
+      // A notify can arrive before or after a rejected authorize response.
+      // Receiving work never grants permission to mine or clears a rejection.
+      if (state_ != ConnectionState::AuthorizationRejected &&
+          (authorized_ || loopback_test_mode_)) {
+        state_ = ConnectionState::Ready;
+        last_error_.clear();
+      }
       if (job_ids_seen_.size() >= kMaxSeenJobs) {
         job_ids_seen_.clear();
         submitted_nonces_by_job_.clear();
@@ -1744,9 +1757,24 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
         res_it->second.kind_case() == google::protobuf::Value::kBoolValue &&
         res_it->second.bool_value();
     if (!accepted) {
-      state_ = ConnectionState::Error;
-      record_error_locked("Pool authorization rejected for worker " +
-                          config_.worker);
+      authorized_ = false;
+      state_ = ConnectionState::AuthorizationRejected;
+      pool_telemetry_state_ = "AUTH_REJECTED";
+      std::string reason = "Pool authorization rejected";
+      if (has_error && err_it->second.kind_case() == google::protobuf::Value::kListValue) {
+        const auto &error = err_it->second.list_value().values();
+        if (!error.empty()) {
+          if (const auto code = value_to_u64(error[0])) reason += " (code " + std::to_string(*code) + ")";
+        }
+        if (error.size() > 1 && error[1].kind_case() == google::protobuf::Value::kStringValue)
+          reason += ": " + error[1].string_value().substr(0, 512);
+      } else if (has_error && err_it->second.kind_case() == google::protobuf::Value::kStructValue) {
+        const auto &error = err_it->second.struct_value().fields();
+        const auto message = error.find("message");
+        if (message != error.end() && message->second.kind_case() == google::protobuf::Value::kStringValue)
+          reason += ": " + message->second.string_value().substr(0, 512);
+      }
+      record_error_locked(reason);
       return true;
     }
     authorized_=true;

@@ -40,6 +40,7 @@ enum class ConnectionState : std::uint8_t {
   Ready = 5,
   Reconnecting = 6,
   Error = 7,
+  AuthorizationRejected = 8,
 };
 
 std::string_view to_string(ConnectionState state) noexcept;
@@ -73,6 +74,9 @@ struct StratumClientConfig {
   std::string worker;
   std::string password{"x"};
   std::string user_agent{nexus_pool_agent};
+  // Opt-in by an H16-capable worker; only Suprnova's known endpoints need
+  // the legacy protocol-version token. Hello still identifies Nexus itself.
+  bool h16_protocol_compatible{false};
   PoolTelemetryOptions pool_telemetry;
   std::string protocol_tag{"keryx-stratum-v3"};
   std::string declared_model_id_hex{
