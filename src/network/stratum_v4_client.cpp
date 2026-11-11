@@ -1,3 +1,4 @@
+#include "keryx/nexus/json_integer_wire.hpp"
 #include "keryx/nexus/stratum_v4_client.hpp"
 #include "keryx/nexus/submission_ledger.hpp"
 
@@ -670,6 +671,7 @@ std::vector<std::string> StratumV4Client::take_outbound_wire_log() {
 }
 
 void StratumV4Client::start() {
+  std::lock_guard lifecycle_lock(lifecycle_mutex_);
   bool expected = false;
   if (!running_.compare_exchange_strong(expected, true)) {
     return;
@@ -679,6 +681,7 @@ void StratumV4Client::start() {
 }
 
 void StratumV4Client::stop() {
+  std::lock_guard lifecycle_lock(lifecycle_mutex_);
   stop_requested_.store(true, std::memory_order_release);
   {
     std::lock_guard lock(mutex_);
@@ -832,7 +835,7 @@ void StratumV4Client::poll_pool_extensions(std::chrono::steady_clock::time_point
       return now>=p.second.sent_at&&now-p.second.sent_at<std::chrono::milliseconds(100);}))return;
   if(now>=next_declare_) {
     std::string models;
-    if(config_.pool_telemetry.trace_ready&&!config_.declared_model_id_hex.empty())
+    if(pool_mining_available_&&config_.pool_telemetry.trace_ready&&!config_.declared_model_id_hex.empty())
       models='"'+json_escape(config_.declared_model_id_hex)+'"';
     const auto written=send_metadata_locked("{\"method\":\"mining.declare_capabilities\",\"params\":["+models+"]}");
     if(written==MetadataWrite::Broken){close_socket_locked();state_=ConnectionState::Reconnecting;return;}
@@ -856,7 +859,9 @@ void StratumV4Client::poll_pool_extensions(std::chrono::steady_clock::time_point
         rate=static_cast<std::uint64_t>(rounded);
     }
     const auto uptime=now>metadata_started_?std::chrono::duration_cast<std::chrono::seconds>(now-metadata_started_).count():0;
-    payload=pool_metrics_json(config_.pool_telemetry,uptime,rate,accepted_shares_,
+    auto advertised=config_.pool_telemetry;
+    if(!pool_mining_available_)advertised.model_id.clear();
+    payload=pool_metrics_json(advertised,uptime,rate,accepted_shares_,
         rejected_shares_,stale_shares_,ai_inference_busy_.load(std::memory_order_acquire));
     method="mining.telemetry";
   }
@@ -874,6 +879,11 @@ void StratumV4Client::poll_pool_extensions(std::chrono::steady_clock::time_point
            <<",\"trace\":"<<(config_.pool_telemetry.trace_ready?1:0)<<"}\n"<<std::flush;
 }
 
+void StratumV4Client::set_pool_mining_available(bool available) {
+  std::lock_guard lock(mutex_);
+  if(pool_mining_available_==available)return;
+  pool_mining_available_=available;next_declare_={};next_metadata_={};
+}
 void StratumV4Client::qualify_pool_ai() {
   std::lock_guard lock(mutex_);
   need(!config_.declared_model_id_hex.empty()&&config_.declared_model_id_hex==config_.pool_telemetry.model_id,"Pool AI loaded/declaration model mismatch");
@@ -921,6 +931,7 @@ bool StratumV4Client::connect_and_handshake_once() {
     const std::string port = std::to_string(endpoint_.port);
     const bool use_tls = endpoint_.tls;
     const bool verify_peer = config_.tls_verify_peer;
+    const auto ca_file = config_.tls_ca_file.string();
     const int connect_timeout_ms = config_.connect_timeout_ms;
     const int io_timeout_ms = config_.io_timeout_ms;
     lock.unlock();
@@ -1036,7 +1047,12 @@ bool StratumV4Client::connect_and_handshake_once() {
       SSL_CTX_set_verify(ssl_ctx,
                          verify_peer ? SSL_VERIFY_PEER : SSL_VERIFY_NONE,
                          nullptr);
-      bool tls_ready = !verify_peer || SSL_CTX_set_default_verify_paths(ssl_ctx) == 1;
+      const bool system_roots = SSL_CTX_set_default_verify_paths(ssl_ctx) == 1;
+      const bool extra_roots = !ca_file.empty() &&
+          SSL_CTX_load_verify_locations(ssl_ctx, ca_file.c_str(), nullptr) == 1;
+      bool tls_ready = (!verify_peer || system_roots || extra_roots) &&
+          (ca_file.empty() || extra_roots);
+      tls_ready = tls_ready && SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION)==1;
       ssl = SSL_new(ssl_ctx);
       tls_ready = tls_ready && ssl;
       std::array<unsigned char, 16> ip{};
@@ -1350,8 +1366,9 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
   google::protobuf::Struct root;
   google::protobuf::util::JsonParseOptions opts;
   opts.ignore_unknown_fields = true;
+  const auto exact_json = preserve_json_integers(line);
   const auto status = google::protobuf::util::JsonStringToMessage(
-      std::string(line), &root, opts);
+      exact_json, &root, opts);
   need(status.ok(), "Malformed Stratum JSON message");
 
   const auto &fields = root.fields();
@@ -1403,7 +1420,7 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       return true;
     }
 
-    if (method == "mining.set_extranonce") {
+    if (method == "mining.set_extranonce" || method == "set_extranonce") {
       need(params.size() >= 2 &&
                params[0].kind_case() == google::protobuf::Value::kStringValue,
            "mining.set_extranonce requires extranonce hex and size");
@@ -1428,10 +1445,11 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
           (en2_bits >= 64) ? 0xffffffffffffffffULL : ((1ULL << en2_bits) - 1ULL);
 
       std::lock_guard lock(mutex_);
+      const bool changed = fixed != nonce_fixed_ || mask != nonce_mask_;
       nonce_fixed_ = fixed;
       nonce_mask_ = mask;
       extranonce2_hex_digits_ = (*en2_bytes_opt) * 2;
-      if (active_job_.has_value()) {
+      if (changed && active_job_.has_value()) {
         active_job_->nonce_fixed = nonce_fixed_;
         active_job_->nonce_mask = nonce_mask_;
         active_job_->extranonce2_hex_digits = extranonce2_hex_digits_;
@@ -1559,6 +1577,12 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
         }
       }
 
+      if (job.protocol_version == 3) {
+        job.header.timestamp = job.timestamp;
+        job.header.daa_score = job.daa_score;
+        job.header.bits = job.bits;
+        job.header.pom_tier = 0;
+      }
       std::lock_guard lock(mutex_);
       job.difficulty = current_difficulty_;
       job.share_target = current_share_target_;
@@ -1623,9 +1647,9 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       {
         std::lock_guard lock(mutex_);
         if(config_.pool_telemetry.trace_ready&&authorized_&&subscribed_&&
-            method!="mining.ai_draw"&&pool_ai_queue_.size()<8&&
+            method!="mining.ai_draw"&&(method=="mining.ai_opening"||pool_mining_available_)&&pool_ai_queue_.size()<8&&
             (method=="mining.ai_opening"||!ai_inference_busy_.load(std::memory_order_acquire))) {
-          pool_ai_queue_.push_back({endpoint_.raw_url,std::string(line),std::chrono::steady_clock::now()});
+          pool_ai_queue_.push_back({endpoint_.raw_url,exact_json,std::chrono::steady_clock::now()});
           return true;
         }
       }
@@ -1717,7 +1741,7 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
           }
         }
       }
-      if (arr.size() >= 2 &&
+      if (arr.size() >= 2 && arr[0].kind_case() == google::protobuf::Value::kListValue &&
           arr[1].kind_case() == google::protobuf::Value::kStringValue &&
           !arr[1].string_value().empty()) {
         const auto en_bytes = hex_decode_bytes(arr[1].string_value());
@@ -1742,6 +1766,12 @@ bool StratumV4Client::process_inbound_line(std::string_view line) {
       }
     }
     subscribed_=res_it!=fields.end()&&res_it->second.kind_case()==google::protobuf::Value::kListValue;
+    if (subscribed_) {
+      const auto &arr = res_it->second.list_value().values();
+      if (arr.size() == 2 && arr[0].kind_case() == google::protobuf::Value::kBoolValue)
+        subscribed_ = arr[0].bool_value() && arr[1].kind_case() == google::protobuf::Value::kStringValue;
+    }
+    if (!subscribed_) { state_ = ConnectionState::Error; record_error_locked("mining.subscribe refused"); return true; }
     if (state_ == ConnectionState::Connected ||
         state_ == ConnectionState::Connecting) {
       state_ = ConnectionState::Subscribed;

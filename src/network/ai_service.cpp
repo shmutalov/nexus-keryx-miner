@@ -281,6 +281,33 @@ std::optional<std::uint64_t> service_response_deadline(std::uint64_t seed_daa,
   return seed_daa + window;
 }
 
+std::size_t sibling_request_rank(const std::array<std::uint8_t,32> &request,
+    std::string_view own_key, std::string_view identity, std::uint32_t tier,
+    std::string_view model_id, const std::vector<ServiceProvider> &providers) {
+  const auto own = decode_hex(own_key);
+  if (!own || own->size()!=32 || identity.size()!=64) return 0;
+  const auto equal=[](std::string_view a,std::string_view b) {
+    return a.size()==b.size() && std::equal(a.begin(),a.end(),b.begin(),[](unsigned char x,unsigned char y){return std::tolower(x)==std::tolower(y);});
+  };
+  std::vector<std::array<std::uint8_t,32>> siblings;
+  for (const auto &p:providers) {
+    if(p.tier!=tier || !equal(p.identity,identity) || !equal(p.model_id,model_id))continue;
+    const auto k=decode_hex(p.escrow_pubkey);if(!k || k->size()!=32)continue;
+    std::array<std::uint8_t,32> key{};std::copy(k->begin(),k->end(),key.begin());siblings.push_back(key);
+  }
+  std::sort(siblings.begin(),siblings.end());siblings.erase(std::unique(siblings.begin(),siblings.end()),siblings.end());
+  std::array<std::uint8_t,32> mine{};std::copy(own->begin(),own->end(),mine.begin());
+  if(!std::binary_search(siblings.begin(),siblings.end(),mine))return 0;
+  const auto order=[&](const auto &key){
+    std::array<std::uint8_t,64> input{},out{};
+    std::copy(request.begin(),request.end(),input.begin());std::copy(key.begin(),key.end(),input.begin()+32);
+    if(blake2b(out.data(),input.data(),nullptr,out.size(),input.size(),0)!=0)throw std::runtime_error("sibling rank digest failed");
+    std::array<std::uint8_t,32> first{};std::copy_n(out.begin(),32,first.begin());return first;
+  };
+  const auto score=order(mine);
+  return std::count_if(siblings.begin(),siblings.end(),[&](const auto &key){return key!=mine && order(key)<score;});
+}
+
 Assignment classify_assignment(const Request &request, std::string_view own_identity,
                                std::string_view own_key, std::uint32_t expected_tier,
                                const std::vector<ServiceProvider> &providers) {

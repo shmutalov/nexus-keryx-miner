@@ -119,6 +119,12 @@ struct ServiceProvider {
   std::string escrow_pubkey;
 };
 
+// Same-address/tier/model rigs agree on the upstream Blake2b-512-prefix rank.
+// Unknown ownership or malformed keys never introduces an artificial delay.
+std::size_t sibling_request_rank(const std::array<std::uint8_t,32> &request_hash,
+    std::string_view own_key, std::string_view identity, std::uint32_t tier,
+    std::string_view model_id, const std::vector<ServiceProvider> &providers);
+
 // Derives the node's service-ledger identity for a version-0 Keryx payout address.
 // Returns nullopt for unsupported address versions or invalid checksum/payload.
 std::optional<std::string> service_identity_from_payout(std::string_view payout_address,

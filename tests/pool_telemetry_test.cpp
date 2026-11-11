@@ -82,5 +82,21 @@ int main(){try{
  check(json.find("18446744073709551615")!=std::string::npos,"u64 receipt count rounded through double");
  auto invalid=cfg.pool_telemetry;invalid.devices.push_back(invalid.devices[0]);bool denied=false;
  try{pool_hello_json(invalid);}catch(const std::invalid_argument&){denied=true;}check(denied,"duplicate GPU mapping accepted");
+ {
+  StratumV4Client w(cfg);w.enable_loopback_test_mode(true);const auto hi=authorize(w,t);
+  reply(w,id(hi),"\"result\":true,\"error\":null");w.qualify_pool_ai();
+  w.poll_pool_extensions(t+std::chrono::seconds(1));w.take_outbound_wire_log();
+  w.set_pool_mining_available(false);w.poll_pool_extensions(t+std::chrono::seconds(2));
+  const auto withdrawn=w.take_outbound_wire_log();bool empty_caps=false,empty_models=false;
+  for(const auto &frame:withdrawn){auto o=parse(frame);const auto m=o.fields().at("method").string_value();
+   if(m=="mining.declare_capabilities")empty_caps=o.fields().at("params").list_value().values_size()==0;
+   if(m=="mining.telemetry")empty_models=o.fields().at("params").list_value().values(0).struct_value().fields().at("models").list_value().values_size()==0;
+  }
+  check(empty_caps&&empty_models,"OOM withdrawal still advertised mined models");
+  check(w.process_inbound_line("{\"id\":99,\"method\":\"mining.ai_request\",\"params\":[]}"),"withdrawn AI request unhandled");
+  check(!w.take_pool_ai(),"withdrawn model accepted a new request");w.take_outbound_wire_log();
+  check(w.process_inbound_line("{\"method\":\"mining.ai_opening\",\"params\":[]}"),"retained opening unhandled");
+  check(w.take_pool_ai().has_value(),"OOM withdrawal abandoned retained openings");
+ }
  std::cout<<"POOL_TELEMETRY=PASS honest_agent=true post_auth=true measured_rate=true stale_omitted=true pause_zero=true receipt_isolation=true reconnect_reset=true bounded_identity=true mainnet_shares=0\n";return 0;
 }catch(const std::exception&e){std::cerr<<"POOL_TELEMETRY=FAIL "<<e.what()<<'\n';return 1;}}

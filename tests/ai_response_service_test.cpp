@@ -595,6 +595,18 @@ void journal_recovery_regressions(const fs::path &dir) {
 int main(int argc,char **argv){
  if(argc<4){std::cerr<<"usage: nexus-ai-response-service-test PUBLIC_FIXTURE PRIVATE_FIXTURE JOURNAL_DIR [--real-inference GGUF LLAMA_LIBRARY] [--ipfs-api URL] [--pom-cuda TREE META TRACE CONTEXT ORACLE OUTPUT_DIR]\n";return 2;}
  try{
+  {
+   std::array<std::uint8_t,32> request{};request.fill(2);
+   std::vector<ServiceProvider> siblings;
+   for(unsigned i=1;i<=4;++i){
+    std::string key;for(unsigned n=0;n<32;++n){key+='0';key+=static_cast<char>('0'+i);}
+    siblings.push_back({0,std::string(64,'a'),std::string(64,'b'),key});}
+   const unsigned golden[]={1,0,3,2};
+   for(unsigned i=0;i<4;++i)require(sibling_request_rank(request,siblings[i].escrow_pubkey,std::string(64,'b'),0,std::string(64,'a'),siblings)==golden[i],"sibling rank differs from upstream Blake2b-512 prefix");
+   siblings.push_back(siblings[0]);
+   require(sibling_request_rank(request,siblings[0].escrow_pubkey,std::string(64,'b'),0,std::string(64,'a'),siblings)==1,"duplicate provider changed sibling rank");
+   require(sibling_request_rank(request,siblings[0].escrow_pubkey,std::string(64,'c'),0,std::string(64,'a'),siblings)==0,"unknown identity delayed");
+  }
   fs::path dir=argv[3];fs::create_directories(dir);journal_recovery_regressions(dir);SubmitMock service;grpc::ServerBuilder builder;int port=0;builder.AddListeningPort("127.0.0.1:0",grpc::InsecureServerCredentials(),&port);builder.RegisterService(&service);auto server=builder.BuildAndStart();if(!server||!port)throw std::runtime_error("mock SubmitTransaction server failed");
   const std::string endpoint="grpc://127.0.0.1:"+std::to_string(port);
   const auto public_f=fixture(argv[1]);const auto private_f=fixture(argv[2]);

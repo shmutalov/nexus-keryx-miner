@@ -82,6 +82,7 @@ struct StratumClientConfig {
   std::string declared_model_id_hex{
       "9631eb996d2dc26efcab2c2ebd7a0eb28fb9f4fbddeca4bfbe0ec1fb1f2c9005"};
   bool tls_verify_peer{true};
+  std::filesystem::path tls_ca_file;
   // Cross-host trace upload destinations require explicit deployment admission.
   std::vector<std::string> trace_upload_hosts;
   int connect_timeout_ms{5000};
@@ -97,6 +98,7 @@ struct StratumPoolJob {
   std::string job_id;
   std::uint32_t protocol_version{4};
   protowire::RpcBlockHeader wire_header{};
+  // v3 carries work fields only; a complete header exists only in v4 wire_header.
   consensus::Header header{};
   Hash pre_pow{};
   std::uint64_t timestamp{0};
@@ -240,6 +242,7 @@ public:
   void update_pool_work(std::uint64_t completed,
       std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
   void poll_pool_extensions(std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
+  void set_pool_mining_available(bool available);
   void qualify_pool_ai(); // called only after native traced replay self-test
   std::optional<PoolAiMessage> take_pool_ai();
   bool submit_pool_ai_result(std::string_view scope,std::string_view result);
@@ -281,6 +284,8 @@ private:
   std::size_t active_endpoint_index_{0};
   StratumEndpoint endpoint_;
 
+  // Serialize lifecycle ownership: only one caller may join the I/O thread.
+  std::mutex lifecycle_mutex_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::atomic<bool> running_{false};
@@ -299,6 +304,7 @@ private:
   std::chrono::steady_clock::time_point authorize_sent_at_{};
 
   bool subscribed_{false}, authorized_{false}, hello_sent_{false};
+  bool pool_mining_available_{true};
   bool metadata_session_enabled_{false},metadata_session_acked_{false};
   std::string hello_json_, pool_telemetry_state_{"DISABLED"};
   std::uint64_t pool_metadata_sent_{}, pool_metadata_acked_{};

@@ -2083,6 +2083,18 @@ pub unsafe extern "C" fn nexus_h15_service_selftest(
 }
 
 /// # Safety
+/// The pointer must refer to a live service with exclusive mutable access elsewhere.
+#[no_mangle]
+pub unsafe extern "C" fn nexus_h15_service_request_work(ptr: *const c_void, prompt: u32, tokens: u32) -> u64 {
+    if ptr.is_null() { return u64::MAX; }
+    let service = unsafe { &*(ptr as *const Service) };
+    match crate::trace_speeds::generation_daa(&service.binding.model, tokens) {
+        Some(generation) => generation.saturating_add(p::work_daa(service.tier, prompt, 0, 1)),
+        None => p::work_daa(service.tier, prompt, tokens, 1),
+    }
+}
+
+/// # Safety
 /// Pointer validity, alignment, span lengths and non-aliasing must satisfy
 /// the contract in `docs/native-ffi.md`; bounds checks cannot validate allocations.
 /// `ptr` must be a live service; mutable access must be exclusive for the entire call.

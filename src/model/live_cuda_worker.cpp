@@ -40,9 +40,11 @@
 #include "keryx/nexus/network/worker_mode.hpp"
 #include "keryx/nexus/network/submit_block_client.hpp"
 #include "keryx/nexus/ai_response_service.hpp"
+#include "keryx/nexus/ai_sibling_schedule.hpp"
 #include "keryx/nexus/h15_audit_client.hpp"
 #include "keryx/nexus/pool_ai_service.hpp"
 #include "keryx/nexus/pom_vram_admission.hpp"
+#include "keryx/nexus/pom_tier_policy.hpp"
 #include "keryx/nexus/escrow_watcher.hpp"
 #include "keryx/nexus/escrow_claim_policy.hpp"
 #include "keryx/nexus/strike_monitor.hpp"
@@ -159,7 +161,7 @@ extern "C" void request_stop(int) { process_stop.store(true,std::memory_order_re
 constexpr std::uint64_t first_nonce = 0x4b455259584d3231ULL;
 constexpr Hash official_model{0xbd,0x34,0x56,0x8c,0xd8,0x9f,0x5f,0x19,0xc6,0xc3,0xa6,0xe1,0xa6,0x1b,0x92,0x9b,0xc8,0x68,0x70,0x94,0x09,0xea,0xad,0x8e,0x67,0x2d,0x85,0xf3,0xc1,0xeb,0x57,0x10};
 constexpr Hash official_root{0x2c,0x49,0x71,0x64,0xea,0xf2,0x00,0x78,0xad,0xd2,0x0e,0x82,0xae,0x4e,0x1b,0x0f,0xdb,0x27,0xd3,0xfd,0xd5,0xea,0xef,0xc1,0xc4,0x8f,0x20,0x41,0x11,0xe1,0x4e,0x88};
-struct QueuedAiRequest { protowire::RpcTransaction transaction; std::uint64_t daa{}; std::string id; std::uint64_t queued_ns{}; };
+struct QueuedAiRequest { protowire::RpcTransaction transaction; std::uint64_t daa{}; std::string id; std::uint64_t queued_ns{}; std::uint64_t next_attempt_ns{}; };
 class AiRequestQueue final {
 public:
   bool push(const protowire::RpcBlock &block) {
@@ -189,8 +191,16 @@ public:
   }
   std::optional<QueuedAiRequest> pop() {
     std::lock_guard lock(mutex_);
-    if (pending_.empty()) return std::nullopt;
-    auto item=std::move(pending_.front());pending_.pop_front();return item;
+    const auto now=monotonic_ns();
+    auto it=std::find_if(pending_.begin(),pending_.end(),[&](const auto &q){return q.next_attempt_ns<=now;});
+    if (it==pending_.end()) return std::nullopt;
+    auto item=std::move(*it);pending_.erase(it);return item;
+  }
+  bool defer(QueuedAiRequest request, std::uint32_t milliseconds) {
+    std::lock_guard lock(mutex_);
+    if(pending_.size()>=ai::max_pending_requests){overflow_=true;return false;}
+    request.next_attempt_ns=monotonic_ns()+std::uint64_t(milliseconds)*1'000'000ULL;
+    pending_.push_back(std::move(request));return true;
   }
   bool overflowed() const noexcept { std::lock_guard lock(mutex_);return overflow_; }
   std::size_t size() const noexcept { std::lock_guard lock(mutex_);return pending_.size(); }
@@ -1084,6 +1094,7 @@ int main(int argc,char **argv) {
       scfg.backup_urls = config.backup_pool_urls;
       scfg.worker = pool_worker;
       scfg.password = pool_password;
+      if (const char *ca = std::getenv("NEXUS_POOL_CA_FILE"); ca && *ca) scfg.tls_ca_file = ca;
       scfg.submission_journal=developer_data_root()/"state"/"submissions"/"pool-shares.journal";
       scfg.user_agent = stratum::nexus_pool_agent;
       scfg.h16_protocol_compatible = true;
@@ -1309,11 +1320,6 @@ int main(int argc,char **argv) {
     };
 
     auto serve_ai_request=[&](QueuedAiRequest request) {
-#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
-      SecondaryLanePause secondary_pause(secondary_lane.get());
-#endif
-      telemetry.set_gpu_activity("PAUSED_FOR_AI");
-      telemetry.set_state("PAUSED", "QUEUED", "AI_REQUEST", submit_enabled ? "ARMED" : "DISABLED");
       if(!ai_response_service) throw std::runtime_error("AiResponse service unavailable after readiness gate");
       if(ai_queue_overflow.load(std::memory_order_acquire))
         throw std::runtime_error("bounded AiRequest queue overflowed; refusing to continue productive PoM");
@@ -1336,6 +1342,36 @@ int main(int argc,char **argv) {
       std::string parse_error;
       const auto parsed_request = ai::parse_request(request.transaction, request.daa, &parse_error, "mainnet");
       if (!parsed_request) throw std::runtime_error("AiRequest changed or failed official parsing before service");
+      // Same-address rigs wait before taking either GPU's ownership. The node's
+      // current awaiting/deadline response is authoritative; uncertainty never delays.
+      const auto existing=ai_response_service->journal().get(request.id);
+      const bool unstarted=!existing || existing->state==ai::ResponseState::Discovered ||
+          existing->state==ai::ResponseState::Assigned || existing->state==ai::ResponseState::RequestValidated;
+      if(h15_audits && unstarted && !h15_audits->response_for_request(parsed_request->request_hash)) {
+        const auto rank=ai::sibling_request_rank(parsed_request->request_hash,escrow_key,*service_identity,0,
+            hex(official_model.data(),official_model.size()),snapshot.providers);
+        if(rank) {
+          const auto admission=canonical_request_admission(request.id);
+          if(admission.state==ai::AiRequestAdmission::State::Awaiting) {
+            const auto prompt=ai::stock_request_prompt_size(request.transaction,escrow_secret);
+            const auto work=h15_audits->estimate_request_work(prompt.value_or(1U<<20),parsed_request->max_tokens);
+            const auto now=monotonic_ns();
+            const auto wait=ai::sibling_wait_ms(rank,work,ai_current_daa.load(),admission.deadline_daa,
+                now>=request.queued_ns?now-request.queued_ns:0);
+            if(wait) {
+              std::osyncstream(std::cout)<<"{\"event\":\"AI_SIBLING_WAIT\",\"request_id\":\""<<request.id
+                  <<"\",\"rank\":"<<rank<<",\"work_daa\":"<<work<<",\"retry_ms\":"<<wait<<"}\n"<<std::flush;
+              if(!ai_requests.defer(std::move(request),wait))throw std::runtime_error("bounded sibling queue overflow");
+              return;
+            }
+          }
+        }
+      }
+#ifdef NEXUS_ENABLE_SECONDARY_VULKAN
+      SecondaryLanePause secondary_pause(secondary_lane.get());
+#endif
+      telemetry.set_gpu_activity("PAUSED_FOR_AI");
+      telemetry.set_state("PAUSED", "QUEUED", "AI_REQUEST", submit_enabled ? "ARMED" : "DISABLED");
       if(h15_audits){const auto prompt_size=ai::stock_request_prompt_size(request.transaction,escrow_secret);
         h15_audits->advance(ai_current_daa.load(),h15_audits->estimate_next_work(prompt_size.value_or(1U<<20),parsed_request->max_tokens));
         h15_audits->submit_due(ai_current_daa.load(),ai_responses_enabled);
@@ -2006,12 +2042,23 @@ int main(int argc,char **argv) {
     std::string last_pool_job_id;
     std::uint64_t last_pool_nonce_fixed=0;
     std::uint64_t last_pool_nonce_mask=0;
+    // This worker's admitted catalog is tier 0. Higher tiers must not enter it
+    // until their model/tree/runtime and service routes are independently qualified.
+    const auto admitted_model=hex(official_model.data(),official_model.size());
+    PomTierPolicy tier_policy({{admitted_model,0,true,true}});
+    tier_policy.bind(gpu_uuid,admitted_model,ai_current_daa.load());
     PomAdmissionBackoff pom_admission;
     const auto degrade_pom=[&](const PomVramAdmissionDenied &denied){
           // prepare_v5's local RAII resources are already unwound. Drop only
           // our PoM engine; ABI9 and its borrowed model/context are retained.
           gpu_ownership.run_pom([&]{resident.reset();});
           const auto backoff=pom_admission.deny(PomAdmissionBackoff::Clock::now());
+          if(denied.allocation_race) {
+            const auto downgraded=tier_policy.after_oom(gpu_uuid,ai_current_daa.load());
+            if(downgraded)throw std::logic_error("unqualified runtime tier switch");
+            if(stratum_client)stratum_client->set_pool_mining_available(false);
+            std::osyncstream(std::cout)<<"POM_TIER state=WITHDRAWN reason=no_smaller_qualified_downloaded_model effective_tier=0 ai_obligations=RETAINED auto_upgrade=false\n"<<std::flush;
+          }
           const auto &b=denied.budget;
           std::osyncstream(std::cout)<<"POM_ADMISSION state=DEGRADED_NO_VRAM pad_bytes="<<b.pad_bytes
             <<" metadata_bytes="<<b.metadata_bytes<<" reserve_bytes="<<b.reserve_bytes<<" free_bytes="<<b.free_bytes
@@ -2084,7 +2131,7 @@ int main(int argc,char **argv) {
         if(h15_restore_pause_observed){telemetry.h15_restore_finished();h15_restore_pause_observed=false;}
       }
       // All AI/recovery/chain work above remains live while only PoM is degraded.
-      if(!pom_admission.due(PomAdmissionBackoff::Clock::now())) {
+      if(!tier_policy.assignment(gpu_uuid) || !pom_admission.due(PomAdmissionBackoff::Clock::now())) {
         telemetry.set_state("DEGRADED_NO_VRAM","IDLE","POM_VRAM_ADMISSION_DENIED",submit_enabled?"ARMED":"DISABLED");
         std::this_thread::sleep_for(std::chrono::milliseconds(50));continue;
       }
@@ -2382,9 +2429,12 @@ int main(int argc,char **argv) {
                 solved_header.pom_final_state = final;
                 solved_header.pom_tier = header.pom_tier;
                 solved_header.task_root = pool_job.task_root;
-                const auto solved_hash = consensus::hash_header_override(
-                    solved_header, 0, 0, false, false,
-                    pool_job.header.daa_score >= consensus::block_task_activation_daa);
+                // Compact jobs disclose only the pre-PoW hash and work fields;
+                // the pool owns the complete block header and its final identity.
+                const auto solved_hash = pool_job.protocol_version == 4
+                    ? consensus::hash_header_override(solved_header, 0, 0, false, false,
+                        pool_job.header.daa_score >= consensus::block_task_activation_daa)
+                    : Hash{};
                 stratum::VerifiedPoolShare share;
                 share.job_generation = pool_job.generation;
                 share.job_id = pool_job.job_id;

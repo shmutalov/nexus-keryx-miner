@@ -860,3 +860,16 @@ fn awaited_child_is_replayed_when_local_acceptance_draw_differs() {
     assert_eq!(s.pending[&id].state.pieces.len(),1);
     assert!(s.pending[&id].state.pieces[0].accepted.is_some());
 }
+
+
+#[test]
+fn sibling_work_counts_prompt_without_audit_padding() {
+    let (_dir, s, _) = setup();
+    let ptr = &s as *const Service as *const c_void;
+    let short = unsafe { nexus_h15_service_request_work(ptr, 1, 32) };
+    let long = unsafe { nexus_h15_service_request_work(ptr, 60000, 32) };
+    assert!(long > short);
+    assert!(unsafe { nexus_h15_service_request_work(ptr, 1, 1024) } >= short);
+    assert!(unsafe { nexus_h15_service_estimate(ptr, 60000, 32) } >= long);
+    assert_eq!(unsafe { nexus_h15_service_request_work(std::ptr::null(), 1, 32) }, u64::MAX);
+}

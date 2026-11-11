@@ -27,6 +27,7 @@ int main(int argc, char** argv) {
     if(mode=="tls_probe") {
       require(argc==4,"tls_probe needs URL and expected result");
       stratum::StratumClientConfig config; config.pool_url=argv[2]; config.worker="synthetic";
+      if (const char *ca = std::getenv("NEXUS_POOL_CA_FILE"); ca && *ca) config.tls_ca_file = ca;
       config.connect_timeout_ms=1000; config.io_timeout_ms=1000;
       stratum::StratumV4Client client(config);
       require(client.connect_and_handshake_once()==(std::string(argv[3])=="accept"),"TLS authentication result mismatch");
@@ -37,13 +38,16 @@ int main(int argc, char** argv) {
       require(iterations>0 && iterations<=10000,"invalid TLS stress iterations");
       for(unsigned i=0;i<iterations;++i) {
         stratum::StratumClientConfig config; config.pool_url=argv[2]; config.worker="synthetic";
+      if (const char *ca = std::getenv("NEXUS_POOL_CA_FILE"); ca && *ca) config.tls_ca_file = ca;
         config.connect_timeout_ms=500; config.io_timeout_ms=500;
         stratum::StratumV4Client client(config); client.start();
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(2);
         while(!client.telemetry_snapshot().connected && std::chrono::steady_clock::now()<deadline)
           std::this_thread::sleep_for(std::chrono::milliseconds(1));
         require(client.telemetry_snapshot().connected,"TLS stop fixture never connected");
+        std::thread other_stop([&]{client.stop();});
         client.stop();
+        other_stop.join();
       }
       std::cout<<"TLS_STOP_CHECKS="<<iterations<<"\n";
     }
@@ -51,11 +55,11 @@ int main(int argc, char** argv) {
       stratum::StratumClientConfig config; config.pool_url="stratum+tcp://127.0.0.1:1"; config.worker="synthetic";
       stratum::StratumV4Client client(config); client.enable_loopback_test_mode(true);
       unsigned checks=0;
-      for(const auto* id : {"0", "1", "9007199254740991", "\"18446744073709551615\""}) {
+      for(const auto* id : {"0", "1", "9007199254740991", "9007199254740993", "18446744073709551615", "\"18446744073709551615\""}) {
         client.process_inbound_line(std::string("{\"method\":\"ping\",\"id\":")+id+"}");
         require(client.take_outbound_wire_log().size()==1,"valid integer rejected"); ++checks;
       }
-      for(const auto* id : {"1.5","-1","18446744073709551616","9007199254740992", "\"-1\"","\"+1\"","\" 1\"","\"1 \"","\"18446744073709551616\"","\"\"","\"1.0\""}) {
+      for(const auto* id : {"1.5","-1","18446744073709551616","1e19", "\"-1\"","\"+1\"","\" 1\"","\"1 \"","\"18446744073709551616\"","\"\"","\"1.0\""}) {
         client.process_inbound_line(std::string("{\"method\":\"ping\",\"id\":")+id+"}");
         require(client.take_outbound_wire_log().empty(),"invalid or inexact integer accepted"); ++checks;
       }

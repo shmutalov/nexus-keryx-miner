@@ -104,6 +104,28 @@ class PoolProbeTests(unittest.TestCase):
         self.assertIsNone(k["escrow_approved"])
         self.assertIsNone(mode.pool_requirements("stratum+ssl://krx.suprnova.cc:4405")["escrow_approval_required"])
 
+    def test_cryo_preset_migrates_without_changing_active_pool(self):
+        original = mode.default_config()
+        original["mode"] = "pool"
+        original["active_pool_id"] = "suprnova"
+        original["pools"] = [p for p in original["pools"] if p["id"] != "cryopool"]
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)/"mode.json"
+            path.write_text(json.dumps(original))
+            path.chmod(0o600)
+            before = path.read_bytes()
+            with patch.object(mode, "config_path", return_value=path):
+                cfg = mode.load()
+                self.assertEqual(cfg["active_pool_id"], "suprnova")
+                cryo = next(p for p in cfg["pools"] if p["id"] == "cryopool")
+                self.assertEqual(cryo["url"], "stratum+ssl://krx.cryo-pool.com:5555")
+                self.assertTrue(cryo["tls"])
+                self.assertEqual(path.read_bytes(), before)
+                path.write_text(json.dumps(cfg))
+                self.assertEqual(sum(p["id"]=="cryopool" for p in mode.load()["pools"]), 1)
+        self.assertTrue(mode.pool_requirements(cryo["url"])["ai_service_required"])
+        self.assertIsNone(mode.pool_requirements(cryo["url"])["escrow_approved"])
+
     def test_real_tls_chain_and_name_validation(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

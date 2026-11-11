@@ -49,6 +49,15 @@ PRESET_SUPRNOVA = {
 }
 
 
+PRESET_CRYO = {
+    "id": "cryopool", "name": "Cryo Pool",
+    "url": "stratum+ssl://krx.cryo-pool.com:5555",
+    "worker": "", "password": "x", "tls": True, "priority": 3,
+    "preset": True, "configured": True,
+    "note": "TLS 5555; NVIDIA with working AI inference required",
+}
+
+
 def _state_dir() -> Path:
     custom = os.environ.get("NEXUS_MINING_MODE_FILE")
     if custom:
@@ -77,6 +86,7 @@ def default_config() -> dict:
         "pools": [
             dict(PRESET_KERYXPOOL),
             dict(PRESET_SUPRNOVA),
+            dict(PRESET_CRYO),
         ],
     }
 
@@ -160,6 +170,11 @@ def pool_requirements(url: str) -> dict:
                 "announced_miner": "keryx-miner-supr/0.16.3",
                 "nul_prompt_support_required": True,
                 "escrow_note": "Pool payout policy; Nexus qualification is separate from the connection test"}
+    if host == "krx.cryo-pool.com":
+        return {"pool": "cryopool", "telemetry_required": False,
+                "escrow_approval_required": None, "escrow_approved": None,
+                "required_vendor": "NVIDIA", "ai_service_required": True,
+                "escrow_note": "Bridge AI service and payout policy; connection alone does not validate mining or escrow"}
     return {"pool": "custom", "telemetry_required": False,
             "escrow_approval_required": None, "escrow_approved": None,
             "escrow_note": "Pool escrow policy unknown"}
@@ -182,7 +197,13 @@ def test_connection(url: str, timeout: float = 3.0) -> dict:
         deadline = started + timeout
         with socket.create_connection((parts["host"], parts["port"]), timeout=timeout) as raw:
             # Same authentication policy as the native worker; no TLS downgrade.
-            conn = ssl.create_default_context().wrap_socket(raw, server_hostname=parts["host"]) if parts["tls"] else raw
+            if parts["tls"]:
+                context = ssl.create_default_context()
+                if ca_file := os.environ.get("NEXUS_POOL_CA_FILE"):
+                    context.load_verify_locations(cafile=ca_file)
+                conn = context.wrap_socket(raw, server_hostname=parts["host"])
+            else:
+                conn = raw
             with conn:
                 result["ping_ms"] = round((time.monotonic() - started) * 1000, 1)
                 pending = bytearray()
@@ -285,6 +306,7 @@ def load() -> dict:
     pools = []
     has_suprnova = False
     has_keryxpool = False
+    has_cryo = False
     for p in pools_raw:
         if not isinstance(p, dict):
             continue
@@ -300,6 +322,8 @@ def load() -> dict:
             has_suprnova = True
         elif pid == "keryxpool":
             has_keryxpool = True
+        elif pid == "cryopool":
+            has_cryo = True
         is_conf = bool(url.strip())
         note = str(p.get("note", ""))
         if pid == "keryxpool" and not is_conf:
@@ -326,6 +350,8 @@ def load() -> dict:
         pools.insert(0, dict(PRESET_KERYXPOOL))
     if not has_suprnova:
         pools.append(dict(PRESET_SUPRNOVA))
+    if not has_cryo:
+        pools.append(dict(PRESET_CRYO))
 
     # Sort pools by priority
     pools.sort(key=lambda x: x["priority"])

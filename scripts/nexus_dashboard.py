@@ -104,6 +104,48 @@ class SessionLog:
                                 'live': before is None}
 
 
+
+
+def pool_display_name(config, stratum):
+    """Use the actual transport endpoint after failover, not the preference."""
+    from urllib.parse import urlsplit
+    endpoint = stratum.get("endpoint") or ""
+    pools = config.get("pools", [])
+    if endpoint:
+        def address(url):
+            try:
+                parsed = urlsplit(url if "://" in url else "stratum+tcp://" + url)
+                return (parsed.hostname or "").lower(), parsed.port
+            except ValueError:
+                return "", None
+        actual = address(endpoint)
+        for pool in pools:
+            if actual[0] and address(pool.get("url", "")) == actual:
+                return pool.get("name") or pool.get("id") or actual[0]
+        known = {"krx.suprnova.cc": "Suprnova", "stratum-eu2.suprnova.cc": "Suprnova",
+                 "stratum-us.suprnova.cc": "Suprnova", "krx.cryo-pool.com": "Cryo Pool",
+                 "s1.keryxpool.com": "KeryxPool", "keryxpool.com": "KeryxPool"}
+        return known.get(actual[0], actual[0] or "Unknown pool")
+    selected = next((pool for pool in pools if pool.get("id") == config.get("active_pool_id")), {})
+    return selected.get("name") or selected.get("id") or "Pool"
+
+
+def pool_pipeline_rows(stratum, counters=None):
+    """Session share receipts are independent of block/chain observations."""
+    counters = counters or {}
+    return [
+        ("Validated targets", str(counters.get("targets_satisfied", "N/A"))),
+        ("Pool accepted", str(stratum.get("accepted_shares", 0))),
+        ("Pool rejected", str(stratum.get("rejected_shares", 0))),
+        ("Stale · included in rejected", str(stratum.get("stale_shares", 0))),
+        ("Pending share replies", str(stratum.get("pending_shares", 0))),
+        ("Block confirmations", "N/A · not reported by pool"),
+        ("Active pool", stratum.get("endpoint") or "N/A"),
+        ("Pool ping / difficulty", f"{stratum.get('ping_ms', 0):.1f} ms / diff {stratum.get('difficulty', 0):.4f}"),
+        ("Pool last error", stratum.get("last_error") or "NONE"),
+    ]
+
+
 class DashboardModel:
     def __init__(self):
         self.events = deque(maxlen=400)
@@ -406,7 +448,8 @@ class DashboardModel:
             token = (winner_lane, str(obj['nonce']))
             if token not in self._winner_seen:
                 self._winner_seen.add(token); self.gpu_winners[winner_lane] += 1
-        if event in ("LIVE_SUBMIT_RESULT", "LIVE_H15_SUBMIT_RESULT", "LIVE_CHAIN_STATUS"):
+        if (event in ("LIVE_SUBMIT_RESULT", "LIVE_H15_SUBMIT_RESULT", "LIVE_CHAIN_STATUS")
+                and not (event != "LIVE_CHAIN_STATUS" and str(obj.get("mode", "")).upper() == "POOL")):
             state = str(obj.get("state", ""))
             identity = str(obj.get("hash", "")).lower()
             if re.fullmatch(r'[0-9a-f]{64}', identity):
@@ -560,6 +603,7 @@ class DashboardModel:
                     "worker": str(stratum.get("worker", "")),
                     "ping_ms": float(stratum.get("ping_ms", 0.0)) if isinstance(stratum.get("ping_ms"), (int, float)) else 0.0,
                     "difficulty": float(stratum.get("difficulty", 0.0)) if isinstance(stratum.get("difficulty"), (int, float)) else 0.0,
+                    "pending_shares": int(stratum.get("pending_shares", 0)) if type(stratum.get("pending_shares", 0)) is int else 0,
                     "accepted_shares": int(stratum.get("accepted_shares", 0)) if isinstance(stratum.get("accepted_shares"), int) else 0,
                     "rejected_shares": int(stratum.get("rejected_shares", 0)) if isinstance(stratum.get("rejected_shares"), int) else 0,
                     "stale_shares": int(stratum.get("stale_shares", 0)) if isinstance(stratum.get("stale_shares"), int) else 0,
@@ -1080,12 +1124,7 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
     st = getattr(model, 'stratum', {}) or {}
     is_pool = st.get('mode') == 'pool'
     mm = getattr(model, 'mining_mode_cfg', {}) or {}
-    active_pool_id = mm.get('active_pool_id', 'suprnova')
-    active_pool_name = "Suprnova"
-    for p in mm.get('pools', []):
-        if p.get('id') == active_pool_id:
-            active_pool_name = p.get('name', active_pool_id)
-            break
+    active_pool_name = pool_display_name(mm, st)
     pool_conn = (st.get('state', 'SOLO_GRPC') + (f" ({st.get('ping_ms', 0):.1f} ms)" if st.get('connected') else "")) if is_pool else (sync + " · SOLO gRPC")
     mining_rows = [("Mining mode", f"POOL ({active_pool_name})" if is_pool else "SOLO (gRPC)"),
                    ("Connection / ping", pool_conn),
@@ -1110,13 +1149,7 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
                   ("DAG observed", str(model.stats["chain_observed"])), ("Chain confirmed · observed", str(model.stats["chain_confirmed"])),
                   ("RPC rejected", str(model.stats["rpc_rejected"]), "error" if model.stats["rpc_rejected"] else "value")]
     if is_pool:
-        block_rows.extend([
-            ("Active pool", f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})"),
-            ("Pool accepted / rejected", f"{st.get('accepted_shares', 0)} / {st.get('rejected_shares', 0)}", "error" if st.get('rejected_shares', 0) else "value"),
-            ("Pool stale shares", str(st.get('stale_shares', 0))),
-            ("Pool ping / difficulty", f"{st.get('ping_ms', 0):.1f} ms / diff {st.get('difficulty', 0):.4f}"),
-            ("Pool last error", st.get('last_error') or "NONE", "error" if st.get('last_error') else "value"),
-        ])
+        block_rows = pool_pipeline_rows(st, counters)
     def activity(y, height, selected, title="LATEST ACTIVITY"):
         frame.box(y, 1, height, width - 3, title)
         if not selected:
@@ -1146,7 +1179,7 @@ def build_matrix_frame(height, width, model, gpu, child_status, tab, log_filter=
         y = 13; available = height - y - 3; event_h = min(9, max(4, available // 3)); body_h = available - event_h - 1
         left_w = (width - 4) * 58 // 100; right_x = left_w + 2; right_w = width - right_x - 2
         frame.rows(y, 1, body_h, left_w, "NETWORK / MINING ENGINE", ([("PoM hashrate", hashrate)] if width < 120 else []) + mining_rows[:8] + escrow_home_rows)
-        block_h = min(9, max(8, body_h - 6)); frame.rows(y, right_x, block_h, right_w, "BLOCK PIPELINE · THIS SESSION", block_rows)
+        block_h = min(max(8, len(block_rows) + 2), max(8, body_h - 4)); frame.rows(y, right_x, block_h, right_w, "POOL SHARE PIPELINE · THIS SESSION" if is_pool else "BLOCK PIPELINE · THIS SESSION", block_rows)
         gy = y + block_h; gh = body_h - block_h
         if gh >= 4:
             frame.box(gy, right_x, gh, right_w, "GPU / AI SERVICE")

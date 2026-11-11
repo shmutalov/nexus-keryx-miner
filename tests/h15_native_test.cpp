@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
     auto mining_cycle = [&] {
       runtime.use_task_context();
       resident = std::make_unique<consensus::CudaResidentSearch>(
-          primary_gpu_uuid(), gguf, runtime.resident_tensors());
+          primary_gpu_uuid(), gguf, runtime.resident_tensors(), runtime.canonical_weights());
       consensus::Hash v4_pph{};v4_pph.fill(static_cast<uint8_t>(42+cycles));
       const auto v4_nonce=12340+cycles;
       const auto v4_daa=consensus::pom_v5_activation_daa-1;

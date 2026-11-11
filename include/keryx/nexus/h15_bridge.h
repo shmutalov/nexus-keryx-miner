@@ -65,6 +65,7 @@ int nexus_h15_service_chain(void *, const uint8_t *, size_t);
 int nexus_h15_service_advance(void *, const NexusH15Api *, uint64_t, uint64_t);
 int nexus_h15_service_restoring(void *);
 int nexus_h15_service_refund(void *, const uint8_t *, size_t);
+uint64_t nexus_h15_service_request_work(const void *, uint32_t, uint32_t);
 uint64_t nexus_h15_service_estimate(const void *, uint32_t, uint32_t);
 int nexus_h15_service_response_due(void *, uint64_t, uint64_t,
                                    NexusH15Buffer *);

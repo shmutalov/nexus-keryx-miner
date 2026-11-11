@@ -84,12 +84,7 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None):
                 st = getattr(model, 'stratum', {}) or {}
                 is_pool = st.get('mode') == 'pool'
                 mm = getattr(model, 'mining_mode_cfg', {}) or {}
-                active_pool_id = mm.get('active_pool_id', 'suprnova')
-                active_pool_name = "Suprnova"
-                for p in mm.get('pools', []):
-                    if p.get('id') == active_pool_id:
-                        active_pool_name = p.get('name', active_pool_id)
-                        break
+                active_pool_name = dashboard.pool_display_name(mm, st)
                 pool_conn = (st.get('state', 'CONNECTED') + (f" ({st.get('ping_ms', 0):.1f} ms)" if st.get('connected') else "")) if is_pool else (model.status + ' / ' + model.synced.upper() + ' (SOLO gRPC)')
                 if is_pool:
                     rows = [
@@ -120,21 +115,19 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None):
                         ('Escrow claimed / ACK', dashboard.krx(model.claimed.get('payout_sompi'), italian=True)),
                         ('Mature escrow / gross', dashboard.krx(model.escrow_available.get('amount_sompi'), italian=True))]
                 rows_panel(panel, rows)
-            elif panel['title'].startswith('BLOCK'):
+            elif panel['title'].startswith(('BLOCK', 'POOL SHARE')):
                 st = getattr(model, 'stratum', {}) or {}
                 is_pool = st.get('mode') == 'pool'
-                panel['title']='BLOCK & SHARE PIPELINE' if is_pool else 'BLOCK PIPELINE / THIS SESSION'
+                panel['title']='POOL SHARE PIPELINE / THIS SESSION' if is_pool else 'BLOCK PIPELINE / THIS SESSION'
                 table=[('Rust winners',model.gpu_winners['rtx'],model.gpu_winners['rx'],sum(model.gpu_winners.values()))]
                 table += [(name,model.gpu_block_stats['rtx'][key],model.gpu_block_stats['rx'][key],model.stats[key])
                           for name,key in [('Submitted','submit_sent'),('RPC acknowledged','rpc_ack'),
                           ('DAG observed','chain_observed'),('Chain confirmed','chain_confirmed'),('RPC rejected','rpc_rejected')]]
                 table.append(('Unattributed DAG','—','—',model.gpu_block_unknown['chain_observed']))
                 if is_pool:
-                    table.append(('Pool accepted / rejected', '—', '—', f"{st.get('accepted_shares', 0)} / {st.get('rejected_shares', 0)}"))
-                    table.append(('Pool stale / diff', '—', '—', f"{st.get('stale_shares', 0)} / {st.get('difficulty', 0):.4f}"))
-                    table.append(('Pool ping / error', '—', '—', f"{st.get('ping_ms', 0):.1f} ms / {st.get('last_error') or 'NONE'}"))
+                    table = dashboard.pool_pipeline_rows(st, (model.native or {}).get('counters', {}))
                 rows_panel(panel,[(row[0],' / '.join(str(x) for x in row[1:])) for row in table])
-                panel['table_columns']=['PIPELINE', name1, name2, 'TOTAL']
+                panel['table_columns']=['PIPELINE', 'TOTAL'] if is_pool else ['PIPELINE', name1, name2, 'TOTAL']
                 panel['table_rows']=[[str(x) for x in row] for row in table]
             elif panel['title'] == 'GPU / AI SERVICE':
                 panel['title'] = 'GPU FLEET / AI'
@@ -232,12 +225,7 @@ def dual_gpu_panels(frame, model, gpu, tab, force=False, preferences=None):
         is_pool = st.get('mode') == 'pool'
         if is_pool:
             mm = getattr(model, 'mining_mode_cfg', {}) or {}
-            active_pool_id = mm.get('active_pool_id', 'suprnova')
-            active_pool_name = "Suprnova"
-            for p in mm.get('pools', []):
-                if p.get('id') == active_pool_id:
-                    active_pool_name = p.get('name', active_pool_id)
-                    break
+            active_pool_name = dashboard.pool_display_name(mm, st)
             totals_rows.insert(0, ('Mining mode / pool', f"POOL ({active_pool_name}) · {st.get('state', 'CONNECTED')} ({st.get('ping_ms', 0):.1f} ms)"))
             totals_rows.insert(1, ('Active pool endpoint', f"{active_pool_name} ({st.get('endpoint') or mm.get('pool_url') or 'N/A'})"))
             totals_rows.insert(2, ('Pool diff / shares', f"diff {st.get('difficulty', 0):.4f} · {st.get('accepted_shares', 0)} acc / {st.get('rejected_shares', 0)} rej / {st.get('stale_shares', 0)} stale"))
@@ -372,12 +360,7 @@ def rig_panels(frame, model, gpu, tab, preferences):
     st = getattr(model, 'stratum', {}) or {}
     is_pool = st.get('mode') == 'pool'
     mm = getattr(model, 'mining_mode_cfg', {}) or {}
-    active_pool_id = mm.get('active_pool_id', 'suprnova')
-    active_pool_name = "Suprnova"
-    for p in mm.get('pools', []):
-        if p.get('id') == active_pool_id:
-            active_pool_name = p.get('name', active_pool_id)
-            break
+    active_pool_name = dashboard.pool_display_name(mm, st)
     pool_conn = (st.get('state', 'CONNECTED') + (f" ({st.get('ping_ms', 0):.1f} ms)" if st.get('connected') else "")) if is_pool else "SOLO gRPC"
 
     summary_rows = [
@@ -413,7 +396,7 @@ def rig_panels(frame, model, gpu, tab, preferences):
     name1, name2 = display_name(gpu1), display_name(gpu2)
 
     network = next((p for p in frame.panels if p['title'].startswith('NETWORK')), None)
-    pipeline = next((p for p in frame.panels if p['title'].startswith('BLOCK')), None)
+    pipeline = next((p for p in frame.panels if p['title'].startswith(('BLOCK', 'POOL SHARE'))), None)
     activity = next((p for p in frame.panels if p['title'].startswith('LATEST')), None)
     preserved = []
     for panel, kind in ((network, 'rig-network'), (pipeline, 'rig-pipeline'), (activity, 'rig-activity')):
@@ -424,19 +407,17 @@ def rig_panels(frame, model, gpu, tab, preferences):
         if kind == 'rig-network':
             clone['title'] = 'NETWORK / SHARED MINER STATE'
         elif kind == 'rig-pipeline':
-            clone['title'] = 'BLOCK & SHARE PIPELINE' if is_pool else 'BLOCK PIPELINE / THIS SESSION'
+            clone['title'] = 'POOL SHARE PIPELINE / THIS SESSION' if is_pool else 'BLOCK PIPELINE / THIS SESSION'
             table = [('Rust winners', model.gpu_winners['rtx'], model.gpu_winners['rx'], sum(model.gpu_winners.values()))]
             table += [(name, model.gpu_block_stats['rtx'][key], model.gpu_block_stats['rx'][key], model.stats[key])
                       for name, key in [('Submitted', 'submit_sent'), ('RPC acknowledged', 'rpc_ack'),
                       ('DAG observed', 'chain_observed'), ('Chain confirmed', 'chain_confirmed'), ('RPC rejected', 'rpc_rejected')]]
             table.append(('Unattributed DAG', '—', '—', model.gpu_block_unknown['chain_observed']))
             if is_pool:
-                table.append(('Pool accepted / rejected', '—', '—', f"{st.get('accepted_shares', 0)} / {st.get('rejected_shares', 0)}"))
-                table.append(('Pool stale / diff', '—', '—', f"{st.get('stale_shares', 0)} / {st.get('difficulty', 0):.4f}"))
-                table.append(('Pool ping / error', '—', '—', f"{st.get('ping_ms', 0):.1f} ms / {st.get('last_error') or 'NONE'}"))
+                table = dashboard.pool_pipeline_rows(st, (model.native or {}).get('counters', {}))
             clone['rows'] = [(row[0], ' / '.join(str(x) for x in row[1:]), 'value', None) for row in table]
             clone['free'] = {}
-            clone['table_columns'] = ['PIPELINE', name1, name2, 'TOTAL']
+            clone['table_columns'] = ['PIPELINE', 'TOTAL'] if is_pool else ['PIPELINE', name1, name2, 'TOTAL']
             clone['table_rows'] = [[str(x) for x in row] for row in table]
         elif kind == 'rig-activity':
             clone['title'] = 'LATEST ACTIVITY'

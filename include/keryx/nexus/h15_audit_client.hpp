@@ -31,6 +31,7 @@ public:
   void report_health(std::uint64_t);
   void report_exit_health(std::uint64_t); // no replay/RPC/effects; bypass health log cooldown
   void poll(); // selected-chain restore; bounded, read-only RPC
+  std::uint64_t estimate_request_work(std::uint32_t prompt_bytes, std::uint32_t tokens) const;
   std::uint64_t estimate_next_work(std::uint32_t prompt_bytes,
                                    std::uint32_t tokens) const;
   void advance(std::uint64_t,
