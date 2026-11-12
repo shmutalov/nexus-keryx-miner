@@ -261,11 +261,17 @@ int main(int argc, char **argv) {
   // Canonical Vulkan environment defaults
   #ifdef _WIN32
   const char *home_env = std::getenv("HOME");
+  if (!home_env) home_env = std::getenv("USERPROFILE");
   fs::path home_path = home_env ? fs::path(home_env) : fs::current_path();
-  fs::path default_data_dir = home_path / "Scaricati" / "KERYX-NEXUS-RECOVERY";
+  const char *local_app_data = std::getenv("LOCALAPPDATA");
+  fs::path default_data_dir = local_app_data ? fs::path(local_app_data) / "nexus-keryx-miner"
+                                             : home_path / "nexus-keryx-miner";
 
   _putenv_s("NEXUS_AI_BACKEND", "vulkan");
   _putenv_s("KERYX_LLAMA_CTX", "512");
+  if (!std::getenv("NEXUS_DATA_DIR")) {
+    _putenv_s("NEXUS_DATA_DIR", default_data_dir.string().c_str());
+  }
   #else
   const char *home_env = std::getenv("HOME");
   fs::path home_path = home_env ? fs::path(home_env) : fs::current_path();
@@ -294,7 +300,11 @@ int main(int argc, char **argv) {
   std::string meta_path;
   std::string oracle_path;
   std::string runtime_dir = "/tmp/nexus-vulkan-worker";
-  std::string vulkan_lib = (default_data_dir / "artifacts" / "inference" / "vk" / "libkeryx-llama-vk.so").string();
+#ifdef _WIN32
+  std::string vulkan_lib = (developer_data_root() / "artifacts" / "inference" / "vk" / "keryx-llama-vk.dll").string();
+#else
+  std::string vulkan_lib = (developer_data_root() / "artifacts" / "inference" / "vk" / "libkeryx-llama-vk.so").string();
+#endif
   std::string ipfs_endpoint = "http://127.0.0.1:5001";
   std::string device_id = "0000:00:02.0";
   std::string escrow_key_file;
@@ -347,6 +357,7 @@ int main(int argc, char **argv) {
     else if (arg == "--meta") { if (i + 1 < argc) meta_path = argv[++i]; }
     else if (arg == "--device" || arg == "--gpu") { if (i + 1 < argc) device_id = argv[++i]; }
     else if (arg == "--vulkan-lib") { if (i + 1 < argc) vulkan_lib = argv[++i]; }
+    else if (arg == "--oracle") { if (i + 1 < argc) oracle_path = argv[++i]; }
     else if (arg == "--ipfs-endpoint" || arg == "--ipfs-api") { if (i + 1 < argc) ipfs_endpoint = argv[++i]; }
     else if (arg == "--escrow-key-file" || arg == "--escrow-key") { if (i + 1 < argc) escrow_key_file = argv[++i]; }
     else if (arg == "--escrow-cert") { if (i + 1 < argc) escrow_cert_hex = argv[++i]; }
@@ -456,10 +467,19 @@ int main(int argc, char **argv) {
   }
 
   // Verify GGUF model and Merkle index
-  model::ReadOnlyGguf gguf(model_path);
-  model::SparseMerkleIndex merkle(gguf, tree_path);
-  const auto anchor = official_tier_anchor(140115000ULL, 0);
-  gguf.verify_sidecar(tree_path, meta_path, official_model, anchor.root, anchor.chunks);
+  std::unique_ptr<model::ReadOnlyGguf> gguf_owner;
+  std::unique_ptr<model::SparseMerkleIndex> merkle_owner;
+  try {
+    gguf_owner = std::make_unique<model::ReadOnlyGguf>(model_path);
+    merkle_owner = std::make_unique<model::SparseMerkleIndex>(*gguf_owner, tree_path);
+    const auto anchor = official_tier_anchor(140115000ULL, 0);
+    gguf_owner->verify_sidecar(tree_path, meta_path, official_model, anchor.root, anchor.chunks);
+  } catch (const std::exception &e) {
+    startup.record("MODEL_VERIFIED", StartupResult::Blocked, std::string("Model verification failed: ") + e.what());
+    return 78;
+  }
+  auto &gguf = *gguf_owner;
+  auto &merkle = *merkle_owner;
   startup.record("MODEL_VERIFIED", StartupResult::Pass, "GGUF model and Merkle sidecar verified");
 
   // Load single resident Vulkan runtime for zero-dup PoM + H15 inference
@@ -706,6 +726,8 @@ int main(int argc, char **argv) {
     if (const char *ca = std::getenv("NEXUS_POOL_CA_FILE"); ca && *ca) scfg.tls_ca_file = ca;
     scfg.submission_journal=developer_data_root()/"state"/"submissions"/"pool-shares.journal";
     scfg.user_agent = stratum::nexus_pool_agent;
+    // PoM v5 pads follow the H16 table (consensus/pom_v5.cpp), as in the CUDA worker.
+    scfg.h16_protocol_compatible = true;
     const auto disabled=[](const char *name){const char *v=std::getenv(name);return v&&(std::string_view(v)=="1"||std::string_view(v)=="true");};
     scfg.pool_telemetry.enabled=!disabled("NEXUS_POOL_TELEMETRY_DISABLE")&&!disabled("KERYX_TELEMETRY_DISABLE");
     scfg.pool_telemetry.build="vulkan";
@@ -1294,6 +1316,9 @@ int main(int argc, char **argv) {
               const auto sub_id = stratum_client->submit_share(share);
               telemetry.set_state("ACTIVE", "IDLE", "", sub_id ? "SUBMIT_SENT" : "STALE");
             }
+          } else {
+            // The host re-walk is authoritative; a GPU winner it rejects is a runtime fault.
+            std::cerr << "AMD_POOL_HOST_REWALK_REJECTED nonce=" << winning_nonce << "\n" << std::flush;
           }
         } catch (const std::exception &e) {
           std::cerr << "AMD_POOL_PROOF_BUILD_ERROR: " << e.what() << "\n" << std::flush;
@@ -1519,6 +1544,9 @@ int main(int argc, char **argv) {
           } else {
             std::cout << "AMD_WINNER_VERIFIED nonce=" << winning_nonce << " submit=DISABLED\n" << std::flush;
           }
+        } else {
+          // The host re-walk is authoritative; a GPU winner it rejects is a runtime fault.
+          std::cerr << "AMD_HOST_REWALK_REJECTED nonce=" << winning_nonce << "\n" << std::flush;
         }
       } catch (const std::exception &e) {
         std::cerr << "AMD_PROOF_BUILD_ERROR: " << e.what() << "\n" << std::flush;
