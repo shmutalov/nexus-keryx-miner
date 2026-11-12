@@ -1194,8 +1194,9 @@ int main(int argc, char **argv) {
             const bool sent = stratum_client->submit_pool_ai_result(message->scope, result);
             std::cout << "POOL_AI_RESULT sent=" << (sent ? "true" : "false") << " scope_bound=true\n" << std::flush;
           } catch (const std::exception &e) {
-            std::cout << "POOL_AI_REQUEST_FAILED scope_bound=true empty_response_sent=false detail=\"" << e.what()
-                      << "\"\n" << std::flush;
+            const bool declined = stratum_client->decline_pool_ai(*message);
+            std::cout << "POOL_AI_REQUEST_FAILED scope_bound=true empty_response_sent=false declined="
+                      << (declined ? "true" : "false") << " detail=\"" << e.what() << "\"\n" << std::flush;
           }
           telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
           continue;

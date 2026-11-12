@@ -76,7 +76,10 @@ flagged the rig `TRACE_INCAPABLE`.
 With `--enable-ai-response`, the traced self-test of [Pool AI](#pool-ai)
 produced 271 traced positions. Nexus's Rust verifier accepted the 14 replays it
 opened, of per-position and sequence leaves both, and the worker qualified
-(`POOL_AI_ROUTE=QUALIFIED`).
+(`POOL_AI_ROUTE=QUALIFIED`). In a 9-minute Suprnova run with it, 26 shares were
+accepted and none rejected, at about 1.54 M nonces/s. The pool sent 35 AI
+requests, all untraced, and the worker declined each one. No traced request
+arrived in that time, so the pool has not yet exercised the traced answer path.
 
 RDNA1 and RDNA2 have not been run on their own hardware. Their paths were
 exercised only by forcing them on RDNA3.
@@ -142,7 +145,9 @@ shares. To serve them, add `--enable-ai-response` to the worker (or to
 If any step fails, the worker prints `POOL_AI_ROUTE=UNQUALIFIED` with the reason
 and exits with code 78 instead of mining as a trace-incapable rig. Requests pause
 the PoM walk while they run, as OPoI challenges do. Each capture is written to
-disk before its answer is sent.
+disk before its answer is sent. Nexus answers only traced requests. Suprnova
+also sends untraced chat requests, and the worker declines those with error 46
+(busy) so the pool re-dispatches them at once.
 
 Traced answers need the official prompt budget, so with `--enable-ai-response`
 the context defaults to 8192 tokens instead of 512 (`KERYX_LLAMA_CTX` overrides
