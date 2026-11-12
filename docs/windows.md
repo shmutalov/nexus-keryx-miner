@@ -3,7 +3,9 @@
 This port builds an x64 Windows executable, independent Rust verifier and CUDA
 inference DLL. It uses Windows APIs directly; WSL and MSYS2 are not required.
 It is an experimental CLI distribution. The Linux desktop/service controls and
-AMD/Vulkan execution are not included in the Windows package.
+AMD/Vulkan execution are not included in the Windows package; AMD GPUs run
+`nexus-live-vulkan-worker` with the runtime built from source as described in
+[Vulkan runtime](vulkan-runtime.md).
 
 The GPU path is restricted to NVIDIA **SM 8.6** by the existing kernels and
 runtime admission. Selecting a different UUID does not add support for another
