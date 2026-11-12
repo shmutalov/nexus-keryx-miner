@@ -10,14 +10,15 @@ licenses and notices. Do not replace or remove them with the project license.
 | `vendor/keryx-miner-v057/` | Escrow implementation and RPC definitions; `LICENSE-APACHE`, `LICENSE-MIT`, `proto/SELECTED_CHAIN_UPSTREAM.json` |
 | `vendor/keryx-trace-abi6/` | Trace formats, reference miner, wrapper source and its canonical-trace build patch; v5 reference has a separate `POM_V5_UPSTREAM.json` pin; isolated ABI9 wrapper/patches use `RUNTIME_ABI9_UPSTREAM.json`; `LICENSE-APACHE`, `LICENSE-MIT`, `UPSTREAM.json` |
 | `vendor/keryx-verifiable-inference/` | Trace/sequence/attention/recurrent codec and verifier at `c21c87372604`; `LICENSE`, `UPSTREAM.json`, `SHAPE_UPSTREAM.json` |
+| `vendor/keryx-miner-rdna3/` | Vulkan PoM walk (`keryx-vulkan` crate and GLSL shaders) and in-process llama.cpp engine (`src/llm_engine.rs`) of keryx-miner-rdna3 `v0.3.34-rdna3` at `abffe6a6df0a`, unmodified; built into `tools/runtime-vulkan`, which also pins shmutalov/llama-cpp-rs `92b2e1ff9d73` (llama.cpp with the engine's Vulkan exports); `LICENSE-APACHE`, `LICENSE-MIT`, `UPSTREAM.json` |
 | `consensus/` | Resident-kernel notice in `RESIDENT_KERNEL_LICENSE-MIT` |
 | `proto/current/` | Upstream wire definitions and `VERIFIABLE_INFERENCE_UPSTREAM.json` |
 | `ai-response-bridge/assets/trace-manifests/` | Text-encoded protocol manifests; `UPSTREAM.json` |
 
 ### Imported license filenames
 
-The imported `LICENSE-MIT` files under `vendor/keryx-miner-v057/` and
-`vendor/keryx-trace-abi6/`, as well as
+The imported `LICENSE-MIT` files under `vendor/keryx-miner-v057/`,
+`vendor/keryx-trace-abi6/` and `vendor/keryx-miner-rdna3/`, as well as
 `consensus/RESIDENT_KERNEL_LICENSE-MIT`, contain **Apache License 2.0** text,
 not MIT license text. The names have been preserved for upstream traceability;
 they must not be cited as evidence that those copies carry an MIT license.
