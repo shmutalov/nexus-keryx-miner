@@ -64,6 +64,8 @@ def parse_args():
                         help="Independent Rust verifier (default: nexus-m21-oracle from the build)")
     parser.add_argument("--live", action="store_true",
                         help="Authorize the Vulkan worker to submit shares/blocks (verified by --oracle first)")
+    parser.add_argument("--enable-ai-response", action="store_true",
+                        help="Let the Vulkan worker serve the pool's traced AI (H15) requests")
     return parser.parse_args()
 
 
@@ -203,6 +205,8 @@ def main():
             if args.live:
                 oracle = Path(args.oracle) if args.oracle else find_executable(root_dir, "nexus-m21-oracle")
                 cmd.extend(["--oracle", str(oracle.resolve()), "--enable-submit"])
+            if args.enable_ai_response:
+                cmd.append("--enable-ai-response")
             print(f"[Launcher] Launching AMD/Cross-Vendor Vulkan Worker: {vk_bin.name}")
             p_vk = subprocess.Popen(cmd, env=vk_env)
             processes.append((p_vk, "AMD Vulkan Worker"))

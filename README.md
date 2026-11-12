@@ -33,7 +33,7 @@ See the [0.0.5 release notes](docs/release-0.0.5.md) (and previous [0.0.4 notes]
 | Architecture / Vendor | Execution Backend | Supported Hardware | Scope & Capabilities |
 | --- | --- | --- | --- |
 | **NVIDIA GeForce RTX** | CUDA Driver API (SM 8.6, 8.9, 12.0) | RTX 30 Series (Ampere), RTX 40 Series (Ada Lovelace), RTX 50 Series | Resident CUDA kernel, tensor-core solver, chaseless solver, native PoM execution, H15/H16 adaptive context |
-| **AMD Radeon** | Vulkan runtime (`tools/runtime-vulkan`) loaded by `nexus-live-vulkan-worker` | RX 7000 (RDNA3, validated on RX 7900 XT); RDNA2/RDNA1 and RDNA4 by capability, not yet run on that hardware | PoM v5 walk over llama.cpp's resident weights (matrix cores on RDNA3/4, `v_dot4` otherwise), OPoI challenge inference; no traced H15 AI. See [Vulkan runtime](docs/vulkan-runtime.md) |
+| **AMD Radeon** | Vulkan runtime (`tools/runtime-vulkan`) loaded by `nexus-live-vulkan-worker` | RX 7000 (RDNA3, validated on RX 7900 XT); RDNA2/RDNA1 and RDNA4 by capability, not yet run on that hardware | PoM v5 walk over llama.cpp's resident weights (matrix cores on RDNA3/4, `v_dot4` otherwise), OPoI challenge inference, traced H15 pool AI (`--enable-ai-response`). See [Vulkan runtime](docs/vulkan-runtime.md) |
 | **AMD Radeon (research)** | Vulkan 1.3 / Buffer Device Address (BDA) | RX 400 / RX 500 (Polaris) | JIT/BDA SPIR-V walk research paths (`experiments/vulkan_jit`, `consensus/vulkan-bda`) |
 | **Host / Independent Oracle** | Rust & C++20 | Linux x86-64, Windows x64 | Independent proof verification against pinned protocol, deterministic test suite, consensus audits |
 

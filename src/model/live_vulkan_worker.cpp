@@ -8,6 +8,7 @@
 #include "keryx/nexus/ai_service.hpp"
 #include "keryx/nexus/ai_response_service.hpp"
 #include "keryx/nexus/h15_audit_client.hpp"
+#include "keryx/nexus/pool_ai_service.hpp"
 #include "keryx/nexus/escrow_watcher.hpp"
 #include "keryx/nexus/native_telemetry.hpp"
 #include "keryx/nexus/startup_readiness.hpp"
@@ -268,7 +269,6 @@ int main(int argc, char **argv) {
                                              : home_path / "nexus-keryx-miner";
 
   _putenv_s("NEXUS_AI_BACKEND", "vulkan");
-  _putenv_s("KERYX_LLAMA_CTX", "512");
   if (!std::getenv("NEXUS_DATA_DIR")) {
     _putenv_s("NEXUS_DATA_DIR", default_data_dir.string().c_str());
   }
@@ -278,7 +278,6 @@ int main(int argc, char **argv) {
   fs::path default_data_dir = home_path / "Scaricati" / "KERYX-NEXUS-RECOVERY";
 
   setenv("NEXUS_AI_BACKEND", "vulkan", 1);
-  setenv("KERYX_LLAMA_CTX", "512", 1);
   if (!std::getenv("NEXUS_DATA_DIR")) {
     setenv("NEXUS_DATA_DIR", default_data_dir.string().c_str(), 1);
   }
@@ -382,6 +381,16 @@ int main(int argc, char **argv) {
       std::uint32_t b = static_cast<std::uint32_t>(std::stoul(pos_args[9]));
       if (b > 0) batch_size = b;
     } catch (...) {}
+  }
+
+  // OPoI challenges fit a 512-token context; traced AI answers need the official prompt budget.
+  if (!std::getenv("KERYX_LLAMA_CTX")) {
+    const char *context = ai_responses_enabled ? "8192" : "512";
+#ifdef _WIN32
+    _putenv_s("KERYX_LLAMA_CTX", context);
+#else
+    setenv("KERYX_LLAMA_CTX", context, 1);
+#endif
   }
 
   // Resolve model paths
@@ -741,6 +750,54 @@ int main(int argc, char **argv) {
     gpu_ownership.set_busy_callback([client = stratum_client.get()](bool busy) {
       if (client) client->set_ai_inference_busy(busy);
     });
+  }
+
+  // Traced pool AI, as in the CUDA worker: the pool is told of a trace-capable model only after a
+  // native traced self-test whose pieces the Rust verifier accepts.
+  std::unique_ptr<ai::H15AuditClient> pool_h15;
+  std::unique_ptr<ai::PoolAiService> pool_ai;
+  if (pool_mode && stratum_client && ai_responses_enabled) {
+    try {
+      if (shared_runtime->abi_version() != 9 || !shared_runtime->supports_length_aware_tracing())
+        throw std::runtime_error("the Vulkan runtime does not export length-aware ABI9 tracing");
+      // Offline pool captures make no node RPC, but the client requires a loopback node endpoint.
+      // In pool mode `endpoint` is the pool, so pass the node default the CUDA worker uses.
+      pool_h15 = std::make_unique<ai::H15AuditClient>(*shared_runtime, gguf, merkle,
+          developer_data_root() / "state" / "pool-ai" / "engine", escrow_secret, "grpc://127.0.0.1:22110",
+          official_model, true);
+      pool_h15->set_gpu_owner([&](const std::function<void()> &work) {
+        gpu_ownership.run_opoi([&] { shared_runtime->pom_release_pad(); }, [&] { work(); return true; }, [] {});
+      });
+      Hash self_request{};
+      self_request.fill(0x5a);
+      constexpr char self_prompt[] = "Nexus pool check\0Reply OK.";
+      gpu_ownership.run_opoi([&] { shared_runtime->pom_release_pad(); }, [&] {
+        (void)pool_h15->infer(std::string_view(self_prompt, sizeof(self_prompt) - 1), 16, self_request);
+        return true;
+      }, [] {});
+      const auto checked = pool_h15->verify_capture(2);
+      if (!checked[0]) throw std::runtime_error("the traced self-test had no verified pieces");
+      pool_ai = std::make_unique<ai::PoolAiService>(developer_data_root() / "state" / "pool-ai" / "records", official_model,
+          [&](std::string_view prompt, std::uint32_t tokens, const Hash &request) {
+            telemetry.set_state("PAUSED", "RUNNING", "POOL_AI_TRACE", submit_enabled ? "ARMED" : "DISABLED");
+            return gpu_ownership.run_opoi([&] { shared_runtime->pom_release_pad(); }, [&] {
+              ai::PoolAiService::Capture result;
+              result.answer = pool_h15->infer(prompt, tokens, request);
+              result.record = pool_h15->export_pool_capture();
+              return result;
+            }, [] {});
+          },
+          [&](auto capture, const Hash &request, const Hash &response, const Hash &seed, auto path, auto previous) {
+            telemetry.set_state("PAUSED", "RUNNING", "POOL_AI_OPENING", submit_enabled ? "ARMED" : "DISABLED");
+            return pool_h15->open_pool_capture(capture, request, response, seed, path, previous);
+          });
+      stratum_client->qualify_pool_ai();
+      std::cout << "POOL_AI_ROUTE=QUALIFIED native=true backend=vulkan verified_seeds=2 durable_capture_before_send=true\n"
+                << std::flush;
+    } catch (const std::exception &e) {
+      std::cerr << "POOL_AI_ROUTE=UNQUALIFIED detail=\"" << e.what() << "\"\n" << std::flush;
+      return 78;
+    }
   }
 
   // Queues
@@ -1129,6 +1186,20 @@ int main(int argc, char **argv) {
         telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
         telemetry.set_gpu_activity("WAITING_TEMPLATE");
         continue;
+      }
+      if (pool_ai) {
+        if (auto message = stratum_client->take_pool_ai()) {
+          try {
+            auto result = pool_ai->handle(message->scope, pool_worker, message->wire);
+            const bool sent = stratum_client->submit_pool_ai_result(message->scope, result);
+            std::cout << "POOL_AI_RESULT sent=" << (sent ? "true" : "false") << " scope_bound=true\n" << std::flush;
+          } catch (const std::exception &e) {
+            std::cout << "POOL_AI_REQUEST_FAILED scope_bound=true empty_response_sent=false detail=\"" << e.what()
+                      << "\"\n" << std::flush;
+          }
+          telemetry.set_state("ACTIVE", "IDLE", "", submit_enabled ? "ARMED" : "DISABLED");
+          continue;
+        }
       }
 
       const auto wait_start_ns = monotonic_ns();

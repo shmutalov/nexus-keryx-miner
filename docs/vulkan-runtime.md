@@ -6,14 +6,13 @@ inference and for the PoM walk. `tools/runtime-vulkan` builds that library:
 `keryx-llama-vk.dll` on Windows, `libkeryx-llama-vk.so` on Linux.
 
 The runtime combines llama.cpp's Vulkan backend, in-process, with the PoM v4/v5
-walk of keryx-miner-rdna3 (`vendor/keryx-miner-rdna3`, unmodified and pinned in
-its `UPSTREAM.json`). It exports ABI 3: plain generation, which answers OPoI
-challenges, and the PoM functions. The traced-inference symbols of ABI 6/8/9
-are not exported, so this runtime does not serve H15 AI requests, and the Vulkan
-worker declares no trace-capable model. Pools that assign H15 AI work to every
-rig count that against the rig's work: Suprnova, for example, flags it
-`TRACE_INCAPABLE`, and the pool is penalized for the shares it produces. Do not
-mine on such pools with this runtime until traced inference is supported.
+walk and the traced evaluations of keryx-miner-rdna3 (`vendor/keryx-miner-rdna3`,
+unmodified and pinned in its `UPSTREAM.json`). It exports ABI 9:
+
+- plain generation, which answers OPoI challenges;
+- traced generation with replays and sequence leaves, which answers the pool's
+  H15 AI requests (see [Pool AI](#pool-ai));
+- the PoM functions.
 
 The worker re-walks every GPU winner on the host and verifies the proof with
 the independent Rust verifier before submitting it. A GPU fault therefore costs
@@ -71,8 +70,13 @@ nexus-vulkan-runtime-parity-test <runtime library> <tier-0 model.gguf> [jobs]
 A live run of `nexus-live-vulkan-worker` on Suprnova (`krx.suprnova.cc:4401`)
 had 26 shares accepted and none rejected. The Rust verifier checked every proof
 before submission, and the host re-walk rejected no GPU winner. The worker
-completed about 1.55 M nonces/s. Suprnova flagged the rig `TRACE_INCAPABLE`, as
-described above.
+completed about 1.55 M nonces/s. That run did not serve AI requests, so Suprnova
+flagged the rig `TRACE_INCAPABLE`.
+
+With `--enable-ai-response`, the traced self-test of [Pool AI](#pool-ai)
+produced 271 traced positions. Nexus's Rust verifier accepted the 14 replays it
+opened, of per-position and sequence leaves both, and the worker qualified
+(`POOL_AI_ROUTE=QUALIFIED`).
 
 RDNA1 and RDNA2 have not been run on their own hardware. Their paths were
 exercised only by forcing them on RDNA3.
@@ -113,15 +117,48 @@ Submissions require the independent verifier and explicit authorization:
 nexus-live-vulkan-worker --keryxd-address stratum+tcp://<pool>:<port> \
   --address keryx:<payout> --worker <name> \
   --model <model.gguf> --tree <pom-tree.bin> --meta <pom-tree.json> \
-  --vulkan-lib <keryx-llama-vk library> --oracle <nexus-m21-oracle> --enable-submit
+  --vulkan-lib <keryx-llama-vk library> --oracle <nexus-m21-oracle> --enable-submit \
+  --enable-ai-response
 ```
 
-`scripts/nexus_launcher.py --device amd --pool-url ... --live` builds the same
-command. It takes the runtime library from next to the worker unless
+`scripts/nexus_launcher.py --device amd --pool-url ... --live --enable-ai-response`
+builds the same command. It takes the runtime library from next to the worker unless
 `--vulkan-lib` is given.
 
 On Windows the worker's data directory defaults to
 `%LOCALAPPDATA%\nexus-keryx-miner` when `NEXUS_DATA_DIR` is unset.
+
+## Pool AI
+
+Pools such as Suprnova send H15 AI requests to every rig. A rig that cannot
+answer them is flagged `TRACE_INCAPABLE`, and the pool is penalized for its
+shares. To serve them, add `--enable-ai-response` to the worker (or to
+`nexus_launcher.py`). At startup the worker then:
+
+1. runs a traced generation on the GPU and opens two seeds of it, which Nexus's
+   Rust verifier must accept;
+2. declares the model trace-capable to the pool.
+
+If any step fails, the worker prints `POOL_AI_ROUTE=UNQUALIFIED` with the reason
+and exits with code 78 instead of mining as a trace-incapable rig. Requests pause
+the PoM walk while they run, as OPoI challenges do. Each capture is written to
+disk before its answer is sent.
+
+Traced answers need the official prompt budget, so with `--enable-ai-response`
+the context defaults to 8192 tokens instead of 512 (`KERYX_LLAMA_CTX` overrides
+it). The captures live in the data directory, which must be private:
+
+- On Linux, it must be owned by the user, with mode `0700`.
+- On Windows, its owner must be the user, and its ACL may grant only the user
+  and SYSTEM. A directory under `%LOCALAPPDATA%` inherits an Administrators
+  entry, so remove inheritance once:
+
+  ```bat
+  icacls "%LOCALAPPDATA%\nexus-keryx-miner" /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+  icacls "%LOCALAPPDATA%\nexus-keryx-miner\*" /reset /T
+  ```
+
+  The second command makes existing files inherit the new ACL.
 
 Environment variables:
 
